@@ -1,0 +1,71 @@
+general:
+  epochs: 100                   # Number of training epochs
+  optimizer: Adam               # Optimizer: Adam / SGD / RMSprop
+  lr: 0.001                     # Learning rate
+  weight_decay: 0.0001          # L2 regularization (weight decay)
+  batch_size: 16                # Batch size for training
+  num_workers: 4                # Number of CPU workers for data loading
+  random_seed: 42               # Random seed for reproducibility
+  patience: 20                  # Early stopping patience (epochs)
+  device: cuda                  # Device: cuda / cpu
+
+model:
+  architecture: dense_nn        # Model type: dense_nn / baseline_ml
+  hidden_layers: [128, 64, 32]  # Hidden layer sizes for dense NN
+  dropout: 0.3                  # Dropout rate (0.0 to disable)
+  activation: relu              # Activation function: relu / leaky_relu / elu
+  use_batch_norm: true          # Whether to use batch normalization
+  
+  # Baseline ML models (for comparison)
+  baseline_model: random_forest  # Options: linear_reg / random_forest / xgboost / gradient_boosting
+
+dataset:
+  data_file: "energy_Na_features.csv"  # Path to input data file
+  
+  # Input features - these columns will be used as model inputs
+  # Orbital occupancies: electron count in each orbital (1s, 2s, 2p, etc.)
+  orbital_features: ['1s', '2s', '2p', '3s', '3p', '3d', '4s', '4p', '4d', '4f',
+                     '5s', '5p', '5d', '5f', '5g', '6s', '6p', '6d', '6f']
+  
+  # Quantum number features: fundamental quantum properties
+  quantum_features: ['J', 'S_qn', 'L_qn', 'parity']
+  
+  # Atomic properties: basic atomic information
+  atomic_features: ['Z', 'A', 'proton_number', 'neutron_number']
+  
+  # Target to predict (output)
+  target_feature: "Level (cm-1)"
+  
+  # Feature engineering: whether to add derived features
+  add_derived_features: true    # Add total electrons, valence electrons, etc.
+  
+  # Data normalization
+  normalize_features: true      # Standardize features (zero mean, unit variance)
+  normalize_target: true        # Standardize target variable
+  
+  # Data splitting
+  split:
+    train: 0.7                  # 70% for training
+    val: 0.15                   # 15% for validation
+    test: 0.15                  # 15% for testing
+  
+  # Handle missing values
+  drop_missing: false           # Whether to drop rows with missing values
+  fill_missing_value: 0.0       # Value to fill missing data (if not dropping)
+
+training:
+  criterion: MSE                # Loss function: MSE / MAE / Huber
+  gradient_clip: 1.0            # Gradient clipping value (0.0 to disable)
+  lr_scheduler: ReduceLROnPlateau  # LR scheduler: ReduceLROnPlateau / StepLR / None
+  lr_scheduler_params:
+    factor: 0.5                 # Multiply LR by this factor when reducing
+    patience: 10                # Epochs to wait before reducing LR
+    min_lr: 0.00001             # Minimum learning rate
+
+logging:
+  use_wandb: false              # Enable Weights & Biases logging
+  wandb_project: "atomic-energy-prediction"
+  wandb_entity: null            # Your W&B username (null = default)
+  log_interval: 10              # Log metrics every N epochs
+  save_dir: "saved_models"      # Directory to save model checkpoints
+  save_best_only: true          # Only save the best model (by val loss)

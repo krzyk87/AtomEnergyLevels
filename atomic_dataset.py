@@ -1,0 +1,330 @@
+"""
+AtomicDataset.py
+
+This module defines the PyTorch Dataset class for atomic energy level data.
+It handles:
+1. Loading CSV data with electron configurations and quantum numbers
+2. Feature engineering (adding derived physical features)
+3. Data normalization and preprocessing
+4. Splitting data into train/validation/test sets
+
+Author: Aga (ML Developer)
+For: Physics PhD project on neural network prediction of atomic energy levels
+"""
+
+import pandas as pd
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from sklearn.preprocessing import StandardScaler
+from typing import Tuple, Optional, Dict
+import json
+import os
+
+
+class AtomicDataset(Dataset):
+    """
+    PyTorch Dataset for atomic energy level prediction.
+    
+    This dataset loads electron configuration data (number of electrons in each orbital),
+    quantum numbers (J, S, L, parity), and predicts energy levels in cm⁻¹.
+    
+    Args:
+        config: Configuration object containing dataset parameters
+        subset: Which data split to use ('train', 'val', or 'test')
+        scaler_features: Pre-fitted StandardScaler for features (used for val/test)
+        scaler_target: Pre-fitted StandardScaler for target (used for val/test)
+    """
+    
+    def __init__(
+        self, 
+        config,
+        subset: str = 'train',
+        scaler_features: Optional[StandardScaler] = None,
+        scaler_target: Optional[StandardScaler] = None
+    ):
+        """
+        Initialize the dataset.
+        
+        For the training set (subset='train'), this will:
+        - Load and preprocess the data
+        - Create train/val/test splits
+        - Fit normalization scalers on training data
+        
+        For validation/test sets, scalers from training must be provided
+        to ensure consistent normalization.
+        """
+        self.config = config
+        self.subset = subset
+        
+        # Load the full dataset from CSV
+        self.df = pd.read_csv(config.dataset.data_file)
+        
+        print(f"Loaded {len(self.df)} atomic energy levels from {config.dataset.data_file}")
+        
+        # Add derived features if requested (total electrons, valence electrons, etc.)
+        if config.dataset.add_derived_features:
+            self._add_derived_features()
+        
+        # Prepare feature columns (inputs to the model)
+        self.feature_columns = self._get_feature_columns()
+        
+        # Prepare target column (what we want to predict)
+        self.target_column = config.dataset.target_feature
+        
+        # Handle missing values in the data
+        self._handle_missing_values()
+        
+        # Split data into train/validation/test sets
+        # This creates self.indices that contains row indices for this subset
+        self._create_splits()
+        
+        # Extract features (X) and target (y) for this subset
+        self.X = self.df.loc[self.indices, self.feature_columns].values
+        self.y = self.df.loc[self.indices, self.target_column].values.reshape(-1, 1)
+        
+        # Normalize features and target if requested
+        if config.dataset.normalize_features:
+            if subset == 'train':
+                # For training set: fit a new scaler and transform
+                self.scaler_features = StandardScaler()
+                self.X = self.scaler_features.fit_transform(self.X)
+            else:
+                # For val/test: use the scaler fitted on training data
+                if scaler_features is None:
+                    raise ValueError(f"scaler_features must be provided for subset='{subset}'")
+                self.scaler_features = scaler_features
+                self.X = self.scaler_features.transform(self.X)
+        else:
+            self.scaler_features = None
+        
+        if config.dataset.normalize_target:
+            if subset == 'train':
+                # Fit scaler on training target values
+                self.scaler_target = StandardScaler()
+                self.y = self.scaler_target.fit_transform(self.y)
+            else:
+                # Use training scaler for val/test
+                if scaler_target is None:
+                    raise ValueError(f"scaler_target must be provided for subset='{subset}'")
+                self.scaler_target = scaler_target
+                self.y = self.scaler_target.transform(self.y)
+        else:
+            self.scaler_target = None
+        
+        print(f"{subset.capitalize()} set: {len(self)} samples, {self.X.shape[1]} features")
+    
+    def _get_feature_columns(self) -> list:
+        """
+        Combine all requested feature types into a single list of column names.
+        
+        Returns:
+            List of column names to use as input features
+        """
+        features = []
+        
+        # Add orbital occupancy features (e.g., how many electrons in 3s, 3p, etc.)
+        if hasattr(self.config.dataset, 'orbital_features'):
+            features.extend(self.config.dataset.orbital_features)
+        
+        # Add quantum number features (J, S, L, parity)
+        if hasattr(self.config.dataset, 'quantum_features'):
+            features.extend(self.config.dataset.quantum_features)
+        
+        # Add atomic properties (Z, A, proton/neutron counts)
+        if hasattr(self.config.dataset, 'atomic_features'):
+            features.extend(self.config.dataset.atomic_features)
+        
+        # Add derived features if they were created
+        if self.config.dataset.add_derived_features:
+            derived = ['total_electrons', 'valence_electrons', 'core_electrons',
+                      'unpaired_electrons', 'max_principal_n']
+            features.extend([f for f in derived if f in self.df.columns])
+        
+        # Filter to only include columns that exist in the dataframe
+        features = [f for f in features if f in self.df.columns]
+        
+        return features
+    
+    def _add_derived_features(self):
+        """
+        Add physically meaningful derived features to help the model learn.
+        
+        These features are computed from the raw electron configuration
+        and provide additional physics-based information:
+        - Total number of electrons
+        - Number of valence electrons (in outermost shell)
+        - Number of core electrons
+        - Number of unpaired electrons
+        - Maximum principal quantum number (highest occupied shell)
+        """
+        # Get all orbital columns (1s, 2s, 2p, 3s, etc.)
+        orbital_cols = self.config.dataset.orbital_features
+        orbital_cols = [c for c in orbital_cols if c in self.df.columns]
+        
+        # Total electrons: sum across all orbitals
+        self.df['total_electrons'] = self.df[orbital_cols].sum(axis=1)
+        
+        # Maximum principal quantum number (n): highest shell with electrons
+        # Extract principal quantum number from orbital name (e.g., '3s' -> 3)
+        for idx, row in self.df.iterrows():
+            max_n = 0
+            for col in orbital_cols:
+                if row[col] > 0:  # If this orbital has electrons
+                    n = int(col[0])  # First character is the principal quantum number
+                    max_n = max(max_n, n)
+            self.df.loc[idx, 'max_principal_n'] = max_n
+        
+        # Valence electrons: electrons in the outermost shell
+        # This is approximate - counts electrons in orbitals with n = max_n
+        valence_electrons = []
+        for idx, row in self.df.iterrows():
+            max_n = int(row['max_principal_n'])
+            valence = 0
+            for col in orbital_cols:
+                n = int(col[0])
+                if n == max_n:
+                    valence += row[col]
+            valence_electrons.append(valence)
+        self.df['valence_electrons'] = valence_electrons
+        
+        # Core electrons: total - valence
+        self.df['core_electrons'] = self.df['total_electrons'] - self.df['valence_electrons']
+        
+        # Unpaired electrons: simplified estimation from S quantum number
+        # S = total spin = (number of unpaired electrons) / 2
+        # So unpaired electrons ≈ 2 * S
+        if 'S_qn' in self.df.columns:
+            self.df['unpaired_electrons'] = 2 * self.df['S_qn']
+        else:
+            self.df['unpaired_electrons'] = 0
+        
+        print(f"Added derived features: total_electrons, valence_electrons, "
+              f"core_electrons, unpaired_electrons, max_principal_n")
+    
+    def _handle_missing_values(self):
+        """
+        Handle missing values in the dataset.
+        
+        Options:
+        1. Drop rows with missing values (if drop_missing=True)
+        2. Fill missing values with a specified value (default: 0.0)
+        """
+        # Check for missing values in feature columns
+        feature_cols = self.feature_columns + [self.target_column]
+        missing_counts = self.df[feature_cols].isnull().sum()
+        
+        if missing_counts.sum() > 0:
+            print(f"Found missing values:\n{missing_counts[missing_counts > 0]}")
+            
+            if self.config.dataset.drop_missing:
+                # Drop rows with any missing values
+                before = len(self.df)
+                self.df = self.df.dropna(subset=feature_cols)
+                after = len(self.df)
+                print(f"Dropped {before - after} rows with missing values")
+            else:
+                # Fill missing values with specified value
+                fill_value = self.config.dataset.fill_missing_value
+                self.df[feature_cols] = self.df[feature_cols].fillna(fill_value)
+                print(f"Filled missing values with {fill_value}")
+    
+    def _create_splits(self):
+        """
+        Split the dataset into train/validation/test sets.
+        
+        Uses random splitting based on the ratios specified in config.
+        Saves split indices to a JSON file for reproducibility.
+        """
+        split_file = "dataset_split_indices.json"
+        
+        # If split file exists and we're not training, load existing splits
+        # This ensures val/test sets are consistent across runs
+        if os.path.exists(split_file) and self.subset != 'train':
+            with open(split_file, 'r') as f:
+                splits = json.load(f)
+            self.indices = splits[self.subset]
+            print(f"Loaded {self.subset} split from {split_file}")
+            return
+        
+        # Create new splits (typically done once for training)
+        np.random.seed(self.config.general.random_seed)
+        
+        # Get all valid indices (rows in the dataframe)
+        all_indices = self.df.index.tolist()
+        np.random.shuffle(all_indices)
+        
+        # Calculate split sizes
+        n_total = len(all_indices)
+        n_train = int(n_total * self.config.dataset.split.train)
+        n_val = int(n_total * self.config.dataset.split.val)
+        
+        # Split indices
+        train_indices = all_indices[:n_train]
+        val_indices = all_indices[n_train:n_train + n_val]
+        test_indices = all_indices[n_train + n_val:]
+        
+        # Save splits to file for reproducibility
+        splits = {
+            'train': train_indices,
+            'val': val_indices,
+            'test': test_indices
+        }
+        
+        with open(split_file, 'w') as f:
+            json.dump(splits, f, indent=2)
+        
+        print(f"Created and saved data splits to {split_file}")
+        print(f"  Train: {len(train_indices)} samples")
+        print(f"  Val:   {len(val_indices)} samples")
+        print(f"  Test:  {len(test_indices)} samples")
+        
+        # Store the indices for this subset
+        self.indices = splits[self.subset]
+    
+    def __len__(self) -> int:
+        """Return the number of samples in this dataset."""
+        return len(self.X)
+    
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get a single sample from the dataset.
+        
+        Args:
+            idx: Index of the sample to retrieve
+            
+        Returns:
+            Tuple of (features, target) as PyTorch tensors
+            - features: Input features (electron config + quantum numbers)
+            - target: Energy level in cm⁻¹
+        """
+        # Convert numpy arrays to PyTorch tensors
+        features = torch.FloatTensor(self.X[idx])
+        target = torch.FloatTensor(self.y[idx])
+        
+        return features, target
+    
+    def get_feature_names(self) -> list:
+        """Return the list of feature column names."""
+        return self.feature_columns
+    
+    def get_input_dim(self) -> int:
+        """Return the number of input features (dimensionality)."""
+        return len(self.feature_columns)
+    
+    def inverse_transform_target(self, y_normalized: np.ndarray) -> np.ndarray:
+        """
+        Convert normalized target values back to original scale (cm⁻¹).
+        
+        This is used after making predictions to convert the model's output
+        (which is in normalized space) back to physical energy levels.
+        
+        Args:
+            y_normalized: Normalized target values
+            
+        Returns:
+            Target values in original scale (cm⁻¹)
+        """
+        if self.scaler_target is not None:
+            return self.scaler_target.inverse_transform(y_normalized)
+        return y_normalized
