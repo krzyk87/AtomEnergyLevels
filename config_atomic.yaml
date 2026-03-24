@@ -44,6 +44,7 @@ dataset:
   
   # Target to predict (output)
   target_feature: "Level (cm-1)"
+  use_binding_energy: true        # Convert to binding energy
   
   # Feature engineering: whether to add derived features
   add_derived_features: false    # Add total_electrons, valence_electrons, core_electrons, unpaired_electrons, max_principal_n

@@ -31,6 +31,34 @@ from AtomicDataset import AtomicDataset
 from AtomicModel import create_model
 from utils import load_checkpoint
 
+def convert_predictions_to_absolute(
+        binding_energy_predictions: np.ndarray,
+        element: str
+) -> np.ndarray:
+    """
+    Convert binding energy predictions back to absolute energy levels.
+
+    E_level = E_ionization - ΔE_binding
+
+    Args:
+        binding_energy_predictions: Predicted binding energies (cm⁻¹)
+        element: Element name (e.g., 'Na', 'K')
+
+    Returns:
+        Absolute energy levels (cm⁻¹)
+    """
+    from AtomicDataset import IONIZATION_ENERGIES
+
+    if element not in IONIZATION_ENERGIES:
+        raise ValueError(f"Unknown element: {element}")
+
+    Z, E_ion = IONIZATION_ENERGIES[element]
+
+    # E_level = E_ion - ΔE_binding
+    energy_levels = E_ion - binding_energy_predictions
+
+    return energy_levels
+
 
 def compute_metrics(
     predictions: np.ndarray, 
@@ -275,7 +303,14 @@ def test_one_run(
     metrics, predictions, targets = test_model(
         model, test_loader, device, test_dataset
     )
-    
+
+    # If trained on binding energies, convert predictions back to absolute energy levels
+    if config.dataset.get('use_binding_energy', False):
+        element = os.path.basename(config.dataset.data_file).split('_')[0]
+        predictions = convert_predictions_to_absolute(predictions, element)
+        targets = convert_predictions_to_absolute(targets, element)
+        metrics = compute_metrics(predictions, targets)
+
     # Print results
     print_metrics(metrics)
     

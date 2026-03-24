@@ -22,6 +22,15 @@ import json
 import os
 import re
 
+IONIZATION_ENERGIES = {
+    # Element: (Z, ionization_energy_cm-1)
+    'Na': (11, 41449.451),  # From NIST
+    'K': (19, 35009.814),
+    'Rb': (37, 27289.199),
+    'Co': (27, 63564.6),    # Approximate
+    'Ni': (28, 61619.77),
+    'Fe': (26, 63737.70),
+}
 
 class AtomicDataset(Dataset):
     """
@@ -66,12 +75,20 @@ class AtomicDataset(Dataset):
         # Add derived features if requested (total electrons, valence electrons, etc.)
         if config.dataset.add_derived_features:
             self._add_derived_features()
-        
+
+        # Convert to binding energy target if requested (E_ion - E_level)
+        if config.dataset.get('use_binding_energy', False):
+            self._add_binding_energy_target()
+
         # Prepare feature columns (inputs to the model)
         self.feature_columns = self._get_feature_columns()
-        
-        # Prepare target column (what we want to predict)
-        self.target_column = config.dataset.target_feature
+
+        # Prepare target column: binding energy or absolute energy level
+        if config.dataset.get('use_binding_energy', False):
+            self.target_column = 'Binding_Energy_cm-1'
+            print(f"  ✓ Target changed to binding energy")
+        else:
+            self.target_column = config.dataset.target_feature
         
         # Handle missing values in the data
         self._handle_missing_values()
@@ -335,7 +352,7 @@ class AtomicDataset(Dataset):
             raise ValueError("No valid features found! Check your data file.")
 
         return features
-    
+
     def _add_derived_features(self):
         """
         Add physically meaningful derived features to help the model learn.
@@ -391,7 +408,55 @@ class AtomicDataset(Dataset):
         
         print(f"Added derived features: total_electrons, valence_electrons, "
               f"core_electrons, unpaired_electrons, max_principal_n")
-    
+
+    def _add_binding_energy_target(self):
+        """
+        Convert absolute energy levels to binding energies.
+
+        Binding energy = E_ionization - E_level
+
+        This represents how much energy is needed to remove the electron
+        from this state to the ionization continuum.
+        """
+        # Determine element from filename or Z number
+        if 'Z' in self.df.columns:
+            Z = self.df['Z'].iloc[0]
+            element = {11: 'Na', 19: 'K', 37: 'Rb', 27: 'Co', 28: 'Ni', 26: 'Fe'}.get(Z)
+        else:
+            # Extract from filename: "energy_Na_features.csv" → "Na"
+            import os
+            filename = os.path.basename(self.config.dataset.data_file)
+            element = filename.split('_')[1]  # Assumes format: energy_ELEMENT_features.csv
+
+        if element not in IONIZATION_ENERGIES:
+            raise ValueError(f"Ionization energy not defined for element: {element}")
+
+        Z, E_ion = IONIZATION_ENERGIES[element]
+
+        print(f"\nConverting to binding energies:")
+        print(f"  Element: {element} (Z={Z})")
+        print(f"  Ionization energy: {E_ion:.2f} cm⁻¹")
+
+        # Calculate binding energy
+        E_level = self.df[self.config.dataset.target_feature]
+        binding_energy = E_ion - E_level
+
+        # Store both
+        self.df['Binding_Energy_cm-1'] = binding_energy
+        self.df['Ionization_Energy_cm-1'] = E_ion
+
+        # Validate (binding energies should all be positive)
+        if (binding_energy < 0).any():
+            n_negative = (binding_energy < 0).sum()
+            print(f"  ⚠️  Warning: {n_negative} levels have E > E_ionization (continuum states?)")
+            print(f"     These will be clipped to 0 (continuum threshold)")
+            binding_energy = binding_energy.clip(lower=0)
+            self.df['Binding_Energy_cm-1'] = binding_energy
+
+        print(f"  ✓ Binding energy range: {binding_energy.min():.2f} to {binding_energy.max():.2f} cm⁻¹")
+
+        self.original_target = self.config.dataset.target_feature
+
     def _handle_missing_values(self):
         """
         Handle missing values in the dataset.
