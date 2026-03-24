@@ -20,6 +20,7 @@ from sklearn.preprocessing import StandardScaler
 from typing import Tuple, Optional, Dict
 import json
 import os
+import re
 
 
 class AtomicDataset(Dataset):
@@ -114,12 +115,108 @@ class AtomicDataset(Dataset):
         
         print(f"{subset.capitalize()} set: {len(self)} samples, {self.X.shape[1]} features")
 
+    def _encode_valence_electrons(self, max_valence=10):
+        """
+        Encode valence electrons as fixed-size feature vector of individual (n, l) pairs with padding.
+
+        This creates a FIXED number of features regardless of how many
+        valence electrons the atom actually has. Atoms with fewer valence
+        electrons are padded with zeros.
+
+        Args:
+            max_valence: Maximum number of valence electrons to encode.
+                         Choose large enough for all atoms you want to train on.
+
+        Example:
+            For Na (1 valence electron) with max_valence=3:
+            Ground state 3s¹: [0, 0, 0, 0, 3, 0]  # [e1_n, e1_l, e2_n, e2_l, e3_n, e3_l]
+            Excited state 3p¹: [0, 0, 0, 0, 3, 1]
+            Excited state 4s¹: [0, 0, 0, 0, 4, 0]
+        """
+        print(f"\nEncoding valence electrons (max={max_valence})...")
+
+        # Get orbital columns
+        orbital_pattern = re.compile(r'^(\d+)([spdfgh])$')
+        orbital_cols = [col for col in self.df.columns if orbital_pattern.match(col)]
+
+        # Define orbital priority (which electrons count as "core" vs "valence")
+        # Lower values = core (filled first), higher = valence
+        def orbital_energy_order(orbital_name):
+            """
+            Approximate orbital filling order (Aufbau principle).
+            Returns a sortable tuple (n + l, n, l) for ordering.
+            """
+            match = orbital_pattern.match(orbital_name)
+            n = int(match.group(1))
+            l_letter = match.group(2)
+            l = {'s': 0, 'p': 1, 'd': 2, 'f': 3, 'g': 4, 'h': 5}[l_letter]
+
+            # Sort by n+l first (Madelung rule), then by n
+            return (n + l, n, l)
+
+        features = []
+
+        for idx, row in self.df.iterrows():
+            # Collect all electrons with their (n, l) quantum numbers
+            all_electrons = []
+
+            for col in orbital_cols:
+                n_electrons = int(row[col])
+                if n_electrons > 0:
+                    match = orbital_pattern.match(col)
+                    n = int(match.group(1))
+                    l_letter = match.group(2)
+                    l = {'s': 0, 'p': 1, 'd': 2, 'f': 3, 'g': 4, 'h': 5}[l_letter]
+
+                    # Add (n, l) for each electron in this orbital
+                    for _ in range(n_electrons):
+                        all_electrons.append((n, l, col))
+
+            # Sort electrons by filling order (core electrons first)
+            all_electrons.sort(key=lambda x: orbital_energy_order(x[2]))
+
+            # Take only the last max_valence electrons (valence electrons)
+            valence_electrons = all_electrons[-max_valence:] if len(
+                all_electrons) >= max_valence else all_electrons
+
+            # Pad with zeros at the BEGINNING if fewer than max_valence
+            # This ensures valence electrons always appear in the same positions
+            while len(valence_electrons) < max_valence:
+                valence_electrons.insert(0, (0, 0, 'pad'))
+
+            # Flatten into feature vector
+            feature_row = []
+            for n, l, _ in valence_electrons:
+                feature_row.extend([n, l])
+
+            features.append(feature_row)
+
+        # Create feature dataframe
+        feature_cols = []
+        for i in range(max_valence):
+            feature_cols.extend([f'val_e{i + 1}_n', f'val_e{i + 1}_l'])
+
+        feature_df = pd.DataFrame(features, columns=feature_cols, index=self.df.index)
+
+        # Merge with original dataframe
+        self.df = pd.concat([self.df, feature_df], axis=1)
+
+        # Print statistics
+        n_valence_actual = len([e for e in all_electrons if e[0] > 0])
+        print(f"  ✓ Created {len(feature_cols)} features ({max_valence} valence electrons)")
+        print(f"  ✓ Actual valence electrons in data: {n_valence_actual} (padded to {max_valence})")
+
+        # Show example
+        example_idx = self.df.index[0]
+        example_features = [int(self.df.loc[example_idx, col]) for col in feature_cols]
+        print(f"  Example configuration: {example_features}")
+
     def _get_feature_columns(self) -> list:
         """
         Automatically detect and select relevant features.
 
         This method intelligently selects features based on:
-        1. Automatic orbital detection (digit+letter pattern)
+        1. Automatically selecting features using valence electron encoding.
         2. Removing constant/empty columns (not informative)
         3. Including quantum numbers and atomic properties
         4. Handling single vs. multi-element datasets
@@ -132,46 +229,38 @@ class AtomicDataset(Dataset):
         features = []
 
         # ========================================
-        # AUTO-DETECT ORBITAL COLUMNS
+        # OPTION 1: Encode valence electrons explicitly
         # ========================================
-        # Pattern: 1s, 2p, 3d, 4f, 5g, 6h, etc.
-        orbital_pattern = re.compile(r'^\d+[spdfgh]$')
+        if self.config.dataset.get('encode_valence_electrons', True):
+            max_valence = self.config.dataset.get('max_valence_electrons', 10)
+            self._encode_valence_electrons(max_valence)
 
-        all_orbitals = [col for col in self.df.columns if orbital_pattern.match(col)]
+            # Add valence electron features
+            for i in range(max_valence):
+                features.extend([f'val_e{i + 1}_n', f'val_e{i + 1}_l'])
 
-        print(f"\n{'=' * 60}")
-        print("FEATURE SELECTION")
-        print(f"{'=' * 60}")
-        print(f"Detected {len(all_orbitals)} orbital columns")
+            print(f"✓ Using valence electron encoding: {len(features)} features")
 
-        # Filter: keep only non-empty, non-constant orbitals
-        valid_orbitals = []
-        empty_orbitals = []
-        constant_orbitals = []
+        # ========================================
+        # OPTION 2: Use full orbital occupancy (fallback)
+        # ========================================
+        else:
+            # Auto-detect orbitals
+            orbital_pattern = re.compile(r'^\d+[spdfgh]$')
+            all_orbitals = [col for col in self.df.columns if orbital_pattern.match(col)]
 
-        for col in all_orbitals:
-            # Check if empty (all zeros)
-            if self.df[col].sum() == 0:
-                empty_orbitals.append(col)
-                continue
-
-            # Check if constant (only one unique value)
-            if self.df[col].nunique() <= 1:
-                constant_orbitals.append(col)
-                continue
-
-            valid_orbitals.append(col)
-
-        print(f"  ✓ Kept {len(valid_orbitals)} informative orbitals")
-        print(f"  ✗ Removed {len(empty_orbitals)} empty orbitals")
-        print(f"  ✗ Removed {len(constant_orbitals)} constant orbitals")
-
-        features.extend(valid_orbitals)
+            # Keep non-empty, non-constant
+            valid_orbitals = [
+                col for col in all_orbitals
+                if self.df[col].sum() > 0 and self.df[col].nunique() > 1
+            ]
+            features.extend(valid_orbitals)
+            print(f"✓ Using full orbital occupancy: {len(features)} features")
 
         # ========================================
         # QUANTUM NUMBERS (always include if present)
         # ========================================
-        quantum_cols = ['J', 'S_qn', 'L_qn', 'parity']
+        quantum_cols = self.config.dataset.get('quantum_features') # ['J', 'S_qn', 'L_qn', 'parity']
         added_quantum = []
 
         for col in quantum_cols:
@@ -184,7 +273,7 @@ class AtomicDataset(Dataset):
         # ========================================
         # ATOMIC PROPERTIES (only if multi-element)
         # ========================================
-        atomic_cols = ['Z', 'A', 'proton_number', 'neutron_number']
+        atomic_cols = self.config.dataset.get('atomic_features')    # ['Z', 'A', 'proton_number', 'neutron_number']
         added_atomic = []
         skipped_atomic = []
 
@@ -209,8 +298,7 @@ class AtomicDataset(Dataset):
         # DERIVED FEATURES
         # ========================================
         if self.config.dataset.add_derived_features:
-            derived_cols = ['total_electrons', 'valence_electrons', 'core_electrons',
-                            'unpaired_electrons', 'max_principal_n']
+            derived_cols = ['total_electrons', 'valence_electrons', 'max_principal_n']  # 'core_electrons', 'unpaired_electrons',
             added_derived = [c for c in derived_cols if c in self.df.columns]
             features.extend(added_derived)
             print(f"  ✓ Added {len(added_derived)} derived features: {added_derived}")
@@ -452,3 +540,38 @@ class AtomicDataset(Dataset):
         if self.scaler_target is not None:
             return self.scaler_target.inverse_transform(y_normalized)
         return y_normalized
+
+    def validate_term_symbol(self):
+        """
+        Verify that Term symbol matches S_qn, L_qn, J values.
+        This catches data entry errors.
+        """
+        if 'Term' not in self.df.columns:
+            return
+
+        errors = []
+
+        for idx, row in self.df.iterrows():
+            term = row['Term']
+            S_qn = row['S_qn']
+            L_qn = row['L_qn']
+            J = row['J']
+
+            # Parse term symbol: ²P₃/₂ → multiplicity=2, L_letter='P', J_term=1.5
+            multiplicity_expected = int(2 * S_qn + 1)
+            L_letter_map = {0: 'S', 1: 'P', 2: 'D', 3: 'F', 4: 'G', 5: 'H'}
+            L_letter_expected = L_letter_map.get(int(L_qn), '?')
+
+            # Check if term matches
+            if not term.startswith(str(multiplicity_expected)):
+                errors.append(f"Row {idx}: Term '{term}' multiplicity doesn't match S_qn={S_qn}")
+
+            if L_letter_expected not in term:
+                errors.append(f"Row {idx}: Term '{term}' L doesn't match L_qn={L_qn}")
+
+        if errors:
+            print(f"⚠️  Found {len(errors)} term symbol mismatches:")
+            for err in errors[:5]:  # Show first 5
+                print(f"   {err}")
+        else:
+            print(f"✓ Term symbols validated: all consistent with S_qn, L_qn, J")

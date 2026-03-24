@@ -23,13 +23,12 @@ dataset:
   data_file: "data/K_features.csv"  # Path to input data file
   split_file: "dataset_split_indices_K.json"  # JSON file to save/load split indices (saved in data/)
 
-  # Feature selection - automatic
-  auto_detect_orbitals: true        # Automatically find orbital columns
-  remove_constant_features: true    # Remove features with only 1 unique value
-  remove_empty_features: true       # Remove all-zero columns
+  # Encoding strategy
+  encode_valence_electrons: true  # Use explicit electron encoding (true) OR use full orbital occupancy (false)
+  max_valence_electrons: 1       # Maximum valence electrons to encode
 
   # Manually specify additional features (optional)
-  force_include_features: ['J', 'S_qn', 'L_qn', 'parity']  # Always include these
+  force_include_features: ['J', 'S_qn', 'L_qn']  # Always include these
   force_exclude_features: [ ]        # Explicitly exclude these
 
   # Input features - these columns will be used as model inputs
@@ -38,16 +37,16 @@ dataset:
                      '5s', '5p', '5d', '5f', '5g', '6s', '6p', '6d', '6f']
   
   # Quantum number features: fundamental quantum properties
-  quantum_features: ['J', 'S_qn', 'L_qn', 'parity']
+  quantum_features: ['J', 'S_qn', 'L_qn'] # 'parity'
   
   # Atomic properties: basic atomic information
-  atomic_features: ['Z', 'A', 'proton_number', 'neutron_number']
+  atomic_features: ['Z', 'A'] # 'proton_number', 'neutron_number'
   
   # Target to predict (output)
   target_feature: "Level (cm-1)"
   
   # Feature engineering: whether to add derived features
-  add_derived_features: true    # Add total electrons, valence electrons, etc.
+  add_derived_features: false    # Add total_electrons, valence_electrons, core_electrons, unpaired_electrons, max_principal_n
   
   # Data normalization
   normalize_features: true      # Standardize features (zero mean, unit variance)
