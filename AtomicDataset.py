@@ -8,8 +8,8 @@ It handles:
 3. Data normalization and preprocessing
 4. Splitting data into train/validation/test sets
 
-Author: Aga (ML Developer)
-For: Physics PhD project on neural network prediction of atomic energy levels
+Author: Aga
+For: Physics project on neural network prediction of atomic energy levels
 """
 
 import pandas as pd

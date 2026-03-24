@@ -2,12 +2,12 @@
 
 A machine learning project for predicting atomic energy levels (in cm⁻¹) from electron configurations and quantum numbers using dense neural networks.
 
-**Author:** Aga (ML Developer)  
-**For:** Physics PhD research project at Poznań University of Technology
+**Author:** Aga   
+**For:** Physics research project at Poznań University of Technology
 
 ---
 
-## 📋 Project Overview
+## Project Overview
 
 This project applies neural networks to predict atomic energy levels, reducing the computational cost of traditional semi-empirical methods. The goal is to:
 
@@ -24,11 +24,10 @@ This project applies neural networks to predict atomic energy levels, reducing t
 - ✅ Early stopping and learning rate scheduling
 - ✅ Comprehensive evaluation metrics
 - ✅ Visualization tools for analysis
-- ✅ Well-documented code for physics students
 
 ---
 
-## 🗂️ Project Structure
+## Project Structure
 
 ```
 atomic_energy_prediction/
@@ -40,14 +39,14 @@ atomic_energy_prediction/
 ├── AtomicModel.py          # Neural network model
 ├── utils.py                # Utility functions
 ├── visualize.py            # Visualization tools
-├── energy_Na_features.csv  # Input data (sodium example)
+├── data/Na_i_features.csv  # Input data (sodium example)
 ├── saved_models/           # Saved model checkpoints
 └── visualizations/         # Output plots
 ```
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Installation
 
@@ -68,7 +67,7 @@ Your input CSV should have columns for:
 - Atomic properties (`Z`, `A`, `proton_number`, `neutron_number`)
 - Target: `Level (cm-1)`
 
-Example: `energy_Na_features.csv` (already provided)
+Example: `Na_i_features.csv` (already provided)
 
 ### 3. Train and Test
 
@@ -94,7 +93,7 @@ python visualize.py
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
 Edit `config_atomic.yaml` to customize:
 
@@ -128,7 +127,7 @@ dataset:
 
 ---
 
-## 📊 Understanding the Output
+## Understanding the Output
 
 ### Training Output
 ```
@@ -162,7 +161,7 @@ Maximum Error:                       1823.45 cm⁻¹
 
 ---
 
-## 📈 Visualizations
+## Visualizations
 
 The `visualize.py` script creates three key plots:
 
@@ -182,7 +181,7 @@ The `visualize.py` script creates three key plots:
 
 ---
 
-## 🔬 For Physics Students: How Does This Work?
+## How Does This Work?
 
 ### The Problem
 Traditional methods (semi-empirical calculations) for computing atomic energy levels:
@@ -221,7 +220,7 @@ The network discovers relationships like:
 
 ---
 
-## 📝 Next Steps
+## Next Steps
 
 ### Immediate (MVP - Minimum Viable Product)
 - [x] Dense neural network implementation
@@ -245,7 +244,7 @@ The network discovers relationships like:
 
 ---
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
 ### Out of Memory (GPU)
 ```yaml
@@ -268,14 +267,14 @@ general:
 
 ---
 
-## 📚 References
+## References
 
 1. Ruczkowski et al. (2026) - Semi-empirical determination of radiative parameters for Nb II
 2. NIST Atomic Spectra Database - https://www.nist.gov/pml/atomic-spectra-database
 
 ---
 
-## 📧 Contact
+## Contact
 
 **Aga** - ML Developer  
 **Project:** Atomic Energy Level Prediction  
@@ -283,6 +282,6 @@ general:
 
 ---
 
-## 📄 License
+## License
 
 This project is developed for academic research. Please cite appropriately if used in publications.

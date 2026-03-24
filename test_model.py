@@ -16,7 +16,7 @@ Evaluation metrics:
 - R²: Coefficient of determination (0-1, higher is better)
 - MAPE: Mean Absolute Percentage Error (percentage accuracy)
 
-Author: Aga (ML Developer)
+Author: Aga
 """
 
 import torch

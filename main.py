@@ -16,8 +16,8 @@ Usage:
     # Use custom config
     python main.py --config my_config.yaml
 
-Author: Aga (ML Developer)
-For: Physics PhD project on atomic energy level prediction
+Author: Aga
+For: Physics project on atomic energy level prediction
 """
 
 import argparse

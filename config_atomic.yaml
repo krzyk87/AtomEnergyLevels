@@ -14,13 +14,13 @@ model:
   hidden_layers: [128, 64, 32]  # Hidden layer sizes for dense NN
   dropout: 0.3                  # Dropout rate (0.0 to disable)
   activation: relu              # Activation function: relu / leaky_relu / elu
-  use_batch_norm: true          # Whether to use batch normalization
+  use_batch_norm: false          # Whether to use batch normalization
   
   # Baseline ML models (for comparison)
   baseline_model: random_forest  # Options: linear_reg / random_forest / xgboost / gradient_boosting
 
 dataset:
-  data_file: "energy_Na_features.csv"  # Path to input data file
+  data_file: "data/Na_i_features.csv"  # Path to input data file
   
   # Input features - these columns will be used as model inputs
   # Orbital occupancies: electron count in each orbital (1s, 2s, 2p, etc.)

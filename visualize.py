@@ -9,7 +9,7 @@ This module creates plots to help understand:
 3. Feature importance
 4. Training progress
 
-Author: Aga (ML Developer)
+Author: Aga
 """
 
 import numpy as np

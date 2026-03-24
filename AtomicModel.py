@@ -13,8 +13,8 @@ Architecture:
 The network takes electron configuration + quantum numbers as input and outputs
 a single energy level prediction in cm⁻¹.
 
-Author: Aga (ML Developer)
-For: Physics PhD project on atomic energy level prediction
+Author: Aga
+For: Physics project on atomic energy level prediction
 """
 
 import torch
