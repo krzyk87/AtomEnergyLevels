@@ -113,37 +113,139 @@ class AtomicDataset(Dataset):
             self.scaler_target = None
         
         print(f"{subset.capitalize()} set: {len(self)} samples, {self.X.shape[1]} features")
-    
+
     def _get_feature_columns(self) -> list:
         """
-        Combine all requested feature types into a single list of column names.
-        
+        Automatically detect and select relevant features.
+
+        This method intelligently selects features based on:
+        1. Automatic orbital detection (digit+letter pattern)
+        2. Removing constant/empty columns (not informative)
+        3. Including quantum numbers and atomic properties
+        4. Handling single vs. multi-element datasets
+
         Returns:
             List of column names to use as input features
         """
+        import re
+
         features = []
-        
-        # Add orbital occupancy features (e.g., how many electrons in 3s, 3p, etc.)
-        if hasattr(self.config.dataset, 'orbital_features'):
-            features.extend(self.config.dataset.orbital_features)
-        
-        # Add quantum number features (J, S, L, parity)
-        if hasattr(self.config.dataset, 'quantum_features'):
-            features.extend(self.config.dataset.quantum_features)
-        
-        # Add atomic properties (Z, A, proton/neutron counts)
-        if hasattr(self.config.dataset, 'atomic_features'):
-            features.extend(self.config.dataset.atomic_features)
-        
-        # Add derived features if they were created
+
+        # ========================================
+        # AUTO-DETECT ORBITAL COLUMNS
+        # ========================================
+        # Pattern: 1s, 2p, 3d, 4f, 5g, 6h, etc.
+        orbital_pattern = re.compile(r'^\d+[spdfgh]$')
+
+        all_orbitals = [col for col in self.df.columns if orbital_pattern.match(col)]
+
+        print(f"\n{'=' * 60}")
+        print("FEATURE SELECTION")
+        print(f"{'=' * 60}")
+        print(f"Detected {len(all_orbitals)} orbital columns")
+
+        # Filter: keep only non-empty, non-constant orbitals
+        valid_orbitals = []
+        empty_orbitals = []
+        constant_orbitals = []
+
+        for col in all_orbitals:
+            # Check if empty (all zeros)
+            if self.df[col].sum() == 0:
+                empty_orbitals.append(col)
+                continue
+
+            # Check if constant (only one unique value)
+            if self.df[col].nunique() <= 1:
+                constant_orbitals.append(col)
+                continue
+
+            valid_orbitals.append(col)
+
+        print(f"  ✓ Kept {len(valid_orbitals)} informative orbitals")
+        print(f"  ✗ Removed {len(empty_orbitals)} empty orbitals")
+        print(f"  ✗ Removed {len(constant_orbitals)} constant orbitals")
+
+        features.extend(valid_orbitals)
+
+        # ========================================
+        # QUANTUM NUMBERS (always include if present)
+        # ========================================
+        quantum_cols = ['J', 'S_qn', 'L_qn', 'parity']
+        added_quantum = []
+
+        for col in quantum_cols:
+            if col in self.df.columns:
+                features.append(col)
+                added_quantum.append(col)
+
+        print(f"  ✓ Added {len(added_quantum)} quantum features: {added_quantum}")
+
+        # ========================================
+        # ATOMIC PROPERTIES (only if multi-element)
+        # ========================================
+        atomic_cols = ['Z', 'A', 'proton_number', 'neutron_number']
+        added_atomic = []
+        skipped_atomic = []
+
+        for col in atomic_cols:
+            if col in self.df.columns:
+                if self.df[col].nunique() > 1:
+                    # Multiple values = multi-element dataset
+                    features.append(col)
+                    added_atomic.append(col)
+                else:
+                    # Single value = single element (not useful as feature)
+                    skipped_atomic.append(col)
+
+        if added_atomic:
+            print(f"  ✓ Added {len(added_atomic)} atomic features: {added_atomic}")
+            print(f"    (Multi-element dataset detected)")
+        if skipped_atomic:
+            print(f"  ✗ Skipped {len(skipped_atomic)} constant atomic features: {skipped_atomic}")
+            print(f"    (Single-element dataset)")
+
+        # ========================================
+        # DERIVED FEATURES
+        # ========================================
         if self.config.dataset.add_derived_features:
-            derived = ['total_electrons', 'valence_electrons', 'core_electrons',
-                      'unpaired_electrons', 'max_principal_n']
-            features.extend([f for f in derived if f in self.df.columns])
-        
-        # Filter to only include columns that exist in the dataframe
+            derived_cols = ['total_electrons', 'valence_electrons', 'core_electrons',
+                            'unpaired_electrons', 'max_principal_n']
+            added_derived = [c for c in derived_cols if c in self.df.columns]
+            features.extend(added_derived)
+            print(f"  ✓ Added {len(added_derived)} derived features: {added_derived}")
+
+        # ========================================
+        # FORCE INCLUDE/EXCLUDE (from config)
+        # ========================================
+        if hasattr(self.config.dataset, 'force_include_features'):
+            for col in self.config.dataset.force_include_features:
+                if col in self.df.columns and col not in features:
+                    features.append(col)
+                    print(f"  ✓ Force-included: {col}")
+
+        if hasattr(self.config.dataset, 'force_exclude_features'):
+            for col in self.config.dataset.force_exclude_features:
+                if col in features:
+                    features.remove(col)
+                    print(f"  ✗ Force-excluded: {col}")
+
+        # ========================================
+        # FINAL VALIDATION
+        # ========================================
+        # Remove duplicates while preserving order
+        features = list(dict.fromkeys(features))
+
+        # Verify all exist in dataframe
         features = [f for f in features if f in self.df.columns]
-        
+
+        print(f"\n{'=' * 60}")
+        print(f"✓ SELECTED {len(features)} TOTAL FEATURES")
+        print(f"{'=' * 60}\n")
+
+        if len(features) == 0:
+            raise ValueError("No valid features found! Check your data file.")
+
         return features
     
     def _add_derived_features(self):
@@ -228,57 +330,79 @@ class AtomicDataset(Dataset):
                 fill_value = self.config.dataset.fill_missing_value
                 self.df[feature_cols] = self.df[feature_cols].fillna(fill_value)
                 print(f"Filled missing values with {fill_value}")
-    
+
     def _create_splits(self):
         """
         Split the dataset into train/validation/test sets.
-        
+
         Uses random splitting based on the ratios specified in config.
         Saves split indices to a JSON file for reproducibility.
+
+        **IMPORTANT:** Once splits are created, they are reused for all subsequent
+        experiments to ensure fair comparison during hyperparameter tuning.
         """
-        split_file = "dataset_split_indices.json"
-        
-        # If split file exists and we're not training, load existing splits
-        # This ensures val/test sets are consistent across runs
-        if os.path.exists(split_file) and self.subset != 'train':
+        # Get split file name from config or fall back to default
+        atom_name = self.config.dataset.data_file.split('_')[1].split('.')[0]  # Extract 'Na' from 'Na_features.csv'
+        default_split_file = f"dataset_split_indices_{atom_name}.json"
+        split_file_name = (
+            self.config.dataset.split_file
+            if hasattr(self.config.dataset, 'split_file')
+            else default_split_file
+        )
+        split_file = os.path.join("data", split_file_name)
+
+        # ✅ Load existing splits if available (for ALL subsets)
+        if os.path.exists(split_file):
             with open(split_file, 'r') as f:
                 splits = json.load(f)
             self.indices = splits[self.subset]
-            print(f"Loaded {self.subset} split from {split_file}")
+            print(f"Loaded {self.subset} split from {split_file} (using existing splits)")
             return
-        
-        # Create new splits (typically done once for training)
+
+        # ⚠️ Only create new splits if file doesn't exist
+        print(f"Creating NEW data splits (file not found: {split_file})")
+        print("⚠️  These splits will be used for all future experiments!")
+
         np.random.seed(self.config.general.random_seed)
-        
-        # Get all valid indices (rows in the dataframe)
+
+        # Get all valid indices
         all_indices = self.df.index.tolist()
         np.random.shuffle(all_indices)
-        
+
         # Calculate split sizes
         n_total = len(all_indices)
         n_train = int(n_total * self.config.dataset.split.train)
         n_val = int(n_total * self.config.dataset.split.val)
-        
+
         # Split indices
         train_indices = all_indices[:n_train]
         val_indices = all_indices[n_train:n_train + n_val]
         test_indices = all_indices[n_train + n_val:]
-        
-        # Save splits to file for reproducibility
+
+        # Save splits to file
         splits = {
             'train': train_indices,
             'val': val_indices,
-            'test': test_indices
+            'test': test_indices,
+            'metadata': {
+                'created_date': str(pd.Timestamp.now()),
+                'random_seed': self.config.general.random_seed,
+                'train_size': len(train_indices),
+                'val_size': len(val_indices),
+                'test_size': len(test_indices),
+                'data_file': self.config.dataset.data_file
+            }
         }
-        
+
+        os.makedirs("data", exist_ok=True)
         with open(split_file, 'w') as f:
             json.dump(splits, f, indent=2)
-        
+
         print(f"Created and saved data splits to {split_file}")
-        print(f"  Train: {len(train_indices)} samples")
-        print(f"  Val:   {len(val_indices)} samples")
-        print(f"  Test:  {len(test_indices)} samples")
-        
+        print(f"  Train: {len(train_indices)} samples ({len(train_indices) / n_total * 100:.1f}%)")
+        print(f"  Val:   {len(val_indices)} samples ({len(val_indices) / n_total * 100:.1f}%)")
+        print(f"  Test:  {len(test_indices)} samples ({len(test_indices) / n_total * 100:.1f}%)")
+
         # Store the indices for this subset
         self.indices = splits[self.subset]
     

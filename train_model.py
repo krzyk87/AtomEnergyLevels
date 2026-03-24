@@ -17,7 +17,7 @@ Key concepts for physics students:
 - Backward pass: Computing gradients (how to adjust weights)
 - Optimizer: Algorithm that updates weights based on gradients
 
-Author: Aga (ML Developer)
+Author: Aga
 """
 
 import torch
@@ -252,7 +252,21 @@ def train_model(config, model, train_loader, val_loader, device):
     # Path for saving the best model
     save_dir = config.logging.save_dir
     os.makedirs(save_dir, exist_ok=True)
-    best_model_path = os.path.join(save_dir, 'best_model.pt')
+
+    # Build a descriptive model filename encoding key config settings
+    atom_name = os.path.basename(config.dataset.data_file).split('_')[0]
+    layers_str = '-'.join(str(h) for h in config.model.hidden_layers)
+    model_filename = (
+        f"best_model"
+        f"_{atom_name}"
+        f"_{config.general.optimizer}"
+        f"_lr{config.general.lr}"
+        f"_bs{config.general.batch_size}"
+        f"_{layers_str}"
+        f"_drop{config.model.dropout}"
+        f".pt"
+    )
+    best_model_path = os.path.join(save_dir, model_filename)
     
     print(f"\n{'='*60}")
     print(f"Starting training for {config.general.epochs} epochs")

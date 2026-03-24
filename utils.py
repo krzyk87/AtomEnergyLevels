@@ -10,7 +10,7 @@ Functions:
 - get_device: Get PyTorch device (GPU or CPU)
 - create_loss_function: Create the loss function for training
 
-Author: Aga (ML Developer)
+Author: Aga
 """
 
 import yaml

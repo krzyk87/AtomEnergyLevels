@@ -20,8 +20,18 @@ model:
   baseline_model: random_forest  # Options: linear_reg / random_forest / xgboost / gradient_boosting
 
 dataset:
-  data_file: "data/Na_i_features.csv"  # Path to input data file
-  
+  data_file: "data/K_features.csv"  # Path to input data file
+  split_file: "dataset_split_indices_K.json"  # JSON file to save/load split indices (saved in data/)
+
+  # Feature selection - automatic
+  auto_detect_orbitals: true        # Automatically find orbital columns
+  remove_constant_features: true    # Remove features with only 1 unique value
+  remove_empty_features: true       # Remove all-zero columns
+
+  # Manually specify additional features (optional)
+  force_include_features: ['J', 'S_qn', 'L_qn', 'parity']  # Always include these
+  force_exclude_features: [ ]        # Explicitly exclude these
+
   # Input features - these columns will be used as model inputs
   # Orbital occupancies: electron count in each orbital (1s, 2s, 2p, etc.)
   orbital_features: ['1s', '2s', '2p', '3s', '3p', '3d', '4s', '4p', '4d', '4f',
