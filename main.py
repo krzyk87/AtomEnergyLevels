@@ -95,7 +95,7 @@ def main():
     print("\n" + "-"*60)
     print("CONFIGURATION")
     print("-"*60)
-    print(f"Data file: {config.dataset.data_file}")
+    # print(f"Data file: {config.dataset.data_file}")
     print(f"Model: {config.model.architecture}")
     print(f"Hidden layers: {config.model.hidden_layers}")
     print(f"Batch size: {config.general.batch_size}")

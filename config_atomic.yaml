@@ -20,8 +20,18 @@ model:
   baseline_model: random_forest  # Options: linear_reg / random_forest / xgboost / gradient_boosting
 
 dataset:
-  data_file: "data/K_features.csv"  # Path to input data file
-  split_file: "dataset_split_indices_K.json"  # JSON file to save/load split indices (saved in data/)
+  # Simple: just list elements
+  elements: [ 'Na', 'K' ]  # Or ['Na', 'K', 'Rb', 'Co', 'Ni']
+
+  # Data directory structure (assumes standard naming)
+  data_dir: "data"
+  # Expected files:
+  #   data/Na_features.csv
+  #   data/dataset_split_indices_Na.json
+
+  # Or for single element (backward compatible):
+#  data_file: "data/K_features.csv"  # Path to input data file
+#  split_file: "dataset_split_indices_K.json"  # JSON file to save/load split indices (saved in data/)
 
   # Encoding strategy
   encode_valence_electrons: true  # Use explicit electron encoding (true) OR use full orbital occupancy (false)

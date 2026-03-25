@@ -31,9 +31,9 @@ import os
 from AtomicDataset import AtomicDataset
 from AtomicModel import create_model
 from utils import (
-    create_loss_function, 
+    create_loss_function,
     save_checkpoint,
-    format_time
+    format_time, get_model_name_from_config
 )
 
 
@@ -253,19 +253,7 @@ def train_model(config, model, train_loader, val_loader, device):
     save_dir = config.logging.save_dir
     os.makedirs(save_dir, exist_ok=True)
 
-    # Build a descriptive model filename encoding key config settings
-    atom_name = os.path.basename(config.dataset.data_file).split('_')[0]
-    layers_str = '-'.join(str(h) for h in config.model.hidden_layers)
-    model_filename = (
-        f"best_model"
-        f"_{atom_name}"
-        f"_{config.general.optimizer}"
-        f"_lr{config.general.lr}"
-        f"_bs{config.general.batch_size}"
-        f"_{layers_str}"
-        f"_drop{config.model.dropout}"
-        f".pt"
-    )
+    model_filename = get_model_name_from_config(config)
     best_model_path = os.path.join(save_dir, model_filename)
     
     print(f"\n{'='*60}")
@@ -330,6 +318,31 @@ def train_model(config, model, train_loader, val_loader, device):
     print(f"{'='*60}\n")
     
     return best_model_path
+
+
+def _extract_element_from_filename(filepath: str) -> str:
+    """
+    Extract element symbol from filename.
+
+    Examples:
+        'data/energy_Na_features.csv' → 'Na'
+        'data/K_features.csv' → 'K'
+    """
+    import os
+    filename = os.path.basename(filepath)
+
+    # Try pattern: energy_ELEMENT_features.csv
+    if '_' in filename:
+        parts = filename.split('_')
+        if len(parts) >= 2:
+            # Remove 'energy' prefix if present
+            if parts[0].lower() == 'energy':
+                return parts[1]
+            else:
+                return parts[0]
+
+    # Fallback: use filename without extension
+    return os.path.splitext(filename)[0]
 
 
 def train_one_run(config):

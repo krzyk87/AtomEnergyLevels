@@ -29,7 +29,8 @@ import os
 
 from AtomicDataset import AtomicDataset
 from AtomicModel import create_model
-from utils import load_checkpoint
+from utils import load_checkpoint, get_model_name_from_config
+
 
 def convert_predictions_to_absolute(
         binding_energy_predictions: np.ndarray,
@@ -294,7 +295,13 @@ def test_one_run(
     
     # Load trained weights
     if checkpoint_path is None:
-        checkpoint_path = os.path.join(config.logging.save_dir, 'best_model.pt')
+        # Auto-determine checkpoint path
+        save_dir = config.logging.save_dir
+        model_name = get_model_name_from_config(config)
+        checkpoint_path = os.path.join(save_dir, f'{model_name}_best.pt')
+
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Model checkpoint not found: {checkpoint_path}")
     
     optimizer = torch.optim.Adam(model.parameters())  # Dummy optimizer for loading
     load_checkpoint(model, optimizer, checkpoint_path, device)
@@ -321,6 +328,23 @@ def test_one_run(
     )
     
     return metrics
+
+
+def _extract_element_from_filename(filepath: str) -> str:
+    """Extract element symbol from filename (same as in train_model.py)."""
+    import os
+
+    filename = os.path.basename(filepath)
+    name_without_ext = os.path.splitext(filename)[0]
+
+    if '_' in name_without_ext:
+        parts = name_without_ext.split('_')
+        if len(parts) >= 3 and parts[0].lower() == 'energy':
+            return parts[1]
+        elif len(parts) >= 2:
+            return parts[0]
+
+    return name_without_ext
 
 
 if __name__ == "__main__":

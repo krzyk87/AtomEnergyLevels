@@ -156,6 +156,65 @@ def create_loss_function(criterion_name: str):
     return criterion
 
 
+def get_model_name_from_config(config) -> str:
+    """
+    Generate model name from configuration.
+
+    Args:
+        config: Configuration object
+
+    Returns:
+        Model name (e.g., 'model_Na', 'model_K_Na')
+    """
+    # Build a descriptive model filename encoding key config settings
+    elements_str = ''
+    if hasattr(config.dataset, 'elements') and config.dataset.elements:
+        # Multi-element: use combined name sorted alphabetically
+        elements_str = '_'.join(sorted(config.dataset.elements))
+
+    elif hasattr(config.dataset, 'data_file') and config.dataset.data_file:
+        # Single element (backward compatible)
+        elements_str = extract_element_from_filename(config.dataset.data_file)
+
+    layers_str = '-'.join(str(h) for h in config.model.hidden_layers)
+    model_filename = (
+        f"best_model"
+        f"_{elements_str}"
+        f"_{config.general.optimizer}"
+        f"_lr{config.general.lr}"
+        f"_bs{config.general.batch_size}"
+        f"_{layers_str}"
+        f"_drop{config.model.dropout}"
+        f".pt"
+    )
+    return model_filename
+
+
+def extract_element_from_filename(filepath: str) -> str:
+    """
+    Extract element symbol from filename.
+
+    Args:
+        filepath: Path to data file
+
+    Returns:
+        Element symbol
+    """
+    import os
+
+    filename = os.path.basename(filepath)
+    name_without_ext = os.path.splitext(filename)[0]
+
+    if '_' in name_without_ext:
+        parts = name_without_ext.split('_')
+        if len(parts) >= 3 and parts[0].lower() == 'energy':
+            return parts[1]
+        elif len(parts) >= 2:
+            return parts[0]
+
+    return name_without_ext
+
+
 def save_checkpoint(model, optimizer, epoch, train_loss, val_loss, save_path):
     """
     Save a model checkpoint.

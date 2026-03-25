@@ -27,6 +27,8 @@ IONIZATION_ENERGIES = {
     'Na': (11, 41449.451),  # From NIST
     'K': (19, 35009.814),
     'Rb': (37, 27289.199),
+    'Cs': (55, 31406.467),
+    'Li': (3, 43487.150),
     'Co': (27, 63564.6),    # Approximate
     'Ni': (28, 61619.77),
     'Fe': (26, 63737.70),
@@ -45,6 +47,9 @@ class AtomicDataset(Dataset):
         scaler_features: Pre-fitted StandardScaler for features (used for val/test)
         scaler_target: Pre-fitted StandardScaler for target (used for val/test)
     """
+    # Class-level cache: shared across all instances
+    _data_cache = {}
+    _cache_key_counter = 0
     
     def __init__(
         self, 
@@ -66,32 +71,66 @@ class AtomicDataset(Dataset):
         """
         self.config = config
         self.subset = subset
-        
-        # Load the full dataset from CSV
-        self.df = pd.read_csv(config.dataset.data_file)
-        
-        print(f"Loaded {len(self.df)} atomic energy levels from {config.dataset.data_file}")
-        
-        # Add derived features if requested (total electrons, valence electrons, etc.)
-        if config.dataset.add_derived_features:
-            self._add_derived_features()
 
-        # Convert to binding energy target if requested (E_ion - E_level)
-        if config.dataset.get('use_binding_energy', False):
-            self._add_binding_energy_target()
+        # Generate cache key based on data configuration
+        cache_key = self._generate_cache_key()
 
-        # Prepare feature columns (inputs to the model)
-        self.feature_columns = self._get_feature_columns()
+        # Check if data already processed
+        if cache_key in AtomicDataset._data_cache:
+            print(f"\n{'=' * 60}")
+            print(f"Loading CACHED data for {subset} set")
+            print(f"{'=' * 60}")
 
-        # Prepare target column: binding energy or absolute energy level
-        if config.dataset.get('use_binding_energy', False):
-            self.target_column = 'Binding_Energy_cm-1'
-            print(f"  ✓ Target changed to binding energy")
+            # Retrieve cached data
+            cached = AtomicDataset._data_cache[cache_key]
+            self.df = cached['df']
+            self.feature_columns = cached['feature_columns']
+            self.target_column = cached['target_column']
+
+            print(f"  ✓ Using preprocessed data: {len(self.df)} total configurations")
+
         else:
+            # First time: process data and cache it
+            print(f"\n{'=' * 60}")
+            print(f"LOADING AND PREPROCESSING DATA")
+            print(f"{'=' * 60}")
+
+            # Load the full dataset
+            self.df = self._load_data()
+
+            print(f"\nLoaded {len(self.df)} atomic energy levels")
+
+            # Validate term symbols
+            self.validate_term_symbol()
+
+            # Add binding energy if requested
+            if config.dataset.get('use_binding_energy', False):
+                self._add_binding_energy_target()
+
+            # Add derived features if requested (total electrons, valence electrons, etc.)
+            if config.dataset.add_derived_features:
+                self._add_derived_features()
+
+            # Prepare feature columns
+            self.feature_columns = self._get_feature_columns()
+            # Prepare target column: binding energy or absolute energy level
+            # if config.dataset.get('use_binding_energy', False):
+            #     self.target_column = 'Binding_Energy_cm-1'
+            #     print(f"  ✓ Target changed to binding energy")
+            # else:
             self.target_column = config.dataset.target_feature
-        
-        # Handle missing values in the data
-        self._handle_missing_values()
+
+            # Handle missing values
+            self._handle_missing_values()
+
+            # ✅ Cache the preprocessed data
+            AtomicDataset._data_cache[cache_key] = {
+                'df': self.df.copy(),  # Store a copy
+                'feature_columns': self.feature_columns,
+                'target_column': self.target_column
+            }
+
+            print(f"\n✓ Data preprocessing complete and cached")
         
         # Split data into train/validation/test sets
         # This creates self.indices that contains row indices for this subset
@@ -132,6 +171,124 @@ class AtomicDataset(Dataset):
         
         print(f"{subset.capitalize()} set: {len(self)} samples, {self.X.shape[1]} features")
 
+    def _generate_cache_key(self) -> str:
+        """
+        Generate unique cache key based on data configuration.
+
+        Same configuration = same cache key = reuse processed data.
+        """
+        import hashlib
+        import json
+
+        # Create key from relevant config parameters
+        key_dict = {}
+
+        # Data source
+        if hasattr(self.config.dataset, 'elements'):
+            key_dict['elements'] = sorted(self.config.dataset.elements)
+        elif hasattr(self.config.dataset, 'data_file'):
+            key_dict['data_file'] = self.config.dataset.data_file
+
+        # Processing parameters that affect data
+        key_dict['use_binding_energy'] = self.config.dataset.get('use_binding_energy', False)
+        key_dict['add_derived_features'] = self.config.dataset.get('add_derived_features', False)
+        key_dict['encode_valence_electrons'] = self.config.dataset.get('encode_valence_electrons', False)
+        key_dict['max_valence_electrons'] = self.config.dataset.get('max_valence_electrons', 1)
+
+        # Convert to deterministic string
+        key_str = json.dumps(key_dict, sort_keys=True)
+
+        # Hash for compact key
+        return hashlib.md5(key_str.encode()).hexdigest()
+
+    @classmethod
+    def clear_cache(cls):
+        """Clear the data cache (useful for testing or memory management)."""
+        cls._data_cache = {}
+        print("Data cache cleared")
+
+    def _load_data(self) -> pd.DataFrame:
+        """
+        Load atomic energy data from single or multiple files.
+
+        Supports two modes:
+        1. Single element: config.dataset.data_file
+        2. Multiple elements: config.dataset.elements (list)
+
+        Returns:
+            Combined DataFrame with all data
+        """
+        # Mode 1: Multiple elements
+        if hasattr(self.config.dataset, 'elements') and self.config.dataset.elements:
+            elements = self.config.dataset.elements
+            data_dir = self.config.dataset.get('data_dir', 'data')
+
+            print(f"\nLoading multiple elements: {elements}")
+            print(f"Data directory: {data_dir}")
+
+            all_dfs = []
+
+            for element in elements:
+                # Construct filename: data/Na_features.csv
+                data_file = os.path.join(data_dir, f"{element}_features.csv")
+
+                if not os.path.exists(data_file):
+                    raise FileNotFoundError(
+                        f"Data file not found for element '{element}': {data_file}"
+                    )
+
+                print(f"  Loading {element}: {data_file}")
+                df = pd.read_csv(data_file)
+
+                # Add element identifier
+                df['Element'] = element
+
+                print(f"    → {len(df)} configurations")
+
+                all_dfs.append(df)
+
+            # Combine all dataframes
+            combined_df = pd.concat(all_dfs, ignore_index=True)
+            print(f"\n  ✓ Combined {len(all_dfs)} elements: {len(combined_df)} total configurations")
+
+            return combined_df
+
+        # Mode 2: Single file (backward compatible)
+        elif hasattr(self.config.dataset, 'data_file') and self.config.dataset.data_file:
+            data_file = self.config.dataset.data_file
+            print(f"\nLoading single element from: {data_file}")
+            df = pd.read_csv(data_file)
+
+            # Add element column if not present
+            if 'Element' not in df.columns:
+                # Extract element from filename: "energy_Na_features.csv" → "Na"
+                element = self._extract_element_from_filename(data_file)
+                df['Element'] = element
+                print(f"  Added Element column: {element}")
+
+            return df
+
+        else:
+            raise ValueError(
+                "Must specify either 'data_file' (single element) or "
+                "'elements' (multiple elements) in config.dataset"
+            )
+
+    def _extract_element_from_filename(self, filepath: str) -> str:
+        """Extract element symbol from filename."""
+        import os
+        filename = os.path.basename(filepath)
+        name_without_ext = os.path.splitext(filename)[0]
+
+        if '_' in name_without_ext:
+            parts = name_without_ext.split('_')
+            if len(parts) >= 3 and parts[0].lower() == 'energy':
+                return parts[1]
+            elif len(parts) >= 2:
+                return parts[0]
+
+        return name_without_ext
+
     def _encode_valence_electrons(self, max_valence=10):
         """
         Encode valence electrons as fixed-size feature vector of individual (n, l) pairs with padding.
@@ -139,6 +296,9 @@ class AtomicDataset(Dataset):
         This creates a FIXED number of features regardless of how many
         valence electrons the atom actually has. Atoms with fewer valence
         electrons are padded with zeros.
+
+        Handles NaN values that appear when combining data from different elements
+        with different orbital columns.
 
         Args:
             max_valence: Maximum number of valence electrons to encode.
@@ -155,6 +315,8 @@ class AtomicDataset(Dataset):
         # Get orbital columns
         orbital_pattern = re.compile(r'^(\d+)([spdfgh])$')
         orbital_cols = [col for col in self.df.columns if orbital_pattern.match(col)]
+
+        print(f"  Found {len(orbital_cols)} orbital columns: {orbital_cols[:10]}...")
 
         # Define orbital priority (which electrons count as "core" vs "valence")
         # Lower values = core (filled first), higher = valence
@@ -178,8 +340,17 @@ class AtomicDataset(Dataset):
             all_electrons = []
 
             for col in orbital_cols:
-                n_electrons = int(row[col])
+                n_electrons_raw = row[col]
+
+                # Skip if NaN (orbital doesn't exist for this element)
+                if pd.isna(n_electrons_raw):
+                    continue
+
+                # Convert to integer
+                n_electrons = int(n_electrons_raw)
+
                 if n_electrons > 0:
+                    # Parse orbital: '3d' → n=3, l=2
                     match = orbital_pattern.match(col)
                     n = int(match.group(1))
                     l_letter = match.group(2)
@@ -193,8 +364,10 @@ class AtomicDataset(Dataset):
             all_electrons.sort(key=lambda x: orbital_energy_order(x[2]))
 
             # Take only the last max_valence electrons (valence electrons)
-            valence_electrons = all_electrons[-max_valence:] if len(
-                all_electrons) >= max_valence else all_electrons
+            if len(all_electrons) >= max_valence:
+                valence_electrons = all_electrons[-max_valence:]
+            else:
+                valence_electrons = all_electrons
 
             # Pad with zeros at the BEGINNING if fewer than max_valence
             # This ensures valence electrons always appear in the same positions
@@ -223,10 +396,17 @@ class AtomicDataset(Dataset):
         print(f"  ✓ Created {len(feature_cols)} features ({max_valence} valence electrons)")
         print(f"  ✓ Actual valence electrons in data: {n_valence_actual} (padded to {max_valence})")
 
-        # Show example
-        example_idx = self.df.index[0]
-        example_features = [int(self.df.loc[example_idx, col]) for col in feature_cols]
-        print(f"  Example configuration: {example_features}")
+        # Show example for each element
+        if 'Element' in self.df.columns:
+            for element in self.df['Element'].unique():
+                element_df = self.df[self.df['Element'] == element]
+                example_idx = element_df.index[0]
+                example_features = [int(self.df.loc[example_idx, col]) for col in feature_cols]
+                print(f"  Example ({element}): {example_features}")
+        else:
+            example_idx = self.df.index[0]
+            example_features = [self.df.loc[example_idx, col] for col in feature_cols]
+            print(f"  Example: {example_features}")
 
     def _get_feature_columns(self) -> list:
         """
@@ -418,44 +598,74 @@ class AtomicDataset(Dataset):
         This represents how much energy is needed to remove the electron
         from this state to the ionization continuum.
         """
-        # Determine element from filename or Z number
-        if 'Z' in self.df.columns:
-            Z = self.df['Z'].iloc[0]
-            element = {11: 'Na', 19: 'K', 37: 'Rb', 27: 'Co', 28: 'Ni', 26: 'Fe'}.get(Z)
-        else:
-            # Extract from filename: "energy_Na_features.csv" → "Na"
-            import os
-            filename = os.path.basename(self.config.dataset.data_file)
-            element = filename.split('_')[1]  # Assumes format: energy_ELEMENT_features.csv
-
-        if element not in IONIZATION_ENERGIES:
-            raise ValueError(f"Ionization energy not defined for element: {element}")
-
-        Z, E_ion = IONIZATION_ENERGIES[element]
-
         print(f"\nConverting to binding energies:")
-        print(f"  Element: {element} (Z={Z})")
-        print(f"  Ionization energy: {E_ion:.2f} cm⁻¹")
 
-        # Calculate binding energy
-        E_level = self.df[self.config.dataset.target_feature]
-        binding_energy = E_ion - E_level
+        # Check if Element column exists
+        if 'Element' not in self.df.columns:
+            # Single element: extract from config or filename
+            if hasattr(self.config.dataset, 'elements') and self.config.dataset.elements:
+                element = self.config.dataset.elements[0]
+            elif hasattr(self.config.dataset, 'data_file'):
+                element = self._extract_element_from_filename(self.config.dataset.data_file)
+            else:
+                raise ValueError("Cannot determine element for binding energy calculation")
 
-        # Store both
-        self.df['Binding_Energy_cm-1'] = binding_energy
-        self.df['Ionization_Energy_cm-1'] = E_ion
+            # Add Element column
+            self.df['Element'] = element
+            print(f"  Added Element column: {element}")
 
-        # Validate (binding energies should all be positive)
-        if (binding_energy < 0).any():
-            n_negative = (binding_energy < 0).sum()
-            print(f"  ⚠️  Warning: {n_negative} levels have E > E_ionization (continuum states?)")
-            print(f"     These will be clipped to 0 (continuum threshold)")
-            binding_energy = binding_energy.clip(lower=0)
-            self.df['Binding_Energy_cm-1'] = binding_energy
+        # Get unique elements in dataset
+        unique_elements = self.df['Element'].unique()
+        print(f"  Elements in dataset: {list(unique_elements)}")
 
-        print(f"  ✓ Binding energy range: {binding_energy.min():.2f} to {binding_energy.max():.2f} cm⁻¹")
+        # Process each element separately
+        binding_energies = []
+        ionization_energies = []
 
-        self.original_target = self.config.dataset.target_feature
+        for idx, row in self.df.iterrows():
+            element = row['Element']
+
+            if element not in IONIZATION_ENERGIES:
+                raise ValueError(
+                    f"Ionization energy not defined for element: {element}\n"
+                    f"Available elements: {list(IONIZATION_ENERGIES.keys())}"
+                )
+
+            Z, E_ion = IONIZATION_ENERGIES[element]
+            E_level = row[self.config.dataset.target_feature]
+
+            # Calculate binding energy for this row
+            binding_energy = E_ion - E_level
+
+            binding_energies.append(binding_energy)
+            ionization_energies.append(E_ion)
+
+        # Add to dataframe
+        self.df['Binding_Energy_cm-1'] = binding_energies
+        self.df['Ionization_Energy_cm-1'] = ionization_energies
+
+        # Report statistics per element
+        for element in unique_elements:
+            element_mask = self.df['Element'] == element
+            element_binding = self.df.loc[element_mask, 'Binding_Energy_cm-1']
+            Z, E_ion = IONIZATION_ENERGIES[element]
+
+            print(f"\n  {element} (Z={Z}):")
+            print(f"    Ionization energy: {E_ion:.2f} cm⁻¹")
+            print(f"    Binding energy range: {element_binding.min():.2f} to {element_binding.max():.2f} cm⁻¹")
+
+            # Check for continuum states (E_level > E_ionization)
+            n_negative = (element_binding < 0).sum()
+            if n_negative > 0:
+                print(f"    ⚠️  {n_negative} levels above ionization (clipped to 0)")
+
+        # Clip negative values (continuum states)
+        self.df['Binding_Energy_cm-1'] = self.df['Binding_Energy_cm-1'].clip(lower=0)
+
+        # Update target column
+        self.config.dataset.target_feature = 'Binding_Energy_cm-1'
+        print(f"\n  ✓ Target changed to: Binding_Energy_cm-1")
+
 
     def _handle_missing_values(self):
         """
@@ -486,53 +696,47 @@ class AtomicDataset(Dataset):
 
     def _create_splits(self):
         """
-        Split the dataset into train/validation/test sets.
+        Create or load train/val/test splits.
 
-        Uses random splitting based on the ratios specified in config.
-        Saves split indices to a JSON file for reproducibility.
-
-        **IMPORTANT:** Once splits are created, they are reused for all subsequent
-        experiments to ensure fair comparison during hyperparameter tuning.
+        For multi-element data, creates stratified splits to ensure
+        each element is represented in all splits.
         """
-        # Get split file name from config or fall back to default
-        atom_name = self.config.dataset.data_file.split('_')[1].split('.')[0]  # Extract 'Na' from 'Na_features.csv'
-        default_split_file = f"dataset_split_indices_{atom_name}.json"
-        split_file_name = (
-            self.config.dataset.split_file
-            if hasattr(self.config.dataset, 'split_file')
-            else default_split_file
-        )
-        split_file = os.path.join("data", split_file_name)
+        # Determine split file name
+        if hasattr(self.config.dataset, 'elements') and len(self.config.dataset.elements) > 1:
+            # Multi-element: use combined name
+            elements_str = '_'.join(sorted(self.config.dataset.elements))
+            split_file = f"dataset_split_indices_{elements_str}.json"
+        else:
+            # Single element: element-specific split file
+            element = self.df['Element'].iloc[0]
+            split_file = f"dataset_split_indices_{element}.json"
 
-        # ✅ Load existing splits if available (for ALL subsets)
+        # Add data_dir if specified
+        if hasattr(self.config.dataset, 'data_dir'):
+            split_file = os.path.join(self.config.dataset.data_dir, split_file)
+
+        print(f"\nData split file: {split_file}")
+
+        # Load existing splits if available
         if os.path.exists(split_file):
             with open(split_file, 'r') as f:
                 splits = json.load(f)
             self.indices = splits[self.subset]
-            print(f"Loaded {self.subset} split from {split_file} (using existing splits)")
+            print(f"  ✓ Loaded existing {self.subset} split: {len(self.indices)} samples")
             return
 
-        # ⚠️ Only create new splits if file doesn't exist
-        print(f"Creating NEW data splits (file not found: {split_file})")
-        print("⚠️  These splits will be used for all future experiments!")
-
+        # Create new splits
+        print(f"  Creating new splits...")
         np.random.seed(self.config.general.random_seed)
 
-        # Get all valid indices
-        all_indices = self.df.index.tolist()
-        np.random.shuffle(all_indices)
+        # For multi-element: stratified split (ensure each element in all splits)
+        if 'Element' in self.df.columns and self.df['Element'].nunique() > 1:
+            train_indices, val_indices, test_indices = self._create_stratified_splits()
+        else:
+            # Single element: simple random split
+            train_indices, val_indices, test_indices = self._create_random_splits()
 
-        # Calculate split sizes
-        n_total = len(all_indices)
-        n_train = int(n_total * self.config.dataset.split.train)
-        n_val = int(n_total * self.config.dataset.split.val)
-
-        # Split indices
-        train_indices = all_indices[:n_train]
-        val_indices = all_indices[n_train:n_train + n_val]
-        test_indices = all_indices[n_train + n_val:]
-
-        # Save splits to file
+        # Save splits
         splits = {
             'train': train_indices,
             'val': val_indices,
@@ -540,25 +744,82 @@ class AtomicDataset(Dataset):
             'metadata': {
                 'created_date': str(pd.Timestamp.now()),
                 'random_seed': self.config.general.random_seed,
+                'elements': self.df['Element'].unique().tolist(),
                 'train_size': len(train_indices),
                 'val_size': len(val_indices),
                 'test_size': len(test_indices),
-                'data_file': self.config.dataset.data_file
             }
         }
 
-        os.makedirs("data", exist_ok=True)
+        os.makedirs(os.path.dirname(split_file) if os.path.dirname(split_file) else '.', exist_ok=True)
         with open(split_file, 'w') as f:
             json.dump(splits, f, indent=2)
 
-        print(f"Created and saved data splits to {split_file}")
-        print(f"  Train: {len(train_indices)} samples ({len(train_indices) / n_total * 100:.1f}%)")
-        print(f"  Val:   {len(val_indices)} samples ({len(val_indices) / n_total * 100:.1f}%)")
-        print(f"  Test:  {len(test_indices)} samples ({len(test_indices) / n_total * 100:.1f}%)")
+        print(f"  ✓ Created and saved splits to {split_file}")
+        self._print_split_statistics(train_indices, val_indices, test_indices)
 
-        # Store the indices for this subset
         self.indices = splits[self.subset]
-    
+
+    def _create_stratified_splits(self):
+        """
+        Create stratified splits ensuring each element appears in all sets.
+        """
+        from sklearn.model_selection import train_test_split
+
+        all_indices = self.df.index.tolist()
+        elements = self.df['Element'].values
+
+        # First split: train vs (val+test)
+        train_idx, temp_idx = train_test_split(
+            all_indices,
+            test_size=(self.config.dataset.split.val + self.config.dataset.split.test),
+            stratify=elements,
+            random_state=self.config.general.random_seed
+        )
+
+        # Second split: val vs test
+        val_ratio = self.config.dataset.split.val / (self.config.dataset.split.val + self.config.dataset.split.test)
+        val_idx, test_idx = train_test_split(
+            temp_idx,
+            test_size=(1 - val_ratio),
+            stratify=elements[temp_idx],
+            random_state=self.config.general.random_seed
+        )
+
+        return train_idx, val_idx, test_idx
+
+    def _create_random_splits(self):
+        """Create simple random splits (for single element)."""
+        all_indices = self.df.index.tolist()
+        np.random.shuffle(all_indices)
+
+        n_total = len(all_indices)
+        n_train = int(n_total * self.config.dataset.split.train)
+        n_val = int(n_total * self.config.dataset.split.val)
+
+        train_indices = all_indices[:n_train]
+        val_indices = all_indices[n_train:n_train + n_val]
+        test_indices = all_indices[n_train + n_val:]
+
+        return train_indices, val_indices, test_indices
+
+    def _print_split_statistics(self, train_idx, val_idx, test_idx):
+        """Print statistics about the splits, including per-element breakdown."""
+        print(f"\n  Split statistics:")
+        print(f"    Train: {len(train_idx)} samples ({len(train_idx) / len(self.df) * 100:.1f}%)")
+        print(f"    Val:   {len(val_idx)} samples ({len(val_idx) / len(self.df) * 100:.1f}%)")
+        print(f"    Test:  {len(test_idx)} samples ({len(test_idx) / len(self.df) * 100:.1f}%)")
+
+        # Per-element breakdown
+        if 'Element' in self.df.columns:
+            print(f"\n  Per-element distribution:")
+            for element in sorted(self.df['Element'].unique()):
+                n_train = sum(self.df.loc[train_idx, 'Element'] == element)
+                n_val = sum(self.df.loc[val_idx, 'Element'] == element)
+                n_test = sum(self.df.loc[test_idx, 'Element'] == element)
+                n_total = sum(self.df['Element'] == element)
+                print(f"    {element}: Train={n_train}, Val={n_val}, Test={n_test} (Total={n_total})")
+
     def __len__(self) -> int:
         """Return the number of samples in this dataset."""
         return len(self.X)
@@ -612,7 +873,11 @@ class AtomicDataset(Dataset):
         This catches data entry errors.
         """
         if 'Term' not in self.df.columns:
+            print("  ℹ️  No 'Term' column found - skipping validation")
             return
+
+        # Mapping from L quantum number to letter
+        L_LETTER_MAP = {0: 'S', 1: 'P', 2: 'D', 3: 'F', 4: 'G', 5: 'H', 6: 'I', 7: 'K'}
 
         errors = []
 
@@ -623,16 +888,45 @@ class AtomicDataset(Dataset):
             J = row['J']
 
             # Parse term symbol: ²P₃/₂ → multiplicity=2, L_letter='P', J_term=1.5
+            # Examples: "2S", "2P*", "2D", "4F", "2[3/2]*"
+            # Pattern: (multiplicity)(L_letter)(optional_subscript)(optional_asterisk)
+            match = re.match(r'^(\d+)([A-Z]).*?(\*?)$', term)
+
+            if not match:
+                # Handle bracket notation: "2[3/2]*"
+                match_bracket = re.match(r'^(\d+)\[.*?\](\*?)$', term)
+                if match_bracket:
+                    continue  # Skip bracket notation (different convention)
+                errors.append(f"Row {idx}: Cannot parse term '{term}'")
+                continue
+
+            multiplicity_str, L_letter, asterisk = match.groups()
+            multiplicity_term = int(multiplicity_str)
+
+            # Check multiplicity: should equal 2*S + 1
             multiplicity_expected = int(2 * S_qn + 1)
-            L_letter_map = {0: 'S', 1: 'P', 2: 'D', 3: 'F', 4: 'G', 5: 'H'}
-            L_letter_expected = L_letter_map.get(int(L_qn), '?')
+            if multiplicity_term != multiplicity_expected:
+                errors.append(
+                    f"Row {idx}: Term '{term}' has multiplicity {multiplicity_term}, "
+                    f"but S_qn={S_qn} implies {multiplicity_expected}"
+                )
 
-            # Check if term matches
-            if not term.startswith(str(multiplicity_expected)):
-                errors.append(f"Row {idx}: Term '{term}' multiplicity doesn't match S_qn={S_qn}")
+            # Check L letter
+            L_letter_expected = L_LETTER_MAP.get(int(L_qn), '?')
+            if L_letter != L_letter_expected:
+                errors.append(
+                    f"Row {idx}: Term '{term}' has L='{L_letter}', "
+                    f"but L_qn={L_qn} implies '{L_letter_expected}'"
+                )
 
-            if L_letter_expected not in term:
-                errors.append(f"Row {idx}: Term '{term}' L doesn't match L_qn={L_qn}")
+            # Check parity (asterisk = odd parity)
+            if 'parity' in row:
+                parity = row['parity']
+                has_asterisk = (asterisk == '*')
+                is_odd_parity = (parity == -1 or parity == 1)  # Depends on encoding
+
+                # Note: This check depends on how parity is encoded in your data
+                # Adjust as needed
 
         if errors:
             print(f"⚠️  Found {len(errors)} term symbol mismatches:")
