@@ -168,6 +168,12 @@ class AtomicDataset(Dataset):
                 self.y = self.scaler_target.transform(self.y)
         else:
             self.scaler_target = None
+
+        # Compute sample weights if requested
+        if self.config.dataset.get('use_sample_weights', False):
+            self.sample_weights = self._compute_sample_weights()
+        else:
+            self.sample_weights = None
         
         print(f"{subset.capitalize()} set: {len(self)} samples, {self.X.shape[1]} features")
 
@@ -407,6 +413,123 @@ class AtomicDataset(Dataset):
             example_idx = self.df.index[0]
             example_features = [self.df.loc[example_idx, col] for col in feature_cols]
             print(f"  Example: {example_features}")
+
+    def _compute_sample_weights(self):
+        """
+        Compute sample weights based on energy distribution.
+
+        Gives higher weight to underrepresented energy ranges to address
+        class imbalance (e.g., few low-energy states, many high-energy states).
+
+        Returns:
+            Array of weights for each sample
+        """
+        # Get target values for this subset
+        if self.config.dataset.get('use_binding_energy', False):
+            target_col = 'Binding_Energy_cm-1'
+        else:
+            target_col = self.config.dataset.target_feature
+
+        energies = self.df.loc[self.indices, target_col].values
+
+        # Choose binning strategy
+        weight_strategy = self.config.dataset.get('weight_strategy', 'energy_bins')
+
+        if weight_strategy == 'energy_bins':
+            # Bin energies and weight by inverse frequency
+            n_bins = self.config.dataset.get('n_energy_bins', 10)
+            weights = self._compute_bin_weights(energies, n_bins)
+
+        elif weight_strategy == 'distance_to_ground':
+            # Weight by distance from ground state (emphasize low energies)
+            weights = self._compute_distance_weights(energies)
+
+        elif weight_strategy == 'kde':
+            # Kernel density estimation (smoothest)
+            weights = self._compute_kde_weights(energies)
+
+        else:
+            raise ValueError(f"Unknown weight_strategy: {weight_strategy}")
+
+        # Normalize weights to average 1.0 (keeps loss scale similar)
+        weights = weights / weights.mean()
+
+        print(f"\n  Sample weighting:")
+        print(f"    Strategy: {weight_strategy}")
+        print(f"    Weight range: {weights.min():.2f} to {weights.max():.2f}")
+        print(f"    Avg weight: {weights.mean():.2f}")
+
+        return weights
+
+    def _compute_bin_weights(self, energies: np.ndarray, n_bins: int):
+        """
+        Compute weights using energy binning.
+
+        Divides energy range into bins and assigns weight = 1/count_in_bin
+        """
+        # Create bins
+        bins = np.linspace(energies.min(), energies.max(), n_bins + 1)
+        bin_indices = np.digitize(energies, bins) - 1
+
+        # Count samples per bin
+        bin_counts = np.bincount(bin_indices, minlength=n_bins)
+
+        # Avoid division by zero
+        bin_counts = np.maximum(bin_counts, 1)
+
+        # Compute weights: inverse frequency
+        weights = 1.0 / bin_counts[bin_indices]
+
+        # Report distribution
+        print(f"    Energy bins: {n_bins}")
+        for i in range(n_bins):
+            if bin_counts[i] > 0:
+                energy_range = f"{bins[i]:.0f}-{bins[i + 1]:.0f}"
+                avg_weight = 1.0 / bin_counts[i]
+                print(f"      Bin {i + 1} ({energy_range} cm⁻¹): {bin_counts[i]} samples, weight={avg_weight:.2f}")
+
+        return weights
+
+    def _compute_distance_weights(self, energies: np.ndarray):
+        """
+        Weight by distance from minimum energy.
+
+        Emphasizes low-energy states (near ground state) over high-energy states.
+        """
+        min_energy = energies.min()
+        distances = energies - min_energy
+
+        # Weight inversely proportional to distance from ground
+        # Add small constant to avoid division by zero
+        epsilon = (energies.max() - energies.min()) * 0.01
+        weights = 1.0 / (distances + epsilon)
+
+        return weights
+
+    def _compute_kde_weights(self, energies: np.ndarray):
+        """
+        Kernel Density Estimation for smooth weighting.
+
+        Uses Gaussian KDE to estimate density, then weights = 1/density
+        """
+        from scipy.stats import gaussian_kde
+
+        # Fit KDE
+        kde = gaussian_kde(energies)
+
+        # Evaluate density at each point
+        densities = kde(energies)
+
+        # Weight = inverse density
+        weights = 1.0 / densities
+
+        return weights
+
+    def get_sample_weight(self, idx: int) -> float:
+        """Get weight for a specific sample index."""
+        if self.sample_weights is None:
+            return 1.0
+        return self.sample_weights[idx]
 
     def _get_feature_columns(self) -> list:
         """

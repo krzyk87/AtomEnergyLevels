@@ -73,7 +73,6 @@ def train_one_epoch(
     model.train()
     
     running_loss = 0.0
-    num_batches = 0
     
     # Iterate through batches of training data
     for batch_idx, (features, targets) in enumerate(train_loader):
@@ -90,6 +89,23 @@ def train_one_epoch(
         
         # Compute loss (how far are predictions from true values)
         loss = criterion(predictions, targets)
+
+        # Apply sample weights if available
+        if hasattr(train_loader.dataset, 'sample_weights') and train_loader.dataset.sample_weights is not None:
+            # Get batch indices
+            batch_indices = train_loader.dataset.indices[
+                batch_idx * config.general.batch_size:
+                (batch_idx + 1) * config.general.batch_size
+            ]
+
+            # Get weights for this batch
+            batch_weights = torch.FloatTensor([
+                train_loader.dataset.get_sample_weight(i)
+                for i in range(len(features))
+            ]).to(device)
+
+            # Apply weights to loss
+            loss = (loss * batch_weights.unsqueeze(1)).mean()
         
         # Backward pass: compute gradients
         # This calculates how much each weight contributed to the loss
@@ -109,10 +125,9 @@ def train_one_epoch(
         
         # Track loss for this batch
         running_loss += loss.item()
-        num_batches += 1
     
     # Average loss across all batches
-    avg_loss = running_loss / num_batches
+    avg_loss = running_loss / len(train_loader)
     
     return avg_loss
 
