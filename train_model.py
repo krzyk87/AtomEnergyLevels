@@ -136,7 +136,8 @@ def validate(
     model: nn.Module,
     val_loader: DataLoader,
     criterion: nn.Module,
-    device: torch.device
+    device: torch.device,
+    val_dataset: AtomicDataset
 ) -> Tuple[float, float, float]:
     """
     Evaluate the model on validation data.
@@ -190,13 +191,18 @@ def validate(
     
     # Compute metrics
     avg_loss = running_loss / num_batches
-    mae = np.mean(np.abs(all_predictions - all_targets))
-    rmse = np.sqrt(np.mean((all_predictions - all_targets) ** 2))
+
+    # Inverse transform BEFORE computing metrics
+    predictions_cm = val_dataset.inverse_transform_target(all_predictions)
+    targets_cm = val_dataset.inverse_transform_target(all_targets)
+
+    mae = np.mean(np.abs(predictions_cm - targets_cm))
+    rmse = np.sqrt(np.mean((predictions_cm - targets_cm) ** 2))
     
     return avg_loss, mae, rmse
 
 
-def train_model(config, model, train_loader, val_loader, device):
+def train_model(config, model, train_loader, val_loader, device, val_dataset):
     """
     Complete training pipeline.
     
@@ -288,7 +294,7 @@ def train_model(config, model, train_loader, val_loader, device):
         
         # Validate
         val_loss, val_mae, val_rmse = validate(
-            model, val_loader, criterion, device
+            model, val_loader, criterion, device, val_dataset
         )
         
         # Update learning rate if using scheduler
@@ -422,7 +428,7 @@ def train_one_run(config):
     
     # Train model
     best_model_path = train_model(
-        config, model, train_loader, val_loader, device
+        config, model, train_loader, val_loader, device, val_dataset
     )
     
     return best_model_path
