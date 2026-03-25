@@ -298,7 +298,7 @@ def test_one_run(
         # Auto-determine checkpoint path
         save_dir = config.logging.save_dir
         model_name = get_model_name_from_config(config)
-        checkpoint_path = os.path.join(save_dir, f'{model_name}_best.pt')
+        checkpoint_path = os.path.join(save_dir, model_name)
 
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Model checkpoint not found: {checkpoint_path}")
@@ -313,7 +313,12 @@ def test_one_run(
 
     # If trained on binding energies, convert predictions back to absolute energy levels
     if config.dataset.get('use_binding_energy', False):
-        element = os.path.basename(config.dataset.data_file).split('_')[0]
+        # Get element from the dataset (supports both single and multi-element datasets)
+        unique_elements = test_dataset.df['Element'].unique()
+        if len(unique_elements) > 1:
+            print(f"Warning: Multiple elements in test set: {unique_elements}. Using first element for conversion.")
+        element = unique_elements[0]
+
         predictions = convert_predictions_to_absolute(predictions, element)
         targets = convert_predictions_to_absolute(targets, element)
         metrics = compute_metrics(predictions, targets)
