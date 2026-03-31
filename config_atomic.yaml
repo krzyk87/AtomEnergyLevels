@@ -54,7 +54,9 @@ dataset:
   
   # Target to predict (output)
   target_feature: "Level (cm-1)"
-  use_binding_energy: true        # Convert to binding energy
+  use_binding_energy: true        # Convert to binding energy: predict (E_ion - E_level) instead of E_level
+  use_inverse_target: false       # Apply inverse scaling: predict A / E_target instead of E_target
+  inverse_target_scale: 100000    # Scale factor A used in inverse transformation (A / E_target)
   
   # Feature engineering: whether to add derived features
   add_derived_features: false    # Add total_electrons, valence_electrons, core_electrons, unpaired_electrons, max_principal_n
@@ -64,7 +66,7 @@ dataset:
   normalize_target: true        # Standardize target variable
 
   # Sample weighting for imbalanced energy distributions
-  use_sample_weights: true
+  use_sample_weights: false
   weight_strategy: 'energy_bins'  # energy_bins / distance_to_ground / kde
   n_energy_bins: 10               # Number of bins for energy_bins strategy
   

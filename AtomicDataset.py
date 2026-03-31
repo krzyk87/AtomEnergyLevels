@@ -107,6 +107,11 @@ class AtomicDataset(Dataset):
             if config.dataset.get('use_binding_energy', False):
                 self._add_binding_energy_target()
 
+            # Apply inverse target scaling if requested: stores A / E_target
+            # Works on whatever target is active (raw level or binding energy)
+            if config.dataset.get('use_inverse_target', False):
+                self._add_inverse_target()
+
             # Add derived features if requested (total electrons, valence electrons, etc.)
             if config.dataset.add_derived_features:
                 self._add_derived_features()
@@ -197,6 +202,8 @@ class AtomicDataset(Dataset):
 
         # Processing parameters that affect data
         key_dict['use_binding_energy'] = self.config.dataset.get('use_binding_energy', False)
+        key_dict['use_inverse_target'] = self.config.dataset.get('use_inverse_target', False)
+        key_dict['inverse_target_scale'] = self.config.dataset.get('inverse_target_scale', 100000)
         key_dict['add_derived_features'] = self.config.dataset.get('add_derived_features', False)
         key_dict['encode_valence_electrons'] = self.config.dataset.get('encode_valence_electrons', False)
         key_dict['max_valence_electrons'] = self.config.dataset.get('max_valence_electrons', 1)
@@ -424,12 +431,9 @@ class AtomicDataset(Dataset):
         Returns:
             Array of weights for each sample
         """
-        # Get target values for this subset
-        if self.config.dataset.get('use_binding_energy', False):
-            target_col = 'Binding_Energy_cm-1'
-        else:
-            target_col = self.config.dataset.target_feature
-
+        # Resolve whichever target column is currently active
+        # (may have been updated by _add_binding_energy_target / _add_inverse_target)
+        target_col = self.config.dataset.target_feature
         energies = self.df.loc[self.indices, target_col].values
 
         # Choose binning strategy
@@ -789,6 +793,51 @@ class AtomicDataset(Dataset):
         self.config.dataset.target_feature = 'Binding_Energy_cm-1'
         print(f"\n  ✓ Target changed to: Binding_Energy_cm-1")
 
+    def _add_inverse_target(self):
+        """
+        Apply inverse scaling to the target variable: stores A / E_target.
+
+        Instead of predicting E directly, the model predicts A / E,
+        where A is a large constant (e.g. 100 000). This compresses the
+        dynamic range: high energies → small values, low energies → large
+        values — the opposite of the raw distribution.
+
+        Mathematically:
+            Raw target:            E_level
+            With binding energy:   E_ion - E_level
+            With inverse scaling:  A / E_target   (applied to whichever is active)
+
+        After prediction the model output must be inverted:
+            E_target = A / model_output
+
+        NOTE: rows where E_target == 0 are dropped to avoid division by zero.
+        These correspond to continuum states already clipped to 0 by
+        _add_binding_energy_target(), so removing them is physically correct.
+        """
+        A = self.config.dataset.get('inverse_target_scale', 100000)
+        target_col = self.config.dataset.target_feature  # already updated by binding energy step
+        inv_col = f'Inverse_{target_col}'
+
+        print(f"\nApplying inverse target scaling (A={A}):")
+        print(f"  Input column:  {target_col}")
+        print(f"  Output column: {inv_col}")
+
+        # Drop rows where target == 0 (division by zero; physically: continuum states)
+        zero_mask = self.df[target_col] == 0
+        n_zeros = zero_mask.sum()
+        if n_zeros > 0:
+            self.df = self.df[~zero_mask].reset_index(drop=True)
+            print(f"  ⚠️  Dropped {n_zeros} rows with E_target=0 (would cause division by zero)")
+
+        self.df[inv_col] = A / self.df[target_col]
+
+        # Report range so you can sanity-check the values look reasonable
+        print(f"  Inverse target range: {self.df[inv_col].min():.4f} to {self.df[inv_col].max():.4f}")
+
+        # Update target column name (same pattern as _add_binding_energy_target)
+        self.config.dataset.target_feature = inv_col
+        print(f"  ✓ Target changed to: {inv_col}")
+
 
     def _handle_missing_values(self):
         """
@@ -979,6 +1028,9 @@ class AtomicDataset(Dataset):
         
         This is used after making predictions to convert the model's output
         (which is in normalized space) back to physical energy levels.
+        Undoes, in order:
+            1. StandardScaler normalization (if normalize_target=True)
+            2. Inverse scaling: E = A / model_output  (if use_inverse_target=True)
         
         Args:
             y_normalized: Normalized target values
@@ -986,9 +1038,18 @@ class AtomicDataset(Dataset):
         Returns:
             Target values in original scale (cm⁻¹)
         """
+        y = y_normalized.copy()
+        # Step 1: undo StandardScaler
         if self.scaler_target is not None:
-            return self.scaler_target.inverse_transform(y_normalized)
-        return y_normalized
+            y = self.scaler_target.inverse_transform(y_normalized)
+
+        # Step 2: undo A / E_target  →  E_target = A / y
+        if self.config.dataset.get('use_inverse_target', False):
+            A = self.config.dataset.get('inverse_target_scale', 100000)
+            # Clip to avoid division by zero from a near-zero model output
+            y = A / np.clip(y, a_min=1e-6, a_max=None)
+
+        return y
 
     def validate_term_symbol(self):
         """
