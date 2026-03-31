@@ -24,14 +24,14 @@ import re
 
 IONIZATION_ENERGIES = {
     # Element: (Z, ionization_energy_cm-1)
+    'Li': (3, 43487.114),
     'Na': (11, 41449.451),  # From NIST
     'K': (19, 35009.814),
-    'Rb': (37, 27289.199),
-    'Cs': (55, 31406.467),
-    'Li': (3, 43487.150),
-    'Co': (27, 63564.6),    # Approximate
-    'Ni': (28, 61619.77),
     'Fe': (26, 63737.70),
+    'Co': (27, 63564.6),
+    'Ni': (28, 61619.77),
+    'Cs': (55, 31406.467),
+    'Rb': (37, 33690.81),
 }
 
 class AtomicDataset(Dataset):

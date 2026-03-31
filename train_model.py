@@ -150,6 +150,7 @@ def validate(
         val_loader: DataLoader for validation data
         criterion: Loss function
         device: CPU or GPU
+        val_dataset: dataset object used for validation
     
     Returns:
         Tuple of (loss, MAE, RMSE)
@@ -219,6 +220,7 @@ def train_model(config, model, train_loader, val_loader, device, val_dataset):
         train_loader: Training data loader
         val_loader: Validation data loader
         device: CPU or GPU
+        val_dataset: Dataset object used for validation
     
     Returns:
         Path to saved best model
