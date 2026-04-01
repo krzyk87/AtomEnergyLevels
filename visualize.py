@@ -512,11 +512,13 @@ def plot_dataset_energy_distributions(
 
 if __name__ == "__main__":
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Create visualization plots")
-    parser.add_argument('--predictions', type=str, 
+    parser.add_argument('--config', type=str, default=None,
+                        help='Path to config YAML — auto-derives predictions filename when provided')
+    parser.add_argument('--predictions', type=str,
                        default='saved_models/predictions.csv',
-                       help='Path to predictions CSV file')
+                       help='Path to predictions CSV file (ignored when --config is given)')
     parser.add_argument('--output_dir', type=str,
                        default='visualizations',
                        help='Directory to save plots')
@@ -530,8 +532,15 @@ if __name__ == "__main__":
     parser.add_argument('--big_A', type=float, default=100000.0,
                         help='Constant A used in A/E and A/(E_ion - E)')
     args = parser.parse_args()
-    
-    create_all_visualizations(args.predictions, args.output_dir)
+
+    if args.config:
+        from utils import load_config, get_predictions_filename
+        _cfg = load_config(args.config)
+        predictions_path = os.path.join(_cfg.logging.save_dir, get_predictions_filename(_cfg))
+    else:
+        predictions_path = args.predictions
+
+    create_all_visualizations(predictions_path, args.output_dir)
 
     if args.plot_dataset_dists:
         features_list = [p.strip() for p in args.features_csvs.split(',') if p.strip()]

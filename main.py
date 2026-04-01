@@ -24,7 +24,7 @@ import argparse
 import os
 import sys
 
-from utils import load_config, set_seed, check_cuda
+from utils import load_config, set_seed, check_cuda, get_model_name_from_config
 from train_model import train_one_run
 from test_model import test_one_run
 
@@ -131,7 +131,7 @@ def main():
         checkpoint = args.checkpoint if args.checkpoint else best_model_path
         
         if checkpoint is None:
-            checkpoint = os.path.join(config.logging.save_dir, 'best_model.pt')
+            checkpoint = os.path.join(config.logging.save_dir, get_model_name_from_config(config))
         
         if not os.path.exists(checkpoint):
             print(f"✗ Checkpoint not found: {checkpoint}")

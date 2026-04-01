@@ -156,38 +156,93 @@ def create_loss_function(criterion_name: str):
     return criterion
 
 
-def get_model_name_from_config(config) -> str:
-    """
-    Generate model name from configuration.
+def _get_elements_str(config) -> str:
+    """Return a string identifying the element(s) in the config."""
+    if hasattr(config.dataset, 'elements') and config.dataset.elements:
+        return '_'.join(sorted(config.dataset.elements))
+    elif hasattr(config.dataset, 'data_file') and config.dataset.data_file:
+        return extract_element_from_filename(config.dataset.data_file)
+    return ''
 
-    Args:
-        config: Configuration object
+
+def get_experiment_tags(config) -> str:
+    """
+    Build a short tag string encoding target type and sample-weighting strategy.
+
+    Target tag:
+        raw         – absolute E_level, no inversion
+        binded      – binding energy (E_ion - E_level)
+        inv_raw     – A / E_level
+        inv_binded  – A / (E_ion - E_level)
+
+    Weight tag:
+        no_weights  – no sample weighting
+        bins        – energy_bins strategy
+        distance    – distance_to_ground strategy
+        kde         – KDE strategy
 
     Returns:
-        Model name (e.g., 'model_Na', 'model_K_Na')
+        Tag string, e.g. 'binded_no_weights' or 'inv_binded_bins'
     """
-    # Build a descriptive model filename encoding key config settings
-    elements_str = ''
-    if hasattr(config.dataset, 'elements') and config.dataset.elements:
-        # Multi-element: use combined name sorted alphabetically
-        elements_str = '_'.join(sorted(config.dataset.elements))
+    use_binding = config.dataset.get('use_binding_energy', False)
+    use_inverse = config.dataset.get('use_inverse_target', False)
+    if use_binding and use_inverse:
+        target_tag = 'inv-binded'
+    elif use_binding:
+        target_tag = 'binded'
+    elif use_inverse:
+        target_tag = 'inv-raw'
+    else:
+        target_tag = 'raw'
 
-    elif hasattr(config.dataset, 'data_file') and config.dataset.data_file:
-        # Single element (backward compatible)
-        elements_str = extract_element_from_filename(config.dataset.data_file)
+    use_weights = config.dataset.get('use_sample_weights', False)
+    if use_weights:
+        strategy = config.dataset.get('weight_strategy', 'energy_bins')
+        weight_tag = {
+            'energy_bins': 'bins',
+            'distance_to_ground': 'distance',
+            'kde': 'kde',
+        }.get(strategy, strategy)
+    else:
+        weight_tag = 'no-weights'
 
+    return f"{target_tag}_{weight_tag}"
+
+
+def get_model_name_from_config(config) -> str:
+    """
+    Generate model checkpoint filename from configuration.
+
+    Encodes element(s), optimizer, learning rate, batch size, architecture,
+    dropout, target type, and sample-weighting strategy.
+
+    Returns:
+        Filename, e.g. 'best_model_K_Adam_lr0.001_bs16_128-64-32_drop0.3_binded_no_weights.pt'
+    """
+    elements_str = _get_elements_str(config)
     layers_str = '-'.join(str(h) for h in config.model.hidden_layers)
-    model_filename = (
-        f"best_model"
-        f"_{elements_str}"
+    tags = get_experiment_tags(config)
+    return (
+        f"best_model_{elements_str}"
         f"_{config.general.optimizer}"
         f"_lr{config.general.lr}"
         f"_bs{config.general.batch_size}"
         f"_{layers_str}"
         f"_drop{config.model.dropout}"
-        f".pt"
+        f"_{tags}.pt"
     )
-    return model_filename
+
+
+def get_predictions_filename(config) -> str:
+    """
+    Generate predictions CSV filename from configuration.
+
+    Returns:
+        Filename, e.g. 'predictions_K_binded_no_weights.csv'
+    """
+    elements_str = _get_elements_str(config)
+    tags = get_experiment_tags(config)
+    return f"predictions_{elements_str}_{tags}.csv"
 
 
 def extract_element_from_filename(filepath: str) -> str:

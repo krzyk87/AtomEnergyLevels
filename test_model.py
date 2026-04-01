@@ -29,7 +29,7 @@ import os
 
 from AtomicDataset import AtomicDataset
 from AtomicModel import create_model
-from utils import load_checkpoint, get_model_name_from_config
+from utils import load_checkpoint, get_model_name_from_config, get_predictions_filename
 
 
 def convert_predictions_to_absolute(
@@ -368,7 +368,7 @@ def test_one_run(
     # Save predictions
     save_predictions(
         predictions, targets, test_dataset,
-        save_path=os.path.join(config.logging.save_dir, 'predictions.csv')
+        save_path=os.path.join(config.logging.save_dir, get_predictions_filename(config))
     )
     
     return metrics
