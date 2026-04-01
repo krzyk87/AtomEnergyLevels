@@ -73,6 +73,13 @@ def train_one_epoch(
     model.train()
     
     running_loss = 0.0
+
+    use_focal = config.training.get('use_focal_loss', False)
+    focal_alpha = config.training.get('focal_loss_alpha', 0.5)
+    use_sample_weights = (
+            hasattr(train_loader.dataset, 'sample_weights')
+            and train_loader.dataset.sample_weights is not None
+    )
     
     # Iterate through batches of training data
     for batch_idx, (features, targets) in enumerate(train_loader):
@@ -88,24 +95,58 @@ def train_one_epoch(
         predictions = model(features)
         
         # Compute loss (how far are predictions from true values)
+        # Per-sample losses — shape: [batch_size, 1]
         loss = criterion(predictions, targets)
 
+        # Start with uniform weights, shape: [batch_size, 1]
+        weights = torch.ones_like(loss)
+
+        # --- Sample weights (static, from energy distribution) ---
+        if use_sample_weights:
+            # Resolve which dataset samples this batch corresponds to.
+            # train_loader.dataset.indices maps dataset positions to df row indices.
+            # batch_idx * batch_size : (batch_idx+1) * batch_size gives the
+            # position within the shuffled dataset for this batch.
+            start = batch_idx * config.general.batch_size
+            end = start + len(features)  # use len(features) not batch_size: last batch may be smaller
+            batch_positions = list(range(start, min(end, len(train_loader.dataset))))
+
+            sw = torch.FloatTensor([
+                train_loader.dataset.sample_weights[pos]
+                for pos in batch_positions
+            ]).to(device).unsqueeze(1)  # [batch_size, 1]
+            weights = weights * sw
+
+        # --- Focal weights (dynamic, based on current prediction error) ---
+        if use_focal:
+            # Weight by error magnitude: harder samples get more weight
+            # Alpha controls how aggressively to focus on hard samples
+            with torch.no_grad():
+                error_magnitude = torch.abs(predictions - targets).detach()
+                focal_weights = (1 + error_magnitude) ** focal_alpha  # alpha ~ 0.5-2.0
+                focal_weights = focal_weights / focal_weights.mean()  # normalize so average weight is 1.0
+            weights = weights * focal_weights
+
+        # Normalize combined weights so loss scale stays comparable across runs
+        weights = weights / weights.mean()
+        loss = (loss * weights).mean()
+
         # Apply sample weights if available
-        if hasattr(train_loader.dataset, 'sample_weights') and train_loader.dataset.sample_weights is not None:
-            # Get batch indices
-            batch_indices = train_loader.dataset.indices[
-                batch_idx * config.general.batch_size:
-                (batch_idx + 1) * config.general.batch_size
-            ]
-
-            # Get weights for this batch
-            batch_weights = torch.FloatTensor([
-                train_loader.dataset.get_sample_weight(i)
-                for i in range(len(features))
-            ]).to(device)
-
-            # Apply weights to loss
-            loss = (loss * batch_weights.unsqueeze(1)).mean()
+        # if hasattr(train_loader.dataset, 'sample_weights') and train_loader.dataset.sample_weights is not None:
+        #     # Get batch indices
+        #     batch_indices = train_loader.dataset.indices[
+        #         batch_idx * config.general.batch_size:
+        #         (batch_idx + 1) * config.general.batch_size
+        #     ]
+        #
+        #     # Get weights for this batch
+        #     batch_weights = torch.FloatTensor([
+        #         train_loader.dataset.get_sample_weight(i)
+        #         for i in range(len(features))
+        #     ]).to(device)
+        #
+        #     # Apply weights to loss
+        #     loss = (loss * batch_weights.unsqueeze(1)).mean()
         
         # Backward pass: compute gradients
         # This calculates how much each weight contributed to the loss
@@ -226,7 +267,8 @@ def train_model(config, model, train_loader, val_loader, device, val_dataset):
         Path to saved best model
     """
     # Create loss function
-    criterion = create_loss_function(config.training.criterion)
+    criterion_train = create_loss_function(config.training.criterion, reduction='none')
+    criterion_val = create_loss_function(config.training.criterion, reduction='mean')
     
     # Create optimizer
     # Optimizer adjusts model weights to minimize loss
@@ -291,12 +333,12 @@ def train_model(config, model, train_loader, val_loader, device, val_dataset):
         
         # Train for one epoch
         train_loss = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, epoch, config
+            model, train_loader, criterion_train, optimizer, device, epoch, config
         )
         
         # Validate
         val_loss, val_mae, val_rmse = validate(
-            model, val_loader, criterion, device, val_dataset
+            model, val_loader, criterion_val, device, val_dataset
         )
         
         # Update learning rate if using scheduler

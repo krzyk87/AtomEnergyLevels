@@ -116,7 +116,7 @@ def get_device(config) -> torch.device:
     return device
 
 
-def create_loss_function(criterion_name: str):
+def create_loss_function(criterion_name: str, reduction: str = 'none'):
     """
     Create the loss function for training.
     
@@ -137,17 +137,17 @@ def create_loss_function(criterion_name: str):
     if criterion_name == 'MSE':
         # Mean Squared Error: (prediction - target)²
         # Good for most regression tasks, penalizes large errors
-        criterion = torch.nn.MSELoss()
+        criterion = torch.nn.MSELoss(reduction=reduction)
     
     elif criterion_name == 'MAE':
         # Mean Absolute Error: |prediction - target|
         # More robust to outliers than MSE
-        criterion = torch.nn.L1Loss()
+        criterion = torch.nn.L1Loss(reduction=reduction)
     
     elif criterion_name == 'Huber':
         # Huber loss: MSE for small errors, MAE for large errors
         # Best of both worlds - smooth and robust
-        criterion = torch.nn.SmoothL1Loss()
+        criterion = torch.nn.SmoothL1Loss(reduction=reduction)
     
     else:
         raise ValueError(f"Unknown criterion: {criterion_name}")
@@ -243,6 +243,18 @@ def get_predictions_filename(config) -> str:
     elements_str = _get_elements_str(config)
     tags = get_experiment_tags(config)
     return f"predictions_{elements_str}_{tags}.csv"
+
+
+def get_metrics_filename(config) -> str:
+    """
+    Generate metrics CSV filename from configuration.
+
+    Returns:
+        Filename, e.g. 'metrics_K_binded_no_weights.csv'
+    """
+    elements_str = _get_elements_str(config)
+    tags = get_experiment_tags(config)
+    return f"metrics_{elements_str}_{tags}.csv"
 
 
 def extract_element_from_filename(filepath: str) -> str:

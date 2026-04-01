@@ -93,6 +93,7 @@ class DenseAtomicEnergyModel(nn.Module):
             prev_dim = hidden_dim
         
         # Output layer: single neuron for regression (predicts energy level)
+        # TODO: final layer output could be passed through torch.clamp(output, min=some_positive_value)
         # No activation function here - we want unbounded output
         layers.append(nn.Linear(prev_dim, 1))
         

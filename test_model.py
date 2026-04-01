@@ -29,7 +29,7 @@ import os
 
 from AtomicDataset import AtomicDataset
 from AtomicModel import create_model
-from utils import load_checkpoint, get_model_name_from_config, get_predictions_filename
+from utils import load_checkpoint, get_model_name_from_config, get_predictions_filename, get_metrics_filename
 
 
 def convert_predictions_to_absolute(
@@ -224,11 +224,17 @@ def save_predictions(
         results['Term'] = test_dataset.df.loc[test_dataset.indices, 'Term'].values
     
     # Sort by absolute error (worst predictions first)
-    results = results.sort_values('Absolute_Error_cm-1', ascending=False)
+    results = results.sort_values('True_Energy_cm-1', ascending=True)
     
     # Save to CSV
     results.to_csv(save_path, index=False)
     print(f"\nSaved predictions to {save_path}")
+
+
+def save_metrics(metrics: Dict[str, float], save_path: str):
+    """Save evaluation metrics to a single-row CSV file."""
+    pd.DataFrame([metrics]).to_csv(save_path, index=False)
+    print(f"Saved metrics to {save_path}")
 
 
 def print_metrics(metrics: Dict[str, float]):
@@ -358,16 +364,22 @@ def test_one_run(
             abs_predictions = convert_predictions_to_absolute(predictions_cm, element)
             abs_targets = convert_predictions_to_absolute(targets_cm, element)
 
-        predictions = abs_predictions
-        targets = abs_targets
-        metrics = compute_metrics(abs_predictions, abs_targets)
+        predictions_cm = abs_predictions
+        targets_cm = abs_targets
+        metrics = compute_metrics(predictions_cm, targets_cm)
 
     # Print results
     print_metrics(metrics)
-    
+
+    # Save metrics
+    save_metrics(
+        metrics,
+        save_path=os.path.join(config.logging.save_dir, get_metrics_filename(config))
+    )
+
     # Save predictions
     save_predictions(
-        predictions, targets, test_dataset,
+        predictions_cm, targets_cm, test_dataset,
         save_path=os.path.join(config.logging.save_dir, get_predictions_filename(config))
     )
     

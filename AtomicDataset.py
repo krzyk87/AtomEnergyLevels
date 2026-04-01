@@ -112,6 +112,9 @@ class AtomicDataset(Dataset):
             if config.dataset.get('use_inverse_target', False):
                 self._add_inverse_target()
 
+            if config.dataset.get('use_log_target', False):
+                self._add_log_target()
+
             # Add derived features if requested (total electrons, valence electrons, etc.)
             if config.dataset.add_derived_features:
                 self._add_derived_features()
@@ -559,6 +562,18 @@ class AtomicDataset(Dataset):
             max_valence = self.config.dataset.get('max_valence_electrons', 10)
             self._encode_valence_electrons(max_valence)
 
+            # Drop valence encoding columns that are constant (same value in every row)
+            # This happens for alkali metals where only the last slot varies
+            # val_cols = [f'val_e{i + 1}_n' for i in range(max_valence)] + \
+            #            [f'val_e{i + 1}_l' for i in range(max_valence)]
+            # val_cols = [c for c in val_cols if c in self.df.columns]
+            # non_constant = [c for c in val_cols if self.df[c].nunique() > 1]
+            # constant_dropped = set(val_cols) - set(non_constant)
+            # if constant_dropped:
+            #     print(f"  ✗ Dropped {len(constant_dropped)} constant valence columns: {sorted(constant_dropped)}")
+            # features = [f for f in features if f not in constant_dropped]
+            # self.df <-- features
+
             # Add valence electron features
             for i in range(max_valence):
                 features.extend([f'val_e{i + 1}_n', f'val_e{i + 1}_l'])
@@ -839,6 +854,11 @@ class AtomicDataset(Dataset):
         print(f"  ✓ Target changed to: {inv_col}")
 
 
+    def _add_log_target(self):
+        log_col = 'Log_Binding_Energy_cm-1'
+        self.df[log_col] = np.log(self.df[self.config.dataset.target_feature])
+        self.config.dataset.target_feature = log_col
+
     def _handle_missing_values(self):
         """
         Handle missing values in the dataset.
@@ -1055,6 +1075,9 @@ class AtomicDataset(Dataset):
                       f"(model output near zero → unphysically large energy). "
                       f"Min raw value: {y.min():.6f}")
             y = A / clipped
+
+        if self.config.dataset.get('use_log_target', False):
+            y = np.exp(y)
 
         return y
 
