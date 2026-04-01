@@ -169,20 +169,24 @@ def get_experiment_tags(config) -> str:
     """
     Build a short tag string encoding target type and sample-weighting strategy.
 
-    Target tag:
-        raw         – absolute E_level, no inversion
-        binded      – binding energy (E_ion - E_level)
-        inv_raw     – A / E_level
-        inv_binded  – A / (E_ion - E_level)
+    Target tag (transformations applied in order: binding → inverse → log):
+        raw             – absolute E_level
+        binded          – E_ion - E_level
+        inv-raw         – A / E_level
+        inv-binded      – A / (E_ion - E_level)
+        log-raw         – log(E_level)
+        log-binded      – log(E_ion - E_level)
+        log-inv-raw     – log(A / E_level)
+        log-inv-binded  – log(A / (E_ion - E_level))
 
     Weight tag:
-        no_weights  – no sample weighting
+        no-weights  – no sample weighting
         bins        – energy_bins strategy
         distance    – distance_to_ground strategy
         kde         – KDE strategy
 
     Returns:
-        Tag string, e.g. 'binded_no_weights' or 'inv_binded_bins'
+        Tag string, e.g. 'log-binded_no-weights' or 'inv-binded_bins'
     """
     use_binding = config.dataset.get('use_binding_energy', False)
     use_inverse = config.dataset.get('use_inverse_target', False)
@@ -194,6 +198,9 @@ def get_experiment_tags(config) -> str:
         target_tag = 'inv-raw'
     else:
         target_tag = 'raw'
+
+    if config.dataset.get('use_log_target', False):
+        target_tag = f'log-{target_tag}'
 
     use_weights = config.dataset.get('use_sample_weights', False)
     if use_weights:

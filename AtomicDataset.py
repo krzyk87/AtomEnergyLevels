@@ -727,6 +727,19 @@ class AtomicDataset(Dataset):
             self.df['unpaired_electrons'] = 2 * self.df['S_qn']
         else:
             self.df['unpaired_electrons'] = 0
+
+        # Approximate quantum defects for K (from literature / NIST fit)
+        QUANTUM_DEFECTS_K = {0: 2.18, 1: 1.71, 2: 0.28, 3: 0.01, 4: 0.0}
+        R_INF = 109736.6  # cm⁻¹
+
+        # For each row, compute n* and the Rydberg prediction
+        n = row['val_e1_n']
+        l = row['val_e1_l']
+        delta = QUANTUM_DEFECTS_K.get(l, 0.0)
+        n_star = n - delta
+        self.df['n_star'] = n_star
+        self.df['rydberg_prediction'] = R_INF / n_star ** 2
+        self.df['one_over_nstar_sq'] = 1.0 / n_star ** 2
         
         print(f"Added derived features: total_electrons, valence_electrons, "
               f"core_electrons, unpaired_electrons, max_principal_n")
