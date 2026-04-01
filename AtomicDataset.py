@@ -1047,7 +1047,14 @@ class AtomicDataset(Dataset):
         if self.config.dataset.get('use_inverse_target', False):
             A = self.config.dataset.get('inverse_target_scale', 100000)
             # Clip to avoid division by zero from a near-zero model output
-            y = A / np.clip(y, a_min=1e-6, a_max=None)
+            clipped = np.clip(y, a_min=1e-6, a_max=None)
+            # Warn if any values were actually clipped (signals a poorly predicted sample)
+            n_clipped = np.sum(y < 1e-6)
+            if n_clipped > 0:
+                print(f"  ⚠️  WARNING: {n_clipped} predictions clipped before inversion "
+                      f"(model output near zero → unphysically large energy). "
+                      f"Min raw value: {y.min():.6f}")
+            y = A / clipped
 
         return y
 

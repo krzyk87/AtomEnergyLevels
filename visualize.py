@@ -521,7 +521,7 @@ if __name__ == "__main__":
                        default='visualizations',
                        help='Directory to save plots')
     # New flags for dataset distributions
-    parser.add_argument('--plot_dataset_dists', action='store_false',
+    parser.add_argument('--plot_dataset_dists', action='store_true',
                         help='If set, also plot dataset energy distributions per split')
     parser.add_argument('--features_csvs', type=str, default='data/K_features.csv',
                         help='Comma-separated list of features CSV paths (e.g., data/K_features.csv,data/Na_features.csv)')

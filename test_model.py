@@ -90,6 +90,10 @@ def compute_metrics(
     # Mean Absolute Error: average of |prediction - target|
     # More interpretable, less sensitive to outliers
     mae = np.mean(np.abs(pred - true))
+
+    # Median Absolute Error: robust to outliers
+    # Reports the 'typical' error, not skewed by worst-case predictions
+    median_ae = float(np.median(np.abs(pred - true)))
     
     # R² (R-squared): proportion of variance explained
     # 1.0 = perfect predictions
@@ -112,6 +116,7 @@ def compute_metrics(
         'mse': float(mse),
         'rmse': float(rmse),
         'mae': float(mae),
+        'median_ae': median_ae,  # add this
         'r2': float(r2),
         'mape': float(mape),
         'max_error': float(max_error)
@@ -239,6 +244,7 @@ def print_metrics(metrics: Dict[str, float]):
     print(f"Mean Squared Error (MSE):        {metrics['mse']:>12.2f}")
     print(f"Root Mean Squared Error (RMSE):  {metrics['rmse']:>12.2f} cm⁻¹")
     print(f"Mean Absolute Error (MAE):       {metrics['mae']:>12.2f} cm⁻¹")
+    print(f"Median Absolute Error:           {metrics['median_ae']:>12.2f} cm⁻¹")
     print(f"R² Score:                        {metrics['r2']:>12.4f}")
     print(f"Mean Absolute % Error (MAPE):    {metrics['mape']:>12.2f}%")
     print(f"Maximum Error:                   {metrics['max_error']:>12.2f} cm⁻¹")
@@ -305,23 +311,56 @@ def test_one_run(
     
     optimizer = torch.optim.Adam(model.parameters())  # Dummy optimizer for loading
     load_checkpoint(model, optimizer, checkpoint_path, device)
-    
-    # Evaluate
-    metrics, predictions, targets = test_model(
+
+    # Evaluate on test set.
+    # test_model() calls test_dataset.inverse_transform_target() internally,
+    # which handles ALL inverse steps in the correct order:
+    #   1. Undo StandardScaler normalisation
+    #   2. Undo A / E_target  (if use_inverse_target=True)
+    # After this, predictions_cm and targets_cm are in the actual target space:
+    #   - binding energy (cm⁻¹)  if use_binding_energy=True
+    #   - absolute E_level (cm⁻¹) otherwise
+    metrics, predictions_cm, targets_cm = test_model(
         model, test_loader, device, test_dataset
     )
 
     # If trained on binding energies, convert predictions back to absolute energy levels
+    # This is a display-only step: E_level = E_ion - binding_energy.
+    # We do NOT do this when use_inverse_target=True, because in that mode
+    # the target is already A / binding_energy, and inverse_transform_target()
+    # has already recovered the binding energy; the conversion below is
+    # still correct and safe to apply.
     if config.dataset.get('use_binding_energy', False):
         # Get element from the dataset (supports both single and multi-element datasets)
         unique_elements = test_dataset.df['Element'].unique()
         if len(unique_elements) > 1:
-            print(f"Warning: Multiple elements in test set: {unique_elements}. Using first element for conversion.")
-        element = unique_elements[0]
+            print(
+                f"Warning: Multiple elements in test set: {unique_elements}. "
+                f"Per-element conversion used."
+            )
+            # Multi-element: convert per row using the element column
+            indices = test_dataset.indices
+            elements = test_dataset.df.loc[indices, 'Element'].values
+            abs_predictions = np.array([
+                convert_predictions_to_absolute(
+                    np.array([predictions_cm.flatten()[i]]), elem
+                )[0]
+                for i, elem in enumerate(elements)
+            ])
+            abs_targets = np.array([
+                convert_predictions_to_absolute(
+                    np.array([targets_cm.flatten()[i]]), elem
+                )[0]
+                for i, elem in enumerate(elements)
+            ])
+        else:
+            element = unique_elements[0]
+            abs_predictions = convert_predictions_to_absolute(predictions_cm, element)
+            abs_targets = convert_predictions_to_absolute(targets_cm, element)
 
-        predictions = convert_predictions_to_absolute(predictions, element)
-        targets = convert_predictions_to_absolute(targets, element)
-        metrics = compute_metrics(predictions, targets)
+        predictions = abs_predictions
+        targets = abs_targets
+        metrics = compute_metrics(abs_predictions, abs_targets)
 
     # Print results
     print_metrics(metrics)

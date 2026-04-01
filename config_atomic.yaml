@@ -66,7 +66,7 @@ dataset:
   normalize_target: true        # Standardize target variable
 
   # Sample weighting for imbalanced energy distributions
-  use_sample_weights: false
+  use_sample_weights: true
   weight_strategy: 'energy_bins'  # energy_bins / distance_to_ground / kde
   n_energy_bins: 10               # Number of bins for energy_bins strategy
   
