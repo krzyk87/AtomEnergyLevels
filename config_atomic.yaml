@@ -3,8 +3,8 @@ general:
   optimizer: Adam               # Optimizer: Adam / SGD / RMSprop
   lr: 0.001                     # Learning rate
   weight_decay: 0.0001          # L2 regularization (weight decay)
-  batch_size: 16                # Batch size for training
-  num_workers: 4                # Number of CPU workers for data loading
+  batch_size: 32                # Batch size for training
+  num_workers: 0                # Number of CPU workers for data loading
   random_seed: 42               # Random seed for reproducibility
   patience: 20                  # Early stopping patience (epochs)
   device: cuda                  # Device: cuda / cpu
@@ -35,7 +35,7 @@ dataset:
 
   # Encoding strategy
   encode_valence_electrons: true  # Use explicit electron encoding (true) OR use full orbital occupancy (false)
-  max_valence_electrons: 1       # Maximum valence electrons to encode
+  max_valence_electrons: 10       # Maximum valence electrons to encode
 
   # Manually specify additional features (optional)
   force_include_features: ['J', 'S_qn', 'L_qn']  # Always include these
