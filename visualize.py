@@ -517,7 +517,7 @@ if __name__ == "__main__":
     parser.add_argument('--config', type=str, default=None,
                         help='Path to config YAML — auto-derives predictions filename when provided')
     parser.add_argument('--predictions', type=str,
-                       default='saved_models/predictions.csv',
+                       default='saved_models/predictions_K_raw_no-weights.csv',
                        help='Path to predictions CSV file (ignored when --config is given)')
     parser.add_argument('--output_dir', type=str,
                        default='visualizations',

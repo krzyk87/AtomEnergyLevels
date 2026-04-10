@@ -148,6 +148,11 @@ def create_loss_function(criterion_name: str, reduction: str = 'none'):
         # Huber loss: MSE for small errors, MAE for large errors
         # Best of both worlds - smooth and robust
         criterion = torch.nn.SmoothL1Loss(reduction=reduction)
+        
+    elif criterion_name == 'SmoothL1':
+        # SmoothL1 loss: Similar to Huber loss, but with a tunable beta parameter
+        # Determines the transition point between L1 and L2 loss regions
+        criterion = torch.nn.SmoothL1Loss(reduction=reduction, beta=20.0)
     
     else:
         raise ValueError(f"Unknown criterion: {criterion_name}")

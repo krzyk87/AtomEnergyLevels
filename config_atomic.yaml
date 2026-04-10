@@ -1,19 +1,19 @@
 general:
-  epochs: 100                   # Number of training epochs
+  epochs: 30000                   # Number of training epochs
   optimizer: Adam               # Optimizer: Adam / SGD / RMSprop
-  lr: 0.001                     # Learning rate
+  lr: 0.0005                     # Learning rate
   weight_decay: 0.0001          # L2 regularization (weight decay)
-  batch_size: 32                # Batch size for training
+  batch_size: 16                # Batch size for training
   num_workers: 0                # Number of CPU workers for data loading
   random_seed: 42               # Random seed for reproducibility
-  patience: 20                  # Early stopping patience (epochs)
+  patience: 1000                  # Early stopping patience (epochs)
   device: cuda                  # Device: cuda / cpu
 
 model:
   architecture: dense_nn        # Model type: dense_nn / baseline_ml
-  hidden_layers: [128, 64, 32]  # Hidden layer sizes for dense NN
-  dropout: 0.3                  # Dropout rate (0.0 to disable)
-  activation: relu              # Activation function: relu / leaky_relu / elu
+  hidden_layers: [128, 64, 32]  # Hidden layer sizes for dense NN     # 128, 64, 32
+  dropout: 0.0                  # Dropout rate (0.0 to disable)
+  activation: elu              # Activation function: relu / leaky_relu / elu
   use_batch_norm: false          # Whether to use batch normalization
   
   # Baseline ML models (for comparison)
@@ -21,7 +21,7 @@ model:
 
 dataset:
   # Simple: just list elements
-  elements: [ 'K' ]  # Or ['Na', 'K', 'Rb', 'Co', 'Ni']
+  elements: [ 'K']  # Or ['Na', 'K', 'Rb', 'Co', 'Ni']  # 'Na', 'Li','Rb','Cs','Fr'
 
   # Data directory structure (assumes standard naming)
   data_dir: "data"
@@ -38,8 +38,8 @@ dataset:
   max_valence_electrons: 1       # Maximum valence electrons to encode
 
   # Manually specify additional features (optional)
-  force_include_features: ['J', 'S_qn', 'L_qn']  # Always include these
-  force_exclude_features: [ ]        # Explicitly exclude these
+  force_include_features: ['J', ]  # Always include these
+  force_exclude_features: ['S_qn', 'L_qn' ]        # Explicitly exclude these
 
   # Input features - these columns will be used as model inputs
   # Orbital occupancies: electron count in each orbital (1s, 2s, 2p, etc.)
@@ -54,17 +54,17 @@ dataset:
   
   # Target to predict (output)
   target_feature: "Level (cm-1)"
-  use_binding_energy: true        # Convert to binding energy: predict (E_ion - E_level) instead of E_level
+  use_binding_energy: false        # Convert to binding energy: predict (E_ion - E_level) instead of E_level
   use_inverse_target: false       # Apply inverse scaling: predict A / E_target instead of E_target
   inverse_target_scale: 100000    # Scale factor A used in inverse transformation (A / E_target)
-  use_log_target: true
+  use_log_target: false
   
   # Feature engineering: whether to add derived features
   add_derived_features: false    # Add total_electrons, valence_electrons, core_electrons, unpaired_electrons, max_principal_n
   
   # Data normalization
   normalize_features: true      # Standardize features (zero mean, unit variance)
-  normalize_target: true        # Standardize target variable
+  normalize_target: false        # Standardize target variable
 
   # Sample weighting for imbalanced energy distributions
   use_sample_weights: false
@@ -73,28 +73,28 @@ dataset:
   
   # Data splitting
   split:
-    train: 0.7                  # 70% for training
-    val: 0.15                   # 15% for validation
-    test: 0.15                  # 15% for testing
+    train: 0.6                  # 70% for training
+    val: 0.2                   # 15% for validation
+    test: 0.2                  # 15% for testing
   
   # Handle missing values
   drop_missing: false           # Whether to drop rows with missing values
   fill_missing_value: 0.0       # Value to fill missing data (if not dropping)
 
 training:
-  criterion: MSE                # Loss function: MSE / MAE / Huber
+  criterion: SmoothL1                # Loss function: MSE / MAE / Huber
   use_focal_loss: false
-  gradient_clip: 1.0            # Gradient clipping value (0.0 to disable)
-  lr_scheduler: ReduceLROnPlateau  # LR scheduler: ReduceLROnPlateau / StepLR / None
+  gradient_clip: 0.0            # Gradient clipping value (0.0 to disable)
+  lr_scheduler: None  # LR scheduler: ReduceLROnPlateau / StepLR / None
   lr_scheduler_params:
     factor: 0.5                 # Multiply LR by this factor when reducing
-    patience: 10                # Epochs to wait before reducing LR
+    patience: 100                # Epochs to wait before reducing LR
     min_lr: 0.00001             # Minimum learning rate
 
 logging:
   use_wandb: false              # Enable Weights & Biases logging
   wandb_project: "atomic-energy-prediction"
   wandb_entity: null            # Your W&B username (null = default)
-  log_interval: 10              # Log metrics every N epochs
+  log_interval: 100              # Log metrics every N epochs
   save_dir: "saved_models"      # Directory to save model checkpoints
   save_best_only: true          # Only save the best model (by val loss)

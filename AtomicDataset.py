@@ -30,8 +30,9 @@ IONIZATION_ENERGIES = {
     'Fe': (26, 63737.70),
     'Co': (27, 63564.6),
     'Ni': (28, 61619.77),
-    'Cs': (55, 31406.467),
     'Rb': (37, 33690.81),
+    'Cs': (55, 31406.467),
+    'Fr': (87, 32848.872)
 }
 
 class AtomicDataset(Dataset):
@@ -121,11 +122,6 @@ class AtomicDataset(Dataset):
 
             # Prepare feature columns
             self.feature_columns = self._get_feature_columns()
-            # Prepare target column: binding energy or absolute energy level
-            # if config.dataset.get('use_binding_energy', False):
-            #     self.target_column = 'Binding_Energy_cm-1'
-            #     print(f"  ✓ Target changed to binding energy")
-            # else:
             self.target_column = config.dataset.target_feature
 
             # Handle missing values
@@ -798,6 +794,7 @@ class AtomicDataset(Dataset):
         # Add to dataframe
         self.df['Binding_Energy_cm-1'] = binding_energies
         self.df['Ionization_Energy_cm-1'] = ionization_energies
+        # TODO: DataFrame is highly fragmented. This is usually the result of calling `frame.insert` many times, which has poor performance.
 
         # Report statistics per element
         for element in unique_elements:

@@ -71,8 +71,10 @@ def train_one_epoch(
     # Set model to training mode
     # This enables dropout and batch normalization training behavior
     model.train()
-    
+
     running_loss = 0.0
+    all_predictions = []
+    all_targets = []
 
     use_focal = config.training.get('use_focal_loss', False)
     focal_alpha = config.training.get('focal_loss_alpha', 0.5)
@@ -80,7 +82,7 @@ def train_one_epoch(
             hasattr(train_loader.dataset, 'sample_weights')
             and train_loader.dataset.sample_weights is not None
     )
-    
+
     # Iterate through batches of training data
     for batch_idx, (features, targets) in enumerate(train_loader):
         # Move data to GPU if available
@@ -131,23 +133,6 @@ def train_one_epoch(
         weights = weights / weights.mean()
         loss = (loss * weights).mean()
 
-        # Apply sample weights if available
-        # if hasattr(train_loader.dataset, 'sample_weights') and train_loader.dataset.sample_weights is not None:
-        #     # Get batch indices
-        #     batch_indices = train_loader.dataset.indices[
-        #         batch_idx * config.general.batch_size:
-        #         (batch_idx + 1) * config.general.batch_size
-        #     ]
-        #
-        #     # Get weights for this batch
-        #     batch_weights = torch.FloatTensor([
-        #         train_loader.dataset.get_sample_weight(i)
-        #         for i in range(len(features))
-        #     ]).to(device)
-        #
-        #     # Apply weights to loss
-        #     loss = (loss * batch_weights.unsqueeze(1)).mean()
-        
         # Backward pass: compute gradients
         # This calculates how much each weight contributed to the loss
         loss.backward()
@@ -163,14 +148,29 @@ def train_one_epoch(
         # Optimization step: update weights based on gradients
         # The optimizer uses gradients to adjust weights to minimize loss
         optimizer.step()
-        
+
         # Track loss for this batch
         running_loss += loss.item()
-    
+
+        # Store predictions and targets for MAE calculation
+        all_predictions.append(predictions.detach().cpu().numpy())
+        all_targets.append(targets.cpu().numpy())
+
     # Average loss across all batches
     avg_loss = running_loss / len(train_loader)
-    
-    return avg_loss
+
+    # Combine all batches for MAE calculation
+    all_predictions = np.concatenate(all_predictions)
+    all_targets = np.concatenate(all_targets)
+
+    # Inverse transform BEFORE computing MAE
+    predictions_cm = train_loader.dataset.inverse_transform_target(all_predictions)
+    targets_cm = train_loader.dataset.inverse_transform_target(all_targets)
+
+    # Calculate average MAE in cm⁻¹
+    avg_mae = np.mean(np.abs(predictions_cm - targets_cm))
+
+    return avg_loss, avg_mae
 
 
 def validate(
@@ -332,7 +332,7 @@ def train_model(config, model, train_loader, val_loader, device, val_dataset):
         epoch_start = time.time()
         
         # Train for one epoch
-        train_loss = train_one_epoch(
+        train_loss, train_mae = train_one_epoch(
             model, train_loader, criterion_train, optimizer, device, epoch, config
         )
         
@@ -352,6 +352,7 @@ def train_model(config, model, train_loader, val_loader, device, val_dataset):
             print(f"Epoch {epoch:3d}/{config.general.epochs} | "
                   f"Train Loss: {train_loss:.4f} | "
                   f"Val Loss: {val_loss:.4f} | "
+                  f"Train MAE: {train_mae:.4f} cm⁻¹ | "
                   f"Val MAE: {val_mae:.2f} cm⁻¹ | "
                   f"Val RMSE: {val_rmse:.2f} cm⁻¹ | "
                   f"Time: {format_time(epoch_time)}")
@@ -437,6 +438,26 @@ def train_one_run(config):
     # Create datasets
     print("\nCreating datasets...")
     train_dataset = AtomicDataset(config, subset='train')
+
+    print("\n" + "=" * 60)
+    print("FEATURE VERIFICATION")
+    print("=" * 60)
+
+    # Check first sample
+    X_first = train_dataset.X[0]
+    print(f"First training sample features: {X_first}")
+    print(f"Feature names: {train_dataset.get_feature_names()}")
+    print(f"Number of features: {len(train_dataset.get_feature_names())}")
+
+    # Check feature ranges
+    print(f"\nFeature ranges:")
+    for i, name in enumerate(train_dataset.get_feature_names()):
+        col_data = train_dataset.X[:, i]
+        print(f"  {name}: min={col_data.min():.3f}, max={col_data.max():.3f}, mean={col_data.mean():.3f}")
+
+    # Check target range
+    print(f"\nTarget ({train_dataset.target_column}):")
+    print(f"  min={train_dataset.y.min():.2f}, max={train_dataset.y.max():.2f}, mean={train_dataset.y.mean():.2f}")
     
     # For val/test, use the same scalers fitted on training data
     val_dataset = AtomicDataset(
