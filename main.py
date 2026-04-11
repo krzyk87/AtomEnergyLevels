@@ -105,41 +105,47 @@ def main():
     print("-"*60 + "\n")
     
     best_model_path = None
-    
+    best_train_metrics = None
+    best_val_metrics = None
+
     # Training phase
     if not args.test_only:
         print("="*60)
         print("TRAINING PHASE")
         print("="*60 + "\n")
-        
+
         try:
-            best_model_path = train_one_run(config)
+            best_model_path, best_train_metrics, best_val_metrics = train_one_run(config)
             print("\n✓ Training completed successfully")
         except Exception as e:
             print(f"\n✗ Training failed with error: {e}")
             import traceback
             traceback.print_exc()
             return 1
-    
+
     # Testing phase
     if not args.train_only:
         print("\n" + "="*60)
         print("TESTING PHASE")
         print("="*60 + "\n")
-        
+
         # Use specified checkpoint or the one from training
         checkpoint = args.checkpoint if args.checkpoint else best_model_path
-        
+
         if checkpoint is None:
             checkpoint = os.path.join(config.logging.save_dir, get_model_name_from_config(config))
-        
+
         if not os.path.exists(checkpoint):
             print(f"✗ Checkpoint not found: {checkpoint}")
             print("  Please train a model first or specify --checkpoint")
             return 1
-        
+
         try:
-            metrics = test_one_run(config, checkpoint)
+            metrics = test_one_run(
+                config, checkpoint,
+                train_metrics=best_train_metrics,
+                val_metrics=best_val_metrics,
+            )
             print("✓ Testing completed successfully")
             
             # Print summary

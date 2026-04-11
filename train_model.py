@@ -313,6 +313,8 @@ def train_model(config, model, train_loader, val_loader, device, val_dataset):
     # This prevents overfitting (memorizing training data)
     best_val_loss = float('inf')
     patience_counter = 0
+    best_train_metrics = {}
+    best_val_metrics = {}
     
     # Path for saving the best model
     save_dir = config.logging.save_dir
@@ -361,7 +363,9 @@ def train_model(config, model, train_loader, val_loader, device, val_dataset):
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            
+            best_train_metrics = {'loss': train_loss, 'mae': train_mae}
+            best_val_metrics = {'loss': val_loss, 'mae': val_mae, 'rmse': val_rmse}
+
             # Save the best model
             save_checkpoint(
                 model, optimizer, epoch, train_loss, val_loss, best_model_path
@@ -383,7 +387,7 @@ def train_model(config, model, train_loader, val_loader, device, val_dataset):
     print(f"Best model saved to: {best_model_path}")
     print(f"{'='*60}\n")
     
-    return best_model_path
+    return best_model_path, best_train_metrics, best_val_metrics
 
 
 def _extract_element_from_filename(filepath: str) -> str:
@@ -492,8 +496,8 @@ def train_one_run(config):
     model = model.to(device)
     
     # Train model
-    best_model_path = train_model(
+    best_model_path, best_train_metrics, best_val_metrics = train_model(
         config, model, train_loader, val_loader, device, val_dataset
     )
-    
-    return best_model_path
+
+    return best_model_path, best_train_metrics, best_val_metrics

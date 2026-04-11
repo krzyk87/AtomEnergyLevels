@@ -269,6 +269,114 @@ def get_metrics_filename(config) -> str:
     return f"metrics_{elements_str}_{tags}.csv"
 
 
+def append_metrics_to_excel(config, test_metrics, train_metrics=None, val_metrics=None, features=None):
+    """
+    Append one experiment row (config settings + metrics) to results Excel file.
+
+    File: results/results_{element}.xlsx, sheet: 'metrics'
+    Each call appends a new row — existing rows are never overwritten.
+
+    Args:
+        config:        OmegaConf config object
+        test_metrics:  dict of test-set metrics (keys without prefix)
+        train_metrics: optional dict of best-epoch training metrics
+        val_metrics:   optional dict of best-epoch validation metrics
+        features:      optional dict with int — number of input features used by the model, and list[str] — names
+                        of input features
+    """
+    import pandas as pd
+    from datetime import datetime
+
+    elements_str = _get_elements_str(config)
+    results_dir = "results"
+    os.makedirs(results_dir, exist_ok=True)
+    results_path = os.path.join(results_dir, f"results_{elements_str}.xlsx")
+    sheet_name = "metrics"
+
+    # --- Build the new row ---
+    row = {"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    row["experiment_tag"] = get_experiment_tags(config)
+
+    # Metrics (prefixed by split)
+    if train_metrics:
+        for k, v in train_metrics.items():
+            row[f"train_{k}"] = v
+
+    if val_metrics:
+        for k, v in val_metrics.items():
+            row[f"val_{k}"] = v
+
+    for k, v in test_metrics.items():
+        row[f"test_{k}"] = v
+
+    # Config: dataset
+    row["target_feature"] = config.dataset.target_feature
+    row["use_binding_energy"] = config.dataset.get("use_binding_energy", False)
+    row["use_inverse_target"] = config.dataset.get("use_inverse_target", False)
+    row["use_log_target"] = config.dataset.get("use_log_target", False)
+    row["normalize_features"] = config.dataset.normalize_features
+    row["normalize_target"] = config.dataset.normalize_target
+    row["use_sample_weights"] = config.dataset.get("use_sample_weights", False)
+    row["weight_strategy"] = config.dataset.get("weight_strategy", "")
+    row["encode_valence_electrons"] = config.dataset.get("encode_valence_electrons", True)
+    row["max_valence_electrons"] = config.dataset.get("max_valence_electrons", 10)
+    row["add_derived_features"] = config.dataset.get("add_derived_features", False)
+
+    # Input features (populated from the dataset object)
+    row["n_features"] = features.get("n_features", None) if features is not None else None
+    feature_names = features.get("feature_names", None) if features is not None else None
+    row["feature_names"] = ", ".join(feature_names) if feature_names is not None else None
+
+    # Config: general
+    row["elements"] = elements_str
+    row["max_epochs"] = config.general.epochs
+    row["optimizer"] = config.general.optimizer
+    row["lr"] = config.general.lr
+    row["weight_decay"] = config.general.weight_decay
+    row["batch_size"] = config.general.batch_size
+    row["patience"] = config.general.patience
+
+    # Config: model
+    row["architecture"] = config.model.architecture
+    row["hidden_layers"] = "-".join(str(h) for h in config.model.hidden_layers)
+    row["dropout"] = config.model.dropout
+    row["activation"] = config.model.activation
+    row["use_batch_norm"] = config.model.use_batch_norm
+
+    # Config: training
+    row["criterion"] = config.training.criterion
+    row["use_focal_loss"] = config.training.get("use_focal_loss", False)
+    row["gradient_clip"] = config.training.gradient_clip
+    row["lr_scheduler"] = config.training.lr_scheduler
+
+    new_df = pd.DataFrame([row])
+
+    # --- Append to existing sheet (or create) ---
+    if os.path.exists(results_path):
+        try:
+            existing_df = pd.read_excel(results_path, sheet_name=sheet_name)
+            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+        except Exception:
+            combined_df = new_df
+    else:
+        combined_df = new_df
+
+    try:
+        if os.path.exists(results_path):
+            from openpyxl import load_workbook  # noqa: F401 — ensures openpyxl is present
+            with pd.ExcelWriter(results_path, engine="openpyxl", mode="a",
+                                if_sheet_exists="replace") as writer:
+                combined_df.to_excel(writer, sheet_name=sheet_name, index=False)
+        else:
+            with pd.ExcelWriter(results_path, engine="openpyxl") as writer:
+                combined_df.to_excel(writer, sheet_name=sheet_name, index=False)
+        print(f"Appended metrics to {results_path} (sheet: '{sheet_name}')")
+    except Exception as exc:
+        fallback = results_path.replace(".xlsx", "_metrics.csv")
+        combined_df.to_csv(fallback, index=False)
+        print(f"Warning: could not write Excel ({exc}). Saved to {fallback} instead.")
+
+
 def extract_element_from_filename(filepath: str) -> str:
     """
     Extract element symbol from filename.

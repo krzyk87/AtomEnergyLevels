@@ -29,7 +29,7 @@ import os
 
 from AtomicDataset import AtomicDataset
 from AtomicModel import create_model
-from utils import load_checkpoint, get_model_name_from_config, get_predictions_filename, get_metrics_filename
+from utils import load_checkpoint, get_model_name_from_config, get_predictions_filename, append_metrics_to_excel
 
 
 def convert_predictions_to_absolute(
@@ -231,12 +231,6 @@ def save_predictions(
     print(f"\nSaved predictions to {save_path}")
 
 
-def save_metrics(metrics: Dict[str, float], save_path: str):
-    """Save evaluation metrics to a single-row CSV file."""
-    pd.DataFrame([metrics]).to_csv(save_path, index=False)
-    print(f"Saved metrics to {save_path}")
-
-
 def print_metrics(metrics: Dict[str, float]):
     """
     Print evaluation metrics in a formatted way.
@@ -259,7 +253,9 @@ def print_metrics(metrics: Dict[str, float]):
 
 def test_one_run(
     config,
-    checkpoint_path: str = None
+    checkpoint_path: str = None,
+    train_metrics: Dict[str, float] = None,
+    val_metrics: Dict[str, float] = None,
 ) -> Dict[str, Any]:
     """
     Run evaluation on test set.
@@ -371,10 +367,14 @@ def test_one_run(
     # Print results
     print_metrics(metrics)
 
-    # Save metrics
-    save_metrics(
-        metrics,
-        save_path=os.path.join(config.logging.save_dir, get_metrics_filename(config))
+    features_config = {"n_features": test_dataset.get_input_dim(), "feature_names": test_dataset.get_feature_names()}
+
+    # Append metrics + config settings to results Excel file
+    append_metrics_to_excel(
+        config, metrics,
+        train_metrics=train_metrics,
+        val_metrics=val_metrics,
+        features=features_config
     )
 
     # Save predictions

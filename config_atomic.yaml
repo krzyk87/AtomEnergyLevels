@@ -38,8 +38,8 @@ dataset:
   max_valence_electrons: 1       # Maximum valence electrons to encode
 
   # Manually specify additional features (optional)
-  force_include_features: ['J', ]  # Always include these
-  force_exclude_features: ['S_qn', 'L_qn' ]        # Explicitly exclude these
+  force_include_features: ['J', 'S_qn', 'L_qn']  # Always include these
+  force_exclude_features: [ ]        # Explicitly exclude these
 
   # Input features - these columns will be used as model inputs
   # Orbital occupancies: electron count in each orbital (1s, 2s, 2p, etc.)
@@ -54,8 +54,8 @@ dataset:
   
   # Target to predict (output)
   target_feature: "Level (cm-1)"
-  use_binding_energy: false        # Convert to binding energy: predict (E_ion - E_level) instead of E_level
-  use_inverse_target: false       # Apply inverse scaling: predict A / E_target instead of E_target
+  use_binding_energy: true        # Convert to binding energy: predict (E_ion - E_level) instead of E_level
+  use_inverse_target: true       # Apply inverse scaling: predict A / E_target instead of E_target
   inverse_target_scale: 100000    # Scale factor A used in inverse transformation (A / E_target)
   use_log_target: false
   
@@ -67,8 +67,8 @@ dataset:
   normalize_target: false        # Standardize target variable
 
   # Sample weighting for imbalanced energy distributions
-  use_sample_weights: false
-  weight_strategy: 'energy_bins'  # energy_bins / distance_to_ground / kde
+  use_sample_weights: true
+  weight_strategy: 'kde'  # energy_bins / distance_to_ground / kde
   n_energy_bins: 10               # Number of bins for energy_bins strategy
   
   # Data splitting
