@@ -76,8 +76,11 @@ class AtomicDataset(Dataset):
         # Generate cache key based on data configuration
         cache_key = self._generate_cache_key()
 
-        # Check if data already processed
-        if cache_key in AtomicDataset._data_cache:
+        # Check if data already processed.
+        # Training always reprocesses so that config changes (e.g. use_log_target,
+        # use_binding_energy) between sequential experiment runs take effect and
+        # the cache is refreshed for the val/test datasets of the same run.
+        if cache_key in AtomicDataset._data_cache and subset != 'train':
             print(f"\n{'=' * 60}")
             print(f"Loading CACHED data for {subset} set")
             print(f"{'=' * 60}")
@@ -104,6 +107,11 @@ class AtomicDataset(Dataset):
             # Validate term symbols
             self.validate_term_symbol()
 
+            # Track the active target column without mutating the shared config object.
+            # Each _add_*_target method reads/updates this instance variable instead
+            # of config.dataset.target_feature, so the config stays clean across runs.
+            self._current_target_col = config.dataset.target_feature
+
             # Add binding energy if requested
             if config.dataset.get('use_binding_energy', False):
                 self._add_binding_energy_target()
@@ -122,7 +130,7 @@ class AtomicDataset(Dataset):
 
             # Prepare feature columns
             self.feature_columns = self._get_feature_columns()
-            self.target_column = config.dataset.target_feature
+            self.target_column = self._current_target_col
 
             # Handle missing values
             self._handle_missing_values()
@@ -202,6 +210,7 @@ class AtomicDataset(Dataset):
         # Processing parameters that affect data
         key_dict['use_binding_energy'] = self.config.dataset.get('use_binding_energy', False)
         key_dict['use_inverse_target'] = self.config.dataset.get('use_inverse_target', False)
+        key_dict['use_log_target'] = self.config.dataset.get('use_log_target', False)
         key_dict['inverse_target_scale'] = self.config.dataset.get('inverse_target_scale', 100000)
         key_dict['add_derived_features'] = self.config.dataset.get('add_derived_features', False)
         key_dict['encode_valence_electrons'] = self.config.dataset.get('encode_valence_electrons', False)
@@ -431,8 +440,7 @@ class AtomicDataset(Dataset):
             Array of weights for each sample
         """
         # Resolve whichever target column is currently active
-        # (may have been updated by _add_binding_energy_target / _add_inverse_target)
-        target_col = self.config.dataset.target_feature
+        target_col = self.target_column
         energies = self.df.loc[self.indices, target_col].values
 
         # Choose binning strategy
@@ -783,7 +791,7 @@ class AtomicDataset(Dataset):
                 )
 
             Z, E_ion = IONIZATION_ENERGIES[element]
-            E_level = row[self.config.dataset.target_feature]
+            E_level = row[self._current_target_col]
 
             # Calculate binding energy for this row
             binding_energy = E_ion - E_level
@@ -814,8 +822,8 @@ class AtomicDataset(Dataset):
         # Clip negative values (continuum states)
         self.df['Binding_Energy_cm-1'] = self.df['Binding_Energy_cm-1'].clip(lower=0)
 
-        # Update target column
-        self.config.dataset.target_feature = 'Binding_Energy_cm-1'
+        # Update active target column (instance variable only — never mutate config)
+        self._current_target_col = 'Binding_Energy_cm-1'
         print(f"\n  ✓ Target changed to: Binding_Energy_cm-1")
 
     def _add_inverse_target(self):
@@ -840,7 +848,7 @@ class AtomicDataset(Dataset):
         _add_binding_energy_target(), so removing them is physically correct.
         """
         A = self.config.dataset.get('inverse_target_scale', 100000)
-        target_col = self.config.dataset.target_feature  # already updated by binding energy step
+        target_col = self._current_target_col  # already updated by binding energy step
         inv_col = f'Inverse_{target_col}'
 
         print(f"\nApplying inverse target scaling (A={A}):")
@@ -859,15 +867,15 @@ class AtomicDataset(Dataset):
         # Report range so you can sanity-check the values look reasonable
         print(f"  Inverse target range: {self.df[inv_col].min():.4f} to {self.df[inv_col].max():.4f}")
 
-        # Update target column name (same pattern as _add_binding_energy_target)
-        self.config.dataset.target_feature = inv_col
+        # Update active target column (instance variable only — never mutate config)
+        self._current_target_col = inv_col
         print(f"  ✓ Target changed to: {inv_col}")
 
 
     def _add_log_target(self):
         log_col = 'Log_Binding_Energy_cm-1'
-        self.df[log_col] = np.log(self.df[self.config.dataset.target_feature])
-        self.config.dataset.target_feature = log_col
+        self.df[log_col] = np.log(self.df[self._current_target_col])
+        self._current_target_col = log_col
 
     def _handle_missing_values(self):
         """
@@ -1087,6 +1095,7 @@ class AtomicDataset(Dataset):
             y = A / clipped
 
         if self.config.dataset.get('use_log_target', False):
+            # RuntimeWarning: overflow encountered in exp
             y = np.exp(y)
 
         return y

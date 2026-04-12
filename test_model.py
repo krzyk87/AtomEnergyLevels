@@ -29,7 +29,8 @@ import os
 
 from AtomicDataset import AtomicDataset
 from AtomicModel import create_model
-from utils import load_checkpoint, get_model_name_from_config, get_predictions_filename, append_metrics_to_excel
+from utils import (load_checkpoint, get_model_name_from_config,
+                   append_metrics_to_excel, _get_elements_str, get_experiment_tags)
 
 
 def convert_predictions_to_absolute(
@@ -231,6 +232,84 @@ def save_predictions(
     print(f"\nSaved predictions to {save_path}")
 
 
+def save_predictions_excel(
+    predictions: np.ndarray,
+    targets: np.ndarray,
+    test_dataset: AtomicDataset,
+    config,
+):
+    """
+    Append a prediction column for the current run to results/predictions_{element}.xlsx.
+
+    On the first run the file is created with fixed identifier/feature columns and
+    True_Energy_cm-1.  Every subsequent run adds one new column named
+    'Predicted_{tags}_ev{max_valence_electrons}', joined on the stable original
+    DataFrame index so row order is never disturbed.
+
+    Args:
+        predictions:  Model predictions in cm⁻¹ (after inverse transform)
+        targets:      True values in cm⁻¹ (after inverse transform)
+        test_dataset: Test AtomicDataset (provides df, indices, feature names)
+        config:       OmegaConf config
+    """
+    elements_str = _get_elements_str(config)
+    results_dir = "results"
+    os.makedirs(results_dir, exist_ok=True)
+    results_path = os.path.join(results_dir, f"predictions_{elements_str}.xlsx")
+    sheet_name = "predictions"
+
+    max_val_e = config.dataset.get("max_valence_electrons", 1)
+    tags = get_experiment_tags(config)
+    pred_col = f"Predicted_{tags}_ev{max_val_e}"
+
+    feature_names = test_dataset.get_feature_names()
+    indices = list(test_dataset.indices)
+
+    # --- Build the current-run dataframe ---
+    run_df = pd.DataFrame()
+    run_df["_df_index"] = indices  # stable join key (fixed by JSON split file)
+
+    for col in ["Configuration", "Term"]:
+        if col in test_dataset.df.columns:
+            run_df[col] = test_dataset.df.loc[indices, col].values
+
+    for col in feature_names:
+        run_df[col] = test_dataset.df.loc[indices, col].values
+
+    run_df["True_Energy_cm-1"] = targets.flatten()
+    run_df[pred_col] = predictions.flatten()
+    run_df = run_df.sort_values("True_Energy_cm-1", ascending=True).reset_index(drop=True)
+
+    # --- Merge with existing file or create fresh ---
+    if os.path.exists(results_path):
+        try:
+            existing_df = pd.read_excel(results_path, sheet_name=sheet_name)
+            combined_df = existing_df.merge(
+                run_df[["_df_index", pred_col]],
+                on="_df_index",
+                how="left",
+            )
+        except Exception:
+            combined_df = run_df
+    else:
+        combined_df = run_df
+
+    # --- Write back ---
+    try:
+        if os.path.exists(results_path):
+            with pd.ExcelWriter(results_path, engine="openpyxl", mode="a",
+                                if_sheet_exists="replace") as writer:
+                combined_df.to_excel(writer, sheet_name=sheet_name, index=False)
+        else:
+            with pd.ExcelWriter(results_path, engine="openpyxl") as writer:
+                combined_df.to_excel(writer, sheet_name=sheet_name, index=False)
+        print(f"Appended predictions column '{pred_col}' to {results_path}")
+    except Exception as exc:
+        fallback = results_path.replace(".xlsx", "_predictions.csv")
+        combined_df.to_csv(fallback, index=False)
+        print(f"Warning: could not write Excel ({exc}). Saved to {fallback} instead.")
+
+
 def print_metrics(metrics: Dict[str, float]):
     """
     Print evaluation metrics in a formatted way.
@@ -367,7 +446,11 @@ def test_one_run(
     # Print results
     print_metrics(metrics)
 
-    features_config = {"n_features": test_dataset.get_input_dim(), "feature_names": test_dataset.get_feature_names()}
+    features_config = {
+        "n_features": test_dataset.get_input_dim(),
+        "feature_names": test_dataset.get_feature_names(),
+        "target_column": test_dataset.target_column,
+    }
 
     # Append metrics + config settings to results Excel file
     append_metrics_to_excel(
@@ -377,11 +460,8 @@ def test_one_run(
         features=features_config
     )
 
-    # Save predictions
-    save_predictions(
-        predictions_cm, targets_cm, test_dataset,
-        save_path=os.path.join(config.logging.save_dir, get_predictions_filename(config))
-    )
+    # Save predictions (appended as a new column to the shared Excel file)
+    save_predictions_excel(predictions_cm, targets_cm, test_dataset, config)
     
     return metrics
 

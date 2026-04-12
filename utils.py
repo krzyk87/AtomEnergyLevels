@@ -310,7 +310,11 @@ def append_metrics_to_excel(config, test_metrics, train_metrics=None, val_metric
         row[f"test_{k}"] = v
 
     # Config: dataset
-    row["target_feature"] = config.dataset.target_feature
+    # Use the actual column name from the dataset (may differ from config base value
+    # when use_binding_energy / use_inverse_target / use_log_target are active).
+    row["target_feature"] = (
+        features.get("target_column") if features is not None else None
+    ) or config.dataset.target_feature
     row["use_binding_energy"] = config.dataset.get("use_binding_energy", False)
     row["use_inverse_target"] = config.dataset.get("use_inverse_target", False)
     row["use_log_target"] = config.dataset.get("use_log_target", False)

@@ -28,35 +28,25 @@ from test_model import test_one_run
 
 # ── Define experiments here ──────────────────────────────────────────────────
 # Each dict is one run. Only the keys you want to override are needed.
-EXPERIMENTS = [
-    {
+weights_strategies = ["energy_bins", "distance_to_ground", "kde"]  #
+EXPERIMENTS = []
+
+# [False, False, False], [True, False, False], [True, True, False], [True, False, True]
+for bind, inv_target, log_target in [[False, False, False], [True, False, False], [True, True, False], [True, False, True]]:
+    EXPERIMENTS.append({
         "dataset.use_sample_weights": False,
-        "dataset.use_binding_energy": True,
-        "dataset.use_inverse_target": False,
-        "dataset.use_log_target": True,
-    },
-    {
-        "dataset.use_sample_weights": True,
-        "dataset.weight_strategy": "energy_bins",
-        "dataset.use_binding_energy": True,
-        "dataset.use_inverse_target": False,
-        "dataset.use_log_target": True,
-    },
-    {
-        "dataset.use_sample_weights": True,
-        "dataset.weight_strategy": "distance_to_ground",
-        "dataset.use_binding_energy": True,
-        "dataset.use_inverse_target": False,
-        "dataset.use_log_target": True,
-    },
-    {
-        "dataset.use_sample_weights": True,
-        "dataset.weight_strategy": "kde",
-        "dataset.use_binding_energy": True,
-        "dataset.use_inverse_target": False,
-        "dataset.use_log_target": True,
-    },
-]
+        "dataset.use_binding_energy": bind,
+        "dataset.use_inverse_target": inv_target,
+        "dataset.use_log_target": log_target,
+    })
+    for strategy in weights_strategies:
+        EXPERIMENTS.append({
+            "dataset.use_sample_weights": True,
+            "dataset.weight_strategy": strategy,
+            "dataset.use_binding_energy": bind,
+            "dataset.use_inverse_target": inv_target,
+            "dataset.use_log_target": log_target,
+        })
 # ── End of experiment definitions ────────────────────────────────────────────
 
 

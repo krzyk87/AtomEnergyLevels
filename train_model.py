@@ -169,6 +169,7 @@ def train_one_epoch(
 
     # Calculate average MAE in cm⁻¹
     avg_mae = np.mean(np.abs(predictions_cm - targets_cm))
+    # RuntimeWarning: invalid value encountered in subtract
 
     return avg_loss, avg_mae
 
@@ -238,8 +239,10 @@ def validate(
     predictions_cm = val_dataset.inverse_transform_target(all_predictions)
     targets_cm = val_dataset.inverse_transform_target(all_targets)
 
+    # RuntimeWarning: invalid value encountered in subtract
     mae = np.mean(np.abs(predictions_cm - targets_cm))
     rmse = np.sqrt(np.mean((predictions_cm - targets_cm) ** 2))
+    # RuntimeWarning: overflow encountered in square
     
     return avg_loss, mae, rmse
 
