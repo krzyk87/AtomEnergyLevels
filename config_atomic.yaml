@@ -1,8 +1,8 @@
 general:
   epochs: 30000                   # Number of training epochs
   optimizer: Adam               # Optimizer: Adam / SGD / RMSprop
-  lr: 0.0005                     # Learning rate
-  weight_decay: 0.0001          # L2 regularization (weight decay)
+  lr: 0.0001                     # Learning rate
+  weight_decay: 0.0          # L2 regularization (weight decay)
   batch_size: 16                # Batch size for training
   num_workers: 0                # Number of CPU workers for data loading
   random_seed: 42               # Random seed for reproducibility
@@ -54,21 +54,22 @@ dataset:
   
   # Target to predict (output)
   target_feature: "Level (cm-1)"
-  use_binding_energy: true        # Convert to binding energy: predict (E_ion - E_level) instead of E_level
-  use_inverse_target: true       # Apply inverse scaling: predict A / E_target instead of E_target
+  use_binding_energy: false        # Convert to binding energy: predict (E_ion - E_level) instead of E_level
+  use_inverse_target: false       # Apply inverse scaling: predict A / E_target instead of E_target
   inverse_target_scale: 100000    # Scale factor A used in inverse transformation (A / E_target)
   use_log_target: false
   
   # Feature engineering: whether to add derived features
   add_derived_features: false    # Add total_electrons, valence_electrons, core_electrons, unpaired_electrons, max_principal_n
+  use_rydberg_features: true    # Add n_star and rydberg_pred as input features
   
   # Data normalization
   normalize_features: true      # Standardize features (zero mean, unit variance)
   normalize_target: false        # Standardize target variable
 
   # Sample weighting for imbalanced energy distributions
-  use_sample_weights: true
-  weight_strategy: 'kde'  # energy_bins / distance_to_ground / kde
+  use_sample_weights: false
+  weight_strategy: 'energy_bins'  # energy_bins / distance_to_ground / kde
   n_energy_bins: 10               # Number of bins for energy_bins strategy
   
   # Data splitting

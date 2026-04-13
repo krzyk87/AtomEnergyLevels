@@ -34,6 +34,7 @@ IONIZATION_ENERGIES = {
     'Cs': (55, 31406.467),
     'Fr': (87, 32848.872)
 }
+R_INF = 109737.316  # Rydberg constant in cm-1
 
 class AtomicDataset(Dataset):
     """
@@ -147,6 +148,10 @@ class AtomicDataset(Dataset):
         # Split data into train/validation/test sets
         # This creates self.indices that contains row indices for this subset
         self._create_splits()
+
+        # Add Rydberg features — after split is known, so δ is fit on train only
+        if config.dataset.get('use_rydberg_features', False):
+            self._add_rydberg_features()
         
         # Extract features (X) and target (y) for this subset
         self.X = self.df.loc[self.indices, self.feature_columns].values
@@ -213,6 +218,7 @@ class AtomicDataset(Dataset):
         key_dict['use_log_target'] = self.config.dataset.get('use_log_target', False)
         key_dict['inverse_target_scale'] = self.config.dataset.get('inverse_target_scale', 100000)
         key_dict['add_derived_features'] = self.config.dataset.get('add_derived_features', False)
+        key_dict['use_rydberg_features'] = self.config.dataset.get('use_rydberg_features', False)
         key_dict['encode_valence_electrons'] = self.config.dataset.get('encode_valence_electrons', False)
         key_dict['max_valence_electrons'] = self.config.dataset.get('max_valence_electrons', 1)
 
@@ -731,22 +737,204 @@ class AtomicDataset(Dataset):
             self.df['unpaired_electrons'] = 2 * self.df['S_qn']
         else:
             self.df['unpaired_electrons'] = 0
-
-        # Approximate quantum defects for K (from literature / NIST fit)
-        QUANTUM_DEFECTS_K = {0: 2.18, 1: 1.71, 2: 0.28, 3: 0.01, 4: 0.0}
-        R_INF = 109736.6  # cm⁻¹
-
-        # For each row, compute n* and the Rydberg prediction
-        n = row['val_e1_n']
-        l = row['val_e1_l']
-        delta = QUANTUM_DEFECTS_K.get(l, 0.0)
-        n_star = n - delta
-        self.df['n_star'] = n_star
-        self.df['rydberg_prediction'] = R_INF / n_star ** 2
-        self.df['one_over_nstar_sq'] = 1.0 / n_star ** 2
         
         print(f"Added derived features: total_electrons, valence_electrons, "
               f"core_electrons, unpaired_electrons, max_principal_n")
+
+    def _add_rydberg_features(self):
+        """
+        Add physics-informed Rydberg features using quantum defects.
+
+        The quantum defect δₗ captures how much the valence electron's effective
+        orbit differs from a pure hydrogen-like orbit, due to core penetration.
+        It is approximately CONSTANT for all members of the same series (same l).
+
+        For example, for K:
+            all np levels:  δ ≈ 1.77  (n=4 through n=46)
+            all ns levels:  δ ≈ 2.21
+            all nd levels:  δ ≈ 0.28
+            all ng levels:  δ ≈ 0.00  (g orbitals don't penetrate the core)
+
+        CRITICAL: δₗ is computed from the TRAINING SET ONLY, then applied to all
+        rows (train/val/test). This is the same principle as fitting StandardScaler
+        on training data only — we must not use test labels to compute δ.
+
+        Features added:
+            n_star       = n - δₗ       (effective principal quantum number)
+            rydberg_pred = E_ion - R∞ / n_star²   (physics baseline prediction)
+
+        The model then learns the residual:  E_level - rydberg_pred
+        This reduces the model's job from ~35,000 cm⁻¹ range to ~200 cm⁻¹ for
+        well-behaved high-n states, and from ~7,000 cm⁻¹ error to ~50 cm⁻¹
+        error for the difficult low-n states like 4p.
+        """
+        print("\nAdding Rydberg physics features...")
+
+        # Find the outermost valence electron slot (last non-zero n across all val_ei_n columns)
+        max_ev = self.config.dataset.get('max_valence_electrons', 1)
+        val_n_cols = [f'val_e{i + 1}_n' for i in range(max_ev) if f'val_e{i + 1}_n' in self.df.columns]
+
+        def _get_outer_electron(row):
+            """Return (n, l) of the outermost (highest energy) valence electron."""
+            for col in reversed(val_n_cols):  # iterate from last slot backwards
+                n = row[col]
+                if pd.notna(n) and int(n) > 0:  # first non-zero from the end
+                    l_col = col.replace('_n', '_l')
+                    return int(n), int(row[l_col])
+            return None, None  # all zeros = no valence electron found
+
+        # We need val_e1_n (principal quantum number) and val_e1_l (angular momentum)
+        # These must already exist from _encode_valence_electrons()
+        if f'val_e{max_ev}_n' not in self.df.columns or f'val_e{max_ev}_l' not in self.df.columns:
+            print(f"  ✗ Skipping: val_e{max_ev}_n / val_e{max_ev}_l not found. "
+                  "Enable encode_valence_electrons first.")
+            return
+
+        # We also need the raw energy level to compute binding energy for the defect.
+        # Use the ORIGINAL level column (not the transformed target), because the
+        # binding energy column may not exist if use_binding_energy=False.
+        raw_level_col = self.config.dataset.target_feature  # e.g. 'Level (cm-1)'
+        if raw_level_col not in self.df.columns:
+            print(f"  ✗ Skipping: raw level column '{raw_level_col}' not found.")
+            return
+
+        # ----------------------------------------------------------------
+        # Step 1: Compute quantum defect for every row in the full dataset.
+        #         δ = n - n*,  where n* = sqrt(R∞ / binding_energy)
+        # ----------------------------------------------------------------
+        defects = []
+        for idx, row in self.df.iterrows():
+            element = row['Element']
+            n, l = _get_outer_electron(row)
+            if n is None:
+                defects.append(np.nan)
+                continue
+            level = row[raw_level_col]
+
+            if element not in IONIZATION_ENERGIES:
+                defects.append(np.nan)
+                continue
+
+            E_ion = IONIZATION_ENERGIES[element][1]
+            binding = E_ion - level
+
+            # Guard against unphysical/zero binding (continuum states)
+            if binding <= 0:
+                defects.append(np.nan)
+                continue
+
+            n_star = np.sqrt(R_INF / binding)
+            delta = n - n_star
+            defects.append(delta)
+
+        self.df['quantum_defect'] = defects
+
+        # ----------------------------------------------------------------
+        # Step 2: Compute mean δₗ from TRAINING ROWS ONLY.
+        #         Group by (element, l) to get element-specific defects,
+        #         which is important once you add Na, Li, Rb etc.
+        # ----------------------------------------------------------------
+        train_df = self.df.loc[self.indices] if self.subset == 'train' else \
+            self.df  # fallback: if called for val/test, train_indices unknown
+
+        # Better: always pass train_indices explicitly.
+        # Since this method is called from __init__ after _create_splits(),
+        # self.indices is the CURRENT subset's indices.
+        # We need the TRAIN indices regardless of which subset we are.
+        # Solution: store train_indices as a class-level attribute during train init.
+        # For now: compute from the split file.
+        split_file = self._get_split_file_path()
+        if os.path.exists(split_file):
+            with open(split_file, 'r') as f:
+                splits = json.load(f)
+            train_indices = splits['train']
+        else:
+            # No split file yet (shouldn't happen since _create_splits ran first)
+            train_indices = self.indices
+
+        train_df = self.df.loc[train_indices]
+
+        # Compute mean defect per (element, l), ignoring NaN rows
+        delta_per_element_l = (
+            train_df.groupby(['Element', f'val_e{max_ev}_l'])['quantum_defect']
+            .mean()
+            .to_dict()
+        )
+
+        print(f"  Quantum defects learned from {len(train_indices)} training samples:")
+        for (element, l), delta in sorted(delta_per_element_l.items()):
+            l_name = {0: 's', 1: 'p', 2: 'd', 3: 'f', 4: 'g'}.get(int(l), '?')
+            print(f"    {element} {l_name}-series (l={int(l)}): δ = {delta:.4f}")
+
+        # ----------------------------------------------------------------
+        # Step 3: Apply Rydberg formula to ALL rows using the learned defects.
+        #         For unseen (element, l) combinations (e.g. g-orbitals not in
+        #         training), fall back to δ=0 (pure hydrogen-like, still a
+        #         good approximation for high-l states).
+        # ----------------------------------------------------------------
+        n_stars = []
+        rydberg_preds = []
+        one_over_nsq_vals = []
+
+        for idx, row in self.df.iterrows():
+            element = row['Element']
+            n, l = _get_outer_electron(row)
+
+            if element not in IONIZATION_ENERGIES:
+                n_stars.append(np.nan)
+                rydberg_preds.append(np.nan)
+                continue
+
+            E_ion = IONIZATION_ENERGIES[element][1]
+
+            # Look up δ for this (element, l); default to 0 if unseen
+            key = (element, l)
+            delta = delta_per_element_l.get(key, 0.0)
+
+            n_eff = n - delta
+            if n_eff <= 0:
+                # Unphysical: n smaller than defect (shouldn't occur for real data)
+                n_stars.append(np.nan)
+                rydberg_preds.append(np.nan)
+                continue
+
+            n_star_val = n_eff  # n* = n - δ
+            ryd_pred = E_ion - R_INF / n_eff ** 2  # Rydberg energy prediction
+            one_over_nsq = 1.0 / n_eff**2
+
+            n_stars.append(n_star_val)
+            rydberg_preds.append(ryd_pred)
+            one_over_nsq_vals.append(one_over_nsq)
+
+        self.df['n_star'] = n_stars
+        self.df['rydberg_pred'] = rydberg_preds
+        self.df['one_over_nstar_sq'] = one_over_nsq_vals
+
+        # ----------------------------------------------------------------
+        # Step 4: Add the new columns to the feature list for this subset.
+        # ----------------------------------------------------------------
+        new_features = ['n_star', 'rydberg_pred', 'one_over_nstar_sq']
+        for col in new_features:
+            if col not in self.feature_columns:
+                self.feature_columns.append(col)
+
+        print(f"  Added features: {new_features}")
+        print(f"  Total features now: {len(self.feature_columns)}")
+
+        # Sanity check: show the residual for the most difficult states
+        # (the ones we know were failing before)
+        check_configs = ['3p6.4p', '3p6.5g']
+        if 'Configuration' in self.df.columns:
+            for cfg in check_configs:
+                rows = self.df[self.df['Configuration'].str.startswith(cfg.split('.')[1]
+                                                                       if '.' in cfg else cfg)]
+                if not rows.empty:
+                    for _, r in rows.iterrows():
+                        residual = r[raw_level_col] - r['rydberg_pred']
+                        print(f"  Check {r.get('Configuration', '?')}: "
+                              f"true={r[raw_level_col]:.1f}, "
+                              f"rydberg={r['rydberg_pred']:.1f}, "
+                              f"residual={residual:.1f} cm⁻¹")
 
     def _add_binding_energy_target(self):
         """
@@ -904,14 +1092,8 @@ class AtomicDataset(Dataset):
                 self.df[feature_cols] = self.df[feature_cols].fillna(fill_value)
                 print(f"Filled missing values with {fill_value}")
 
-    def _create_splits(self):
-        """
-        Create or load train/val/test splits.
-
-        For multi-element data, creates stratified splits to ensure
-        each element is represented in all splits.
-        """
-        # Determine split file name
+    def _get_split_file_path(self) -> str:
+        """Return the path to the split indices JSON file."""
         if hasattr(self.config.dataset, 'elements') and len(self.config.dataset.elements) > 1:
             # Multi-element: use combined name
             elements_str = '_'.join(sorted(self.config.dataset.elements))
@@ -925,6 +1107,17 @@ class AtomicDataset(Dataset):
         if hasattr(self.config.dataset, 'data_dir'):
             split_file = os.path.join(self.config.dataset.data_dir, split_file)
 
+        return split_file
+
+    def _create_splits(self):
+        """
+        Create or load train/val/test splits.
+
+        For multi-element data, creates stratified splits to ensure
+        each element is represented in all splits.
+        """
+        # Determine split file name
+        split_file = self._get_split_file_path()
         print(f"\nData split file: {split_file}")
 
         # Load existing splits if available

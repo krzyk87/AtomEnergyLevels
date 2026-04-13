@@ -218,7 +218,13 @@ def get_experiment_tags(config) -> str:
     else:
         weight_tag = 'no-weights'
 
-    return f"{target_tag}_{weight_tag}"
+    use_rydberg = config.dataset.get('use_rydberg_features', False)
+    if use_rydberg:
+        rydberg_tag = 'ryd'
+    else:
+        rydberg_tag = 'no-ryd'
+
+    return f"{target_tag}_{weight_tag}_{rydberg_tag}"
 
 
 def get_model_name_from_config(config) -> str:
@@ -325,6 +331,7 @@ def append_metrics_to_excel(config, test_metrics, train_metrics=None, val_metric
     row["encode_valence_electrons"] = config.dataset.get("encode_valence_electrons", True)
     row["max_valence_electrons"] = config.dataset.get("max_valence_electrons", 10)
     row["add_derived_features"] = config.dataset.get("add_derived_features", False)
+    row["use_rydberg_features"] = config.dataset.get("use_rydberg_features", False)
 
     # Input features (populated from the dataset object)
     row["n_features"] = features.get("n_features", None) if features is not None else None
