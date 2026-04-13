@@ -34,6 +34,8 @@ IONIZATION_ENERGIES = {
     'Cs': (55, 31406.467),
     'Fr': (87, 32848.872)
 }
+# Alkali metals: the Rydberg features are physically meaningful (1 valence electron)
+ALKALI_METALS = {'Li', 'Na', 'K', 'Rb', 'Cs', 'Fr'}
 R_INF = 109737.316  # Rydberg constant in cm-1
 
 class AtomicDataset(Dataset):
@@ -221,6 +223,7 @@ class AtomicDataset(Dataset):
         key_dict['use_rydberg_features'] = self.config.dataset.get('use_rydberg_features', False)
         key_dict['encode_valence_electrons'] = self.config.dataset.get('encode_valence_electrons', False)
         key_dict['max_valence_electrons'] = self.config.dataset.get('max_valence_electrons', 1)
+        key_dict['stratify_energy_bins'] = self.config.dataset.get('stratify_energy_bins', 5)
 
         # Convert to deterministic string
         key_str = json.dumps(key_dict, sort_keys=True)
@@ -910,10 +913,21 @@ class AtomicDataset(Dataset):
         self.df['rydberg_pred'] = rydberg_preds
         self.df['one_over_nstar_sq'] = one_over_nsq_vals
 
+        # Warn and skip for elements where Rydberg features are not applicable
+        elements_in_data = self.df['Element'].unique()
+        non_alkali = [e for e in elements_in_data if e not in ALKALI_METALS]
+        if non_alkali:
+            print(f"  ⚠ Rydberg features not computed for: {non_alkali}")
+            print(f"    (Rydberg formula requires single-valence-electron atoms)")
+            # Set NaN for non-alkali rows; model will treat these as missing
+            self.df.loc[self.df['Element'].isin(non_alkali), 'rydberg_pred'] = np.nan
+            self.df.loc[self.df['Element'].isin(non_alkali), 'n_star'] = np.nan
+            self.df.loc[self.df['Element'].isin(non_alkali), 'one_over_nstar_sq'] = np.nan
+
         # ----------------------------------------------------------------
         # Step 4: Add the new columns to the feature list for this subset.
         # ----------------------------------------------------------------
-        new_features = ['n_star', 'rydberg_pred', 'one_over_nstar_sq']
+        new_features = ['n_star', 'rydberg_pred']   # 'one_over_nstar_sq'
         for col in new_features:
             if col not in self.feature_columns:
                 self.feature_columns.append(col)
@@ -1132,12 +1146,15 @@ class AtomicDataset(Dataset):
         print(f"  Creating new splits...")
         np.random.seed(self.config.general.random_seed)
 
-        # For multi-element: stratified split (ensure each element in all splits)
-        if 'Element' in self.df.columns and self.df['Element'].nunique() > 1:
-            train_indices, val_indices, test_indices = self._create_stratified_splits()
-        else:
-            # Single element: simple random split
-            train_indices, val_indices, test_indices = self._create_random_splits()
+        # # For multi-element: stratified split (ensure each element in all splits)
+        # if 'Element' in self.df.columns and self.df['Element'].nunique() > 1:
+        #     train_indices, val_indices, test_indices = self._create_stratified_splits()
+        # else:
+        #     # Single element: simple random split
+        #     train_indices, val_indices, test_indices = self._create_random_splits()
+
+        # Always use energy-stratified splits:
+        train_indices, val_indices, test_indices = self._create_stratified_splits()
 
         # Save splits
         splits = {
@@ -1165,29 +1182,122 @@ class AtomicDataset(Dataset):
 
     def _create_stratified_splits(self):
         """
-        Create stratified splits ensuring each element appears in all sets.
+        Create stratified splits by element × energy quantile bin.
+
+        For each element, energy levels are divided into n_bins quantile bins
+        (equal sample count per bin). The stratum label is 'ELEMENT_binN'.
+        This guarantees that both rare low-energy states AND the dense
+        high-energy cluster are proportionally represented in every split.
+
+        Works for single-element datasets too: the 'element' part of the
+        stratum label is constant, so stratification is purely by energy bin.
+
+        Config key: dataset.stratify_energy_bins (default: 5, set 0 to disable)
         """
         from sklearn.model_selection import train_test_split
+
+        n_bins = int(self.config.dataset.get('stratify_energy_bins', 5))
+        raw_level_col = self.config.dataset.target_feature  # original level column
+
+        # ----------------------------------------------------------------
+        # Build stratum labels: 'ELEMENT_bin0' .. 'ELEMENT_bin{n_bins-1}'
+        # ----------------------------------------------------------------
+        strata = []
+        for idx, row in self.df.iterrows():
+            element = row.get('Element', 'X')
+
+            if n_bins <= 1:
+                # No energy stratification — stratify by element only
+                strata.append(element)
+                continue
+
+            level = row.get(raw_level_col, np.nan)
+            try:
+                level = float(level)
+            except (TypeError, ValueError):
+                level = np.nan
+
+            if np.isnan(level):
+                strata.append(f"{element}_bin0")
+                continue
+
+            # Compute quantile bin within this element's levels
+            el_levels = self.df.loc[
+                self.df['Element'] == element, raw_level_col
+            ].astype(float)
+
+            # pd.qcut with duplicates='drop' handles ties gracefully
+            try:
+                bin_label = pd.qcut(
+                    el_levels, q=n_bins, labels=False, duplicates='drop'
+                ).loc[idx]
+                bin_label = int(bin_label) if pd.notna(bin_label) else 0
+            except Exception:
+                bin_label = 0
+
+            strata.append(f"{element}_bin{bin_label}")
+
+        strata = np.array(strata)
+
+        # ----------------------------------------------------------------
+        # Check minimum bin size — sklearn needs >= 2 per stratum per split
+        # If any stratum has < 4 samples (can't survive two splits), merge
+        # it into the nearest stratum by renaming it.
+        # ----------------------------------------------------------------
+        from collections import Counter
+        counts = Counter(strata)
+        MIN_STRATUM_SIZE = 4
+        for label, count in counts.items():
+            if count < MIN_STRATUM_SIZE:
+                # Find replacement: same element, adjacent bin number
+                element = label.rsplit('_bin', 1)[0]
+                bin_num = int(label.rsplit('_bin', 1)[1])
+                # Try bin+1, then bin-1
+                for alt in [bin_num + 1, bin_num - 1, bin_num + 2]:
+                    alt_label = f"{element}_bin{alt}"
+                    if alt_label in counts and counts[alt_label] >= MIN_STRATUM_SIZE:
+                        strata[strata == label] = alt_label
+                        print(f"    ⚠ Merged stratum '{label}' ({count} samples) "
+                              f"→ '{alt_label}'")
+                        break
 
         all_indices = self.df.index.tolist()
         elements = self.df['Element'].values
 
-        # First split: train vs (val+test)
+        # ----------------------------------------------------------------
+        # First split: train vs (val + test)
+        # ----------------------------------------------------------------
         train_idx, temp_idx = train_test_split(
             all_indices,
             test_size=(self.config.dataset.split.val + self.config.dataset.split.test),
-            stratify=elements,
+            stratify=strata,  # strata aligned with all_indices
             random_state=self.config.general.random_seed
         )
 
+        # ----------------------------------------------------------------
         # Second split: val vs test
-        val_ratio = self.config.dataset.split.val / (self.config.dataset.split.val + self.config.dataset.split.test)
+        # Use integer positions into temp_idx to index strata correctly.
+        # ----------------------------------------------------------------
+        temp_positions = [all_indices.index(i) for i in temp_idx]  # positional
+        strata_temp = strata[temp_positions]
+
+        val_ratio = self.config.dataset.split.val / (
+                self.config.dataset.split.val + self.config.dataset.split.test
+        )
         val_idx, test_idx = train_test_split(
             temp_idx,
             test_size=(1 - val_ratio),
-            stratify=elements[temp_idx],
+            stratify=strata_temp,
             random_state=self.config.general.random_seed
         )
+
+        # Print what the strata look like
+        print(f"\n  Stratification: {n_bins} energy bins × element")
+        for label in sorted(set(strata)):
+            n_train = sum(strata[all_indices.index(i)] == label for i in train_idx)
+            n_val = sum(strata[all_indices.index(i)] == label for i in val_idx)
+            n_test = sum(strata[all_indices.index(i)] == label for i in test_idx)
+            print(f"    {label}: train={n_train}, val={n_val}, test={n_test}")
 
         return train_idx, val_idx, test_idx
 
