@@ -347,6 +347,7 @@ def _compute_metrics(df: pd.DataFrame, big_A: float = 1000.0) -> Dict[str, np.nd
       - E_level: raw energy (cm^-1) from 'Level (cm-1)'
       - A_over_E: A / E_level
       - A_over_delta: A / (E_ion - E_level), where E_ion from IONIZATION_ENERGIES per element
+      - log_delta: log(E_ion - E_level)
     """
     if 'Level (cm-1)' not in df.columns:
         raise KeyError("Expected column 'Level (cm-1)' in features CSV")
@@ -376,10 +377,16 @@ def _compute_metrics(df: pd.DataFrame, big_A: float = 1000.0) -> Dict[str, np.nd
         invalid = (~np.isfinite(A_over_delta)) | (delta <= 0)
         A_over_delta[invalid] = np.nan
 
+    # log(E_ion - E_level) with guard delta > 0
+    with np.errstate(divide='ignore', invalid='ignore'):
+        log_delta = np.log(delta)
+        log_delta[(~np.isfinite(log_delta)) | (delta <= 0)] = np.nan
+
     return {
         'E_level': E,
         'A_over_E': A_over_E,
         'A_over_delta': A_over_delta,
+        'log_delta': log_delta,
     }
 
 
@@ -446,6 +453,7 @@ def plot_dataset_energy_distributions(
             'E_level': clean(_subset_arrays(metrics['E_level'], idxs)),
             'A_over_E': clean(_subset_arrays(metrics['A_over_E'], idxs)),
             'A_over_delta': clean(_subset_arrays(metrics['A_over_delta'], idxs)),
+            'log_delta': clean(_subset_arrays(metrics['log_delta'], idxs)),
         }
 
     # Plotting function
@@ -507,6 +515,14 @@ def plot_dataset_energy_distributions(
         title='Distribution of A / (E_ion - E_level)',
         xlabel='A / (E_ion - E_level)',
         filename='dist_A_over_delta.png'
+    )
+
+    # 4) log(E_ion - E_level)
+    _plot_metric(
+        'log_delta',
+        title='Distribution of log(E_ion - E_level)',
+        xlabel='log(E_ion - E_level) (cm⁻¹)',
+        filename='dist_log_delta.png'
     )
 
 
