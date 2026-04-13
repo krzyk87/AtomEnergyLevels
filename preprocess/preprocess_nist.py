@@ -97,12 +97,20 @@ def read_nist_csv(filepath: str) -> pd.DataFrame:
         inner = outer_parsed[0] if len(outer_parsed) == 1 else ','.join(outer_parsed)
 
         # inner is comma-separated Excel formula cells: =""val1"",=""val2"",...
-        # Split by comma and clean each field individually.
-        fields = inner.split(',')
+        # Some cells contain commas in their values (e.g. J = "7/2,9/2"), so
+        # splitting naively on ',' would misalign all subsequent columns.
+        # Instead, split on the inter-cell boundary '","=""' which only appears
+        # between cells, never inside a value.
+        parts = inner.split('","=""')
         values = []
-        for field in fields:
-            val = re.sub(r'^[="]+', '', field)   # strip leading ="" / =""""
-            val = re.sub(r'[" ]+$', '', val)     # strip trailing "" / spaces
+        for i, part in enumerate(parts):
+            if i == 0:
+                # First cell: leading =" (the inter-cell separator consumed the
+                # trailing " of this cell, so nothing to strip on the right).
+                val = re.sub(r'^[="]+', '', part)
+            else:
+                # Subsequent cells: trailing """ artifact left after split.
+                val = re.sub(r'"+$', '', part)
             values.append(val.strip())
 
         if values:
@@ -318,6 +326,8 @@ def preprocess_element(element: str, data_dir: str = 'data') -> pd.DataFrame:
     parse_errors = 0
     out_rows = []
 
+    multi_j_rows = 0
+
     for _, row in df.iterrows():
         config      = str(row.get('Configuration', '')).strip()
         term        = str(row.get('Term', '')).strip()
@@ -329,7 +339,6 @@ def preprocess_element(element: str, data_dir: str = 'data') -> pd.DataFrame:
         lande       = str(row.get('Lande', '')).strip() if 'Lande' in df.columns else ''
         reference   = str(row.get('Reference', '')).strip()
 
-        J            = parse_j(j_str)
         S_qn, L_qn, parity = parse_term(term)
 
         try:
@@ -349,30 +358,39 @@ def preprocess_element(element: str, data_dir: str = 'data') -> pd.DataFrame:
         except ValueError:
             unc_val = None
 
-        out_row = {
-            'Configuration':    config,
-            'Term':             term,
-            'Prefix':           prefix,
-            'Suffix':           suffix,
-            'Lande':            lande,
-            'Reference':        reference,
-            'Z':                Z,
-            'A':                A,
-            'proton_number':    Z,
-            'neutron_number':   A - Z,
-            'J':                J,
-            'S_qn':             S_qn,
-            'L_qn':             L_qn,
-            'parity':           parity,
-        }
+        # Split multi-valued J fields (e.g. '7/2,9/2') into separate rows.
+        j_parts = [v.strip() for v in j_str.split(',')]
+        if len(j_parts) > 1:
+            multi_j_rows += 1
 
-        for orb in orbital_cols:
-            out_row[orb] = occupancies.get(orb, 0)
+        for j_part in j_parts:
+            out_row = {
+                'Configuration':    config,
+                'Term':             term,
+                'Prefix':           prefix,
+                'Suffix':           suffix,
+                'Lande':            lande,
+                'Reference':        reference,
+                'Z':                Z,
+                'A':                A,
+                'proton_number':    Z,
+                'neutron_number':   A - Z,
+                'J':                parse_j(j_part),
+                'S_qn':             S_qn,
+                'L_qn':             L_qn,
+                'parity':           parity,
+            }
 
-        out_row['Level (cm-1)']       = level_val
-        out_row['Uncertainty (cm-1)'] = unc_val
+            out_row['Level (cm-1)'] = level_val
+            out_row['Uncertainty (cm-1)'] = unc_val
 
-        out_rows.append(out_row)
+            for orb in orbital_cols:
+                out_row[orb] = occupancies.get(orb, 0)
+
+            out_rows.append(out_row)
+
+    if multi_j_rows:
+        print(f"  {multi_j_rows} row(s) with multiple J values expanded into separate rows")
 
     if parse_errors:
         print(f"  {parse_errors} rows had configuration parse errors "
