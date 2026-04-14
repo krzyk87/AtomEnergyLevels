@@ -13,8 +13,11 @@ Usage:
 Plots produced:
     1.  Feature distributions — histogram per feature, coloured by element
     2.  Correlation matrix — catches redundancies (e.g. L_qn vs val_e1_l)
-    3.  Mutual information ranking — non-parametric feature importance
-    4.  Feature vs binding-energy scatter — reveals Rydberg structure
+    3.  Mutual information ranking — 2×2 subplots for log_binding_energy,
+        raw_energy (Level cm-1), binding_energy, inverse_binding_energy
+    4.  Feature vs log-binding-energy scatter — reveals Rydberg structure
+    4b. Feature vs raw-energy (Level cm-1) scatter
+    4c. Feature vs binding-energy scatter
     5.  Rydberg residuals — (true level − rydberg_pred) vs n_star, coloured by l
     6.  n* distribution — validates quantum defect per element & series
     7.  Quantum defect stability — δ vs n, coloured by l (ideally flat lines)
@@ -379,40 +382,73 @@ def plot_correlation_matrix(df: pd.DataFrame, features: list, pdf: PdfPages,
     plt.close(fig)
 
 # ---------------------------------------------------------------------------
-# Plot 3: Mutual information ranking
+# Plot 3: Mutual information ranking — multiple targets as subplots
 # ---------------------------------------------------------------------------
 
 def plot_mutual_information(df: pd.DataFrame, features: list,
-                             target: str, pdf: PdfPages):
+                             targets: list, pdf: PdfPages):
+    """
+    Render MI ranking for every target in *targets* as subplots on one PDF page.
+
+    targets: list of (column_name, display_label) tuples.
+             column_name must exist in df; display_label is shown in the subplot title.
+    """
     from sklearn.feature_selection import mutual_info_regression
     from sklearn.preprocessing import StandardScaler
 
-    available = [f for f in features if f in df.columns and f != target]
-    target_vals = df[target].dropna()
-    common_idx  = df[available].dropna().index.intersection(target_vals.index)
+    n_targets = len(targets)
+    ncols = 2
+    nrows = (n_targets + ncols - 1) // ncols
+    bar_height_per_feat = 0.38
+    subplot_h = max(4, len(features) * bar_height_per_feat)
 
-    X = df.loc[common_idx, available].values
-    y = df.loc[common_idx, target].values
+    fig, axes = plt.subplots(nrows, ncols,
+                              figsize=(18, subplot_h * nrows))
+    axes = np.array(axes).flatten()
 
-    # Normalise for fair comparison
-    X_sc = StandardScaler().fit_transform(X)
-    mi = mutual_info_regression(X_sc, y, random_state=42)
+    for i, (col_name, label) in enumerate(targets):
+        ax = axes[i]
+        if col_name not in df.columns:
+            ax.set_visible(False)
+            continue
 
-    order = np.argsort(mi)[::-1]
-    sorted_feats = [available[i] for i in order]
-    sorted_mi    = mi[order]
+        available = [f for f in features if f in df.columns and f != col_name]
+        target_vals = df[col_name].dropna()
+        common_idx = df[available].dropna().index.intersection(target_vals.index)
+        if len(common_idx) == 0:
+            ax.set_visible(False)
+            continue
 
-    fig, ax = plt.subplots(figsize=(10, max(4, len(available) * 0.45)))
-    colors = ["#1D9E75" if v > np.median(sorted_mi) else "#888780" for v in sorted_mi]
-    bars = ax.barh(sorted_feats[::-1], sorted_mi[::-1], color=colors[::-1], height=0.6)
-    ax.set_xlabel("Mutual information (with log binding energy)", fontsize=10)
-    ax.axvline(np.median(sorted_mi), color="#BA7517", ls="--", lw=1, label="median")
-    ax.legend(fontsize=9)
-    for bar, val in zip(bars, sorted_mi[::-1]):
-        ax.text(val + max(sorted_mi) * 0.01, bar.get_y() + bar.get_height() / 2,
-                f"{val:.3f}", va="center", fontsize=8)
-    _suptitle(fig, f"Mutual information ranking — target: {target}\n"
-              "(higher = more informative; near-zero = essentially noise for this target)")
+        X = df.loc[common_idx, available].values
+        y = df.loc[common_idx, col_name].values
+
+        X_sc = StandardScaler().fit_transform(X)
+        mi = mutual_info_regression(X_sc, y, random_state=42)
+
+        order = np.argsort(mi)[::-1]
+        sorted_feats = [available[k] for k in order]
+        sorted_mi = mi[order]
+        median_mi = np.median(sorted_mi)
+
+        colors = ["#1D9E75" if v > median_mi else "#888780" for v in sorted_mi]
+        bars = ax.barh(sorted_feats[::-1], sorted_mi[::-1],
+                       color=colors[::-1], height=0.6)
+        ax.set_xlabel("Mutual information", fontsize=9)
+        ax.axvline(median_mi, color="#BA7517", ls="--", lw=1, label="median")
+        ax.legend(fontsize=8)
+        ax.set_title(f"target: {label}", fontsize=10, fontweight="bold")
+        ax.tick_params(labelsize=7)
+        x_pad = max(sorted_mi) * 0.01 if max(sorted_mi) > 0 else 0.001
+        for bar, val in zip(bars, sorted_mi[::-1]):
+            ax.text(val + x_pad, bar.get_y() + bar.get_height() / 2,
+                    f"{val:.3f}", va="center", fontsize=7)
+
+    for j in range(n_targets, len(axes)):
+        axes[j].set_visible(False)
+
+    _suptitle(fig,
+              "Mutual information ranking — feature importance per target\n"
+              "(higher = more informative; near-zero = essentially noise for that target)")
     fig.tight_layout()
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
@@ -668,7 +704,8 @@ def main():
     if not args.no_rydberg:
         print("Computing Rydberg features...")
         df = add_rydberg_features(df, args.level_col)
-        df["log_binding_energy"] = np.log(df["binding_energy"].clip(lower=1e-6))
+        df["log_binding_energy"]     = np.log(df["binding_energy"].clip(lower=1e-6))
+        df["inverse_binding_energy"] = 1.0 / df["binding_energy"].replace(0, np.nan)
         print("  Done.")
 
     print("Computing derived features...")
@@ -701,10 +738,24 @@ def main():
     if args.level_col in df.columns:
         target_cols.append(args.level_col)
 
-    target_for_mi = "log_binding_energy" if "log_binding_energy" in df.columns else args.level_col
+    # MI targets: (column_name, display_label) — keep only those present in df
+    _mi_candidates = [
+        ("log_binding_energy",     "log_binding_energy"),
+        (args.level_col,           f"raw_energy ({args.level_col})"),
+        ("binding_energy",         "binding_energy"),
+        ("inverse_binding_energy", "inverse_binding_energy"),
+    ]
+    mi_targets = [(col, lbl) for col, lbl in _mi_candidates if col in df.columns]
+
+    # Scatter targets beyond log_binding_energy
+    scatter_extra_targets = [t for t in [args.level_col, "binding_energy"]
+                              if t in df.columns]
+
+    target_for_log_scatter = "log_binding_energy" if "log_binding_energy" in df.columns \
+        else args.level_col
 
     print(f"\nFeatures to analyse: {all_features}")
-    print(f"MI target: {target_for_mi}")
+    print(f"MI targets: {[lbl for _, lbl in mi_targets]}")
     print(f"\nWriting report to: {out_path}")
 
     with PdfPages(out_path) as pdf:
@@ -727,34 +778,37 @@ def main():
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
 
-        print("  [1/8] Feature distributions...")
+        print("  [1] Feature distributions...")
         plot_feature_distributions(df, all_features, elements, args.level_col, pdf)
 
-        print("  [2/8] Correlation matrix...")
+        print("  [2] Correlation matrix...")
         plot_correlation_matrix(df, all_features, pdf, targets=target_cols)
 
-        print("  [3/8] Mutual information ranking...")
-        plot_mutual_information(df, all_features, target_for_mi, pdf)
+        print("  [3] Mutual information ranking (all targets)...")
+        plot_mutual_information(df, all_features, mi_targets, pdf)
 
-        print("  [4/8] Feature vs target scatter...")
-        plot_feature_target_scatter(df, all_features, target_for_mi, elements, pdf)
+        print("  [4] Feature vs log-binding-energy scatter...")
+        plot_feature_target_scatter(df, all_features, target_for_log_scatter, elements, pdf)
+
+        for extra_target in scatter_extra_targets:
+            print(f"  [4+] Feature vs {extra_target} scatter...")
+            plot_feature_target_scatter(df, all_features, extra_target, elements, pdf)
 
         if not args.no_rydberg:
-            print("  [5/8] Rydberg residuals...")
+            print("  [5] Rydberg residuals...")
             plot_rydberg_residuals(df, args.level_col, elements, pdf)
 
-            print("  [6/8] Quantum defect stability...")
+            print("  [6] Quantum defect stability...")
             plot_quantum_defect(df, elements, pdf)
 
-        print("  [7/8] Feature ranges by element...")
+        print("  [7] Feature ranges by element...")
         plot_feature_ranges(df, all_features, elements, pdf)
 
         if not args.no_rydberg:
-            print("  [8/8] n* distribution...")
+            print("  [8] n* distribution...")
             plot_nstar_distribution(df, elements, pdf)
 
     print(f"\nDone. Report: {out_path}")
-    print(f"  Contains {8 if not args.no_rydberg else 3} diagnostic pages.")
 
 
 if __name__ == "__main__":
