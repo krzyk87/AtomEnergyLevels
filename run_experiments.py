@@ -32,7 +32,7 @@ weights_strategies = ["energy_bins", "distance_to_ground", "kde"]  #
 EXPERIMENTS = []
 
 # [False, False, False], [True, False, False], [True, True, False], [True, False, True]
-for bind, inv_target, log_target in [[False, False, False], [True, False, False], [True, True, False], [True, False, True]]:
+for bind, inv_target, log_target in [[False, False, False], [True, False, False], [True, False, True]]:
     EXPERIMENTS.append({
         "dataset.use_sample_weights": False,
         "dataset.use_binding_energy": bind,

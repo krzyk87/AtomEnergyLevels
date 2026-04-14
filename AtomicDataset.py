@@ -937,18 +937,18 @@ class AtomicDataset(Dataset):
 
         # Sanity check: show the residual for the most difficult states
         # (the ones we know were failing before)
-        check_configs = ['3p6.4p', '3p6.5g']
-        if 'Configuration' in self.df.columns:
-            for cfg in check_configs:
-                rows = self.df[self.df['Configuration'].str.startswith(cfg.split('.')[1]
-                                                                       if '.' in cfg else cfg)]
-                if not rows.empty:
-                    for _, r in rows.iterrows():
-                        residual = r[raw_level_col] - r['rydberg_pred']
-                        print(f"  Check {r.get('Configuration', '?')}: "
-                              f"true={r[raw_level_col]:.1f}, "
-                              f"rydberg={r['rydberg_pred']:.1f}, "
-                              f"residual={residual:.1f} cm⁻¹")
+        # check_configs = ['3p6.4p', '3p6.5g']
+        # if 'Configuration' in self.df.columns:
+        #     for cfg in check_configs:
+        #         rows = self.df[self.df['Configuration'].str.startswith(cfg.split('.')[1]
+        #                                                                if '.' in cfg else cfg)]
+        #         if not rows.empty:
+        #             for _, r in rows.iterrows():
+        #                 residual = r[raw_level_col] - r['rydberg_pred']
+        #                 print(f"  Check {r.get('Configuration', '?')}: "
+        #                       f"true={r[raw_level_col]:.1f}, "
+        #                       f"rydberg={r['rydberg_pred']:.1f}, "
+        #                       f"residual={residual:.1f} cm⁻¹")
 
     def _add_binding_energy_target(self):
         """
