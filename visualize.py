@@ -315,6 +315,8 @@ def _load_features_combine(features_csvs: List[str]) -> Tuple[pd.DataFrame, List
         elements_order.append(elem)
         all_dfs.append(df)
     combined = pd.concat(all_dfs, ignore_index=True) if len(all_dfs) > 1 else all_dfs[0]
+
+    print(f"Loaded {len(combined)} rows from {elements_order} features CSVs")
     return combined, elements_order
 
 
@@ -327,7 +329,7 @@ def _infer_split_path(features_csvs: List[str], default_dir: str = 'data') -> Op
         return candidate
     # Try reversed order too
     if len(elems) > 1:
-        key_rev = '_'.join(reversed(elems))
+        key_rev = '_'.join(sorted(elems))
         candidate2 = os.path.join(default_dir, f"dataset_split_indices_{key_rev}.json")
         if os.path.exists(candidate2):
             return candidate2
@@ -415,6 +417,7 @@ def plot_dataset_energy_distributions(
     Each figure has three subplots for Train / Val / Test subsets using provided split indices.
     """
     os.makedirs(output_dir, exist_ok=True)
+    print(f"Plotting dataset distributions for {len(features_csvs)} features CSVs...")
 
     df, elems = _load_features_combine(features_csvs)
 
@@ -493,12 +496,14 @@ def plot_dataset_energy_distributions(
         print(f"Saved plot to {save_path}")
         plt.close(fig)
 
+    elems_str = '_'.join(elems)
+
     # 1) Raw E_level
     _plot_metric(
         'E_level',
         title='Distribution of Raw Energy Levels (E_level)',
         xlabel='E_level (cm⁻¹)',
-        filename='dist_E_level.png'
+        filename=f'{elems_str}_dist_E_level.png'
     )
 
     # 2) A / E_level
@@ -506,7 +511,7 @@ def plot_dataset_energy_distributions(
         'A_over_E',
         title=f'Distribution of A / E_level (A={big_A:g})',
         xlabel='A / E_level',
-        filename='dist_A_over_E.png'
+        filename=f'{elems_str}_dist_A_over_E.png'
     )
 
     # 3) A / (E_ion - E_level)
@@ -514,7 +519,7 @@ def plot_dataset_energy_distributions(
         'A_over_delta',
         title='Distribution of A / (E_ion - E_level)',
         xlabel='A / (E_ion - E_level)',
-        filename='dist_A_over_delta.png'
+        filename=f'{elems_str}_dist_A_over_delta.png'
     )
 
     # 4) log(E_ion - E_level)
@@ -522,7 +527,7 @@ def plot_dataset_energy_distributions(
         'log_delta',
         title='Distribution of log(E_ion - E_level)',
         xlabel='log(E_ion - E_level) (cm⁻¹)',
-        filename='dist_log_delta.png'
+        filename=f'{elems_str}_dist_log_delta.png'
     )
 
 
@@ -541,7 +546,7 @@ if __name__ == "__main__":
     # New flags for dataset distributions
     parser.add_argument('--plot_dataset_dists', action='store_true',
                         help='If set, also plot dataset energy distributions per split')
-    parser.add_argument('--features_csvs', type=str, default='data/K_features.csv',
+    parser.add_argument('--features_csvs', type=str, default='data/K_features.csv,data/Na_features.csv,data/Li_features.csv',
                         help='Comma-separated list of features CSV paths (e.g., data/K_features.csv,data/Na_features.csv)')
     parser.add_argument('--split_json', type=str, default='',
                         help='Path to dataset split indices JSON (if omitted, will try to infer)')
