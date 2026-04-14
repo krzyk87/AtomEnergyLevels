@@ -713,7 +713,7 @@ class AtomicDataset(Dataset):
             max_n = 0
             for col in orbital_cols:
                 if row[col] > 0:  # If this orbital has electrons
-                    n = int(col[0])  # First character is the principal quantum number
+                    n = int(re.match(r'^(\d+)', col).group(1))  # First character is the principal quantum number
                     max_n = max(max_n, n)
             self.df.loc[idx, 'max_principal_n'] = max_n
         
@@ -724,7 +724,7 @@ class AtomicDataset(Dataset):
             max_n = int(row['max_principal_n'])
             valence = 0
             for col in orbital_cols:
-                n = int(col[0])
+                n = int(re.match(r'^(\d+)', col).group(1))
                 if n == max_n:
                     valence += row[col]
             valence_electrons.append(valence)
@@ -927,7 +927,7 @@ class AtomicDataset(Dataset):
         # ----------------------------------------------------------------
         # Step 4: Add the new columns to the feature list for this subset.
         # ----------------------------------------------------------------
-        new_features = ['n_star', 'rydberg_pred']   # 'one_over_nstar_sq'
+        new_features = ['n_star', 'rydberg_pred', 'one_over_nstar_sq']   # 'one_over_nstar_sq'
         for col in new_features:
             if col not in self.feature_columns:
                 self.feature_columns.append(col)

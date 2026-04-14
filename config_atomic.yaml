@@ -21,7 +21,7 @@ model:
 
 dataset:
   # Simple: just list elements
-  elements: [ 'K']  # Or ['Na', 'K', 'Rb', 'Co', 'Ni']  # 'Na', 'Li','Rb','Cs','Fr'
+  elements: ['Li','Na','K']  # Or ['Na', 'K', 'Rb', 'Co', 'Ni']  # 'Na', 'Li','Rb','Cs','Fr'
 
   # Data directory structure (assumes standard naming)
   data_dir: "data"
@@ -38,8 +38,8 @@ dataset:
   max_valence_electrons: 1       # Maximum valence electrons to encode
 
   # Manually specify additional features (optional)
-  force_include_features: ['J', 'S_qn', 'L_qn']  # Always include these
-  force_exclude_features: [ ]        # Explicitly exclude these
+  force_include_features: ['J', ]  # Always include these
+  force_exclude_features: ['S_qn', 'L_qn' ]        # Explicitly exclude these
 
   # Input features - these columns will be used as model inputs
   # Orbital occupancies: electron count in each orbital (1s, 2s, 2p, etc.)
