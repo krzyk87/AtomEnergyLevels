@@ -442,7 +442,7 @@ def save_checkpoint(model, optimizer, epoch, train_loss, val_loss, save_path):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     
     torch.save(checkpoint, save_path)
-    print(f"Saved checkpoint to {save_path}")
+    # print(f"Saved checkpoint to {save_path}")
 
 
 def load_checkpoint(model, optimizer, checkpoint_path, device):

@@ -737,6 +737,8 @@ def main():
         target_cols.append("binding_energy")
     if args.level_col in df.columns:
         target_cols.append(args.level_col)
+    if "inverse_binding_energy" in df.columns:
+        target_cols.append("inverse_binding_energy")
 
     # MI targets: (column_name, display_label) — keep only those present in df
     _mi_candidates = [
@@ -748,7 +750,7 @@ def main():
     mi_targets = [(col, lbl) for col, lbl in _mi_candidates if col in df.columns]
 
     # Scatter targets beyond log_binding_energy
-    scatter_extra_targets = [t for t in [args.level_col, "binding_energy"]
+    scatter_extra_targets = [t for t in [args.level_col, "binding_energy", "inverse_binding_energy"]
                               if t in df.columns]
 
     target_for_log_scatter = "log_binding_energy" if "log_binding_energy" in df.columns \

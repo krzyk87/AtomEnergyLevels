@@ -373,7 +373,7 @@ def train_model(config, model, train_loader, val_loader, device, val_dataset):
             save_checkpoint(
                 model, optimizer, epoch, train_loss, val_loss, best_model_path
             )
-            print(f"  → New best model! Val Loss: {val_loss:.4f}")
+            # print(f"  → New best model! Val Loss: {val_loss:.4f}")
         else:
             patience_counter += 1
         

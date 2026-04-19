@@ -21,7 +21,7 @@ model:
 
 dataset:
   # Simple: just list elements
-  elements: ['Li','Na','K']  # Or ['Na', 'K', 'Rb', 'Co', 'Ni']  # 'Na', 'Li','Rb','Cs','Fr'
+  elements: ['Li','Na','K','Rb','Cs','Fr']  # Or ['Na', 'K', 'Rb', 'Co', 'Ni']  # 'Na', 'Li','Rb','Cs','Fr'
 
   # Data directory structure (assumes standard naming)
   data_dir: "data"
@@ -77,7 +77,7 @@ dataset:
     train: 0.6                  # 70% for training
     val: 0.2                   # 15% for validation
     test: 0.2                  # 15% for testing
-  stratify_energy_bins: 5   # quantile bins per element; 0 = element-only stratification
+  stratify_energy_bins: 10   # quantile bins per element; 0 = element-only stratification
   
   # Handle missing values
   drop_missing: false           # Whether to drop rows with missing values
