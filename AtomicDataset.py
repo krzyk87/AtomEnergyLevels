@@ -1222,9 +1222,9 @@ class AtomicDataset(Dataset):
                 continue
 
             # Compute quantile bin within this element's levels
-            el_levels = self.df.loc[
-                self.df['Element'] == element, raw_level_col
-            ].astype(float)
+            E_ion = IONIZATION_ENERGIES.get(element, (None, np.nan))[1]
+            el_levels_raw = self.df.loc[self.df['Element'] == element, raw_level_col].astype(float)
+            el_levels = np.log((E_ion - el_levels_raw).clip(lower=1))  # bin on log(binding)
 
             # pd.qcut with duplicates='drop' handles ties gracefully
             try:
