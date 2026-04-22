@@ -348,7 +348,10 @@ def append_metrics_to_excel(config, test_metrics, train_metrics=None, val_metric
     row["patience"] = config.general.patience
 
     # Config: model
-    row["architecture"] = config.model.architecture
+    if config.model.architecture == "baseline_ml":
+        row["architecture"] = config.model.get("baseline_model", "baseline_ml")
+    else:
+        row["architecture"] = config.model.architecture
     row["hidden_layers"] = "-".join(str(h) for h in config.model.hidden_layers)
     row["dropout"] = config.model.dropout
     row["activation"] = config.model.activation
