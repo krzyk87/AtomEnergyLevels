@@ -61,6 +61,7 @@ dataset:
   
   # Feature engineering: whether to add derived features
   add_derived_features: false    # Add total_electrons, valence_electrons, core_electrons, unpaired_electrons, max_principal_n
+  add_transition_metal_features: false   # Set to true for Fe, Co, Ni, Sc training
   use_rydberg_features: true    # Add n_star and rydberg_pred as input features
   
   # Data normalization

@@ -655,6 +655,18 @@ class AtomicDataset(Dataset):
             features.extend(added_derived)
             print(f"  ✓ Added {len(added_derived)} derived features: {added_derived}")
 
+        if self.config.dataset.get('add_transition_metal_features', False):
+            tm_cols = [
+                'J_sq', 'L_sq', 'S_sq', 'lande_so_term',
+                'n_3d', 'd_holes', 'd_from_half', 'is_half_filled',
+                'Z_eff', 'Z_eff_sq',
+                'zeta_3d', 'E_so_estimate',
+                'parity_computed'
+            ]
+            tm_added = [c for c in tm_cols if c in self.df.columns]
+            features.extend(tm_added)
+            print(f"  ✓ Added {len(tm_added)} transition metal features: {tm_added}")
+
         # ========================================
         # FORCE INCLUDE/EXCLUDE (from config)
         # ========================================
@@ -743,6 +755,166 @@ class AtomicDataset(Dataset):
         
         print(f"Added derived features: total_electrons, valence_electrons, "
               f"core_electrons, unpaired_electrons, max_principal_n")
+
+        # For transition metal atoms: add iron-group physics features
+        if self.config.dataset.get('add_transition_metal_features', False):
+            self._add_transition_metal_features()
+
+    def _add_transition_metal_features(self):
+        """
+        Add physics-based features for iron-group transition metal atoms (Fe, Co, Ni, Sc).
+
+        Unlike alkali metals (one valence electron, Rydberg-Ritz series), iron-group
+        atoms have partially filled 3d shells. Their energy structure is governed by:
+          1. Spin-orbit coupling (Landé interval rule): splits J-levels within a term
+             by ΔE ∝ J(J+1) − L(L+1) − S(S+1)
+          2. Hund's rules / 3d filling: energy depends strongly on n_3d and
+             distance from half-filling (exchange energy maximisation at n_3d=5)
+          3. Effective nuclear charge (Slater's rules): determines the energy scale
+             as Z_eff² analogous to hydrogen's Z²/n² structure
+
+        Features are computed in the following order (ordering matters — Feature 4
+        depends on lande_so_term produced by Feature 1):
+          1. Angular momentum coupling products: J_sq, L_sq, S_sq, lande_so_term
+          2. d-shell occupancy:                 n_3d, d_holes, d_from_half, is_half_filled
+          3. Effective nuclear charge:           Z_eff, Z_eff_sq
+          4. Spin-orbit energy estimate:         zeta_3d, E_so_estimate
+          5. Parity flag from orbitals:          parity_computed
+        """
+        print("\nAdding transition metal physics features...")
+
+        # ----------------------------------------------------------------
+        # Feature 1: Angular momentum coupling products (Landé interval rule)
+        # The MLP needs J(J+1), L(L+1), S(S+1) as explicit features because
+        # the spin-orbit energy is LINEAR in these products, not in J/L/S alone.
+        # lande_so_term = J(J+1) - L(L+1) - S(S+1)  ∝ spin-orbit energy shift
+        # ----------------------------------------------------------------
+        self.df['J_sq'] = self.df['J'] * (self.df['J'] + 1)            # J(J+1)
+        self.df['L_sq'] = self.df['L_qn'] * (self.df['L_qn'] + 1)      # L(L+1)
+        self.df['S_sq'] = self.df['S_qn'] * (self.df['S_qn'] + 1)      # S(S+1)
+        # Landé spin-orbit term: proportional to the spin-orbit energy within a multiplet
+        self.df['lande_so_term'] = self.df['J_sq'] - self.df['L_sq'] - self.df['S_sq']
+
+        # ----------------------------------------------------------------
+        # Feature 2: d-electron count and half-shell features (Hund's rules)
+        # The 3d shell (capacity 10) has special stability at half-filling (n_3d=5)
+        # due to maximal exchange energy. Pairing cost is symmetric around half-fill:
+        #   d_from_half encodes this pairing cost (0 at half-fill, 5 at empty/full).
+        #   d_holes encodes electron-hole symmetry: the 3d⁹ spectrum mirrors 3d¹.
+        # ----------------------------------------------------------------
+        if '3d' in self.df.columns:
+            # fillna(0) handles multi-element data where alkali rows have NaN in '3d'
+            n_3d_vals = self.df['3d'].fillna(0).astype(float)
+        else:
+            print("  ⚠ '3d' column not found in DataFrame — setting n_3d = 0 for all rows")
+            n_3d_vals = pd.Series(0.0, index=self.df.index)
+
+        self.df['n_3d'] = n_3d_vals                                       # raw d-electron count (0–10)
+        self.df['d_holes'] = 10 - self.df['n_3d']                         # electron-hole symmetry
+        self.df['d_from_half'] = (self.df['n_3d'] - 5).abs()             # distance from half-filled shell
+        self.df['is_half_filled'] = (self.df['n_3d'] == 5).astype(int)   # special stability flag
+
+        # ----------------------------------------------------------------
+        # Feature 3: Effective nuclear charge Z_eff via Slater's rules
+        # Z_eff = Z - σ, where σ is the screening constant for a 3d electron:
+        #   σ = 0.35*(n_3d - 1)          [same [3d] group, excluding target electron]
+        #     + 0.85*(n_3s + n_3p)        [n-1 shell: moderate screening]
+        #     + 1.00*(n_2s + n_2p + n_1s) [inner shells: full screening]
+        # Z_eff² is the dominant energy scale (analogue of Z²/n² in hydrogen).
+        # ----------------------------------------------------------------
+        if 'Element' not in self.df.columns:
+            raise ValueError(
+                "Z_eff cannot be computed: 'Element' column is missing from the DataFrame. "
+                "Ensure multi-element data is loaded with an 'Element' column, or for "
+                "single-element datasets add one via df['Element'] = '<symbol>'."
+            )
+
+        z_eff_vals = []
+        for idx, row in self.df.iterrows():
+            Z = IONIZATION_ENERGIES[row['Element']][0]   # atomic number Z from lookup table
+
+            # Same [3d] group screening: each of the other n_3d-1 electrons shields by 0.35
+            n_3d = row['3d'] if '3d' in self.df.columns and not pd.isna(row['3d']) else 0
+            sigma = (n_3d - 1) * 0.35   # (n_3d-1) same-group electrons × 0.35
+
+            # [3s, 3p] (n-1 shell for a 3d electron): moderate screening at 0.85 each
+            for col in ['3s', '3p']:
+                if col in self.df.columns and not pd.isna(row[col]):
+                    sigma += row[col] * 0.85
+
+            # [2s, 2p] and [1s] (inner shells): full screening at 1.00 each
+            for col in ['2s', '2p', '1s']:
+                if col in self.df.columns and not pd.isna(row[col]):
+                    sigma += row[col] * 1.00
+
+            z_eff_vals.append(Z - sigma)
+
+        self.df['Z_eff'] = z_eff_vals                        # effective nuclear charge (float)
+        self.df['Z_eff_sq'] = self.df['Z_eff'] ** 2         # Z_eff² — dominant energy scale
+
+        # ----------------------------------------------------------------
+        # Feature 4: Spin-orbit energy estimate (iron-group analogue of rydberg_pred)
+        # Within a multiplet, spin-orbit splitting follows the Landé interval rule:
+        #   E_so = (ζ / 2) * lande_so_term
+        # where ζ₃d is the single-electron spin-orbit coupling constant (cm⁻¹).
+        # The MLP learns the residual: corrections from configuration interaction, etc.
+        # Requires lande_so_term from Feature 1.
+        # ----------------------------------------------------------------
+        SPIN_ORBIT_CONSTANTS = {   # tabulated ζ₃d values (cm⁻¹) from atomic physics literature
+            'Sc': 55.0,
+            'Fe': 410.0,
+            'Co': 515.0,
+            'Ni': 630.0,
+        }
+
+        # Look up ζ₃d per element; unknown elements get 0.0 (no spin-orbit correction)
+        self.df['zeta_3d'] = self.df['Element'].map(
+            lambda e: SPIN_ORBIT_CONSTANTS.get(e, 0.0)
+        )
+        # Physics-based spin-orbit energy estimate (cm⁻¹); MLP corrects the residual
+        self.df['E_so_estimate'] = (self.df['zeta_3d'] / 2) * self.df['lande_so_term']
+
+        # ----------------------------------------------------------------
+        # Feature 5: Parity flag computed from orbital occupancy
+        # Parity = (Σ nᵢ × ℓᵢ) mod 2, where ℓ is the subshell angular momentum:
+        #   s=0, p=1, d=2, f=3, g=4, h=5
+        # Computed independently from NIST 'parity' column as a clean 0/1 feature.
+        # 0 = even parity, 1 = odd parity.
+        # ----------------------------------------------------------------
+        SUBSHELL_L = {'s': 0, 'p': 1, 'd': 2, 'f': 3, 'g': 4, 'h': 5}
+        orbital_pattern = re.compile(r'^(\d+)([spdfgh])$')
+        # Only iterate over orbital columns that actually exist in the DataFrame
+        orbital_cols_present = [col for col in self.df.columns if orbital_pattern.match(col)]
+
+        parity_vals = []
+        for idx, row in self.df.iterrows():
+            total_l = 0
+            for col in orbital_cols_present:
+                match = orbital_pattern.match(col)
+                l = SUBSHELL_L[match.group(2)]      # angular momentum ℓ for this subshell
+                # NaN occupancy → 0 (orbital absent for this element in multi-element data)
+                n_electrons = row[col] if not pd.isna(row[col]) else 0
+                total_l += int(n_electrons) * l
+            parity_vals.append(total_l % 2)         # 0 = even, 1 = odd
+
+        self.df['parity_computed'] = parity_vals    # 0/1 binary parity flag from orbital structure
+
+        # ----------------------------------------------------------------
+        # Summary: report all added columns with value ranges
+        # ----------------------------------------------------------------
+        new_cols = [
+            'J_sq', 'L_sq', 'S_sq', 'lande_so_term',
+            'n_3d', 'd_holes', 'd_from_half', 'is_half_filled',
+            'Z_eff', 'Z_eff_sq',
+            'zeta_3d', 'E_so_estimate',
+            'parity_computed',
+        ]
+        print(f"\n  Added {len(new_cols)} transition metal features:")
+        for col in new_cols:
+            if col in self.df.columns:
+                col_data = self.df[col].dropna()
+                print(f"    {col:20s}: min={col_data.min():.3f}, "
+                      f"max={col_data.max():.3f}, mean={col_data.mean():.3f}")
 
     def _add_rydberg_features(self):
         """
