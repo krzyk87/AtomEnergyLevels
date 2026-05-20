@@ -10,14 +10,19 @@ Output: data/{Element}_features.csv
 The script:
   1. Reads the NIST Excel-exported CSV (special quoting format)
   2. Parses electron configurations into per-orbital occupancy columns
-  3. Derives quantum numbers J, S_qn, L_qn, parity from the Term symbol
+     (intermediate coupling terms in parentheses, e.g. '(3F)', are ignored)
+  3. Derives quantum numbers J, S_qn, L_qn, parity from the Term symbol,
+     and the spectroscopic label prefix (term_label) for multiplet atoms
   4. Adds atomic constants Z, A, proton_number, neutron_number
   5. Filters out rows with approximated energies (marked with square brackets)
-  6. Saves the resulting feature CSV
+  6. Parses Lande g-factor (lande_g) and leading LS-coupling percentage
+     (leading_pct) for multiplet atoms (e.g. Co, Fe, Ni)
+  7. Saves the resulting feature CSV
 
 Usage:
     python preprocess/preprocess_nist.py --element K
     python preprocess/preprocess_nist.py --element Na
+    python preprocess/preprocess_nist.py --element Co
     python preprocess/preprocess_nist.py --element all
 """
 
@@ -40,6 +45,12 @@ ELEMENTS = {
     'Rb': {'Z': 37,  'A': 85},
     'Cs': {'Z': 55,  'A': 133},
     'Fr': {'Z': 87,  'A': 223},
+    'Sc': {'Z': 21,  'A': 45},
+    'Fe': {'Z': 26,  'A': 56},
+    'Co': {'Z': 27,  'A': 59},
+    'Ni': {'Z': 28,  'A': 59},
+    'Cu': {'Z': 29,  'A': 64},
+    'Zn': {'Z': 30,  'A': 65},
 }
 
 # Aufbau filling order: (orbital_name, max_electrons)
@@ -216,21 +227,37 @@ def collect_orbital_columns(configs: list, Z: int) -> list:
 
 def parse_term(term_str: str) -> tuple:
     """
-    Parse a spectroscopic term symbol into (S_qn, L_qn, parity).
+    Parse a spectroscopic term symbol into (S_qn, L_qn, parity, term_label).
+
+    Handles both plain alkaline-style terms and multiplet-atom terms that carry
+    a single-letter spectroscopic label prefix (e.g. 'a 4F', 'z 6F*', 'b 2G').
 
     Examples:
-        '2S'      → (0.5, 0, 0)     even parity, S state
-        '2P*'     → (0.5, 1, 1)     odd parity (asterisk), P state
-        '3F*'     → (1.0, 3, 1)
-        '2[3/2]*' → (0.5, None, 1)  bracket notation: L not well defined
-        ''        → (None, None, 0)
+        '2S'      → (0.5, 0, 0, '')    even parity, no label
+        '2P*'     → (0.5, 1, 1, '')    odd parity (asterisk), P state
+        '3F*'     → (1.0, 3, 1, '')
+        'a 4F'    → (1.5, 3, 0, 'a')   multiplet label prefix
+        'z 6F*'   → (2.5, 3, 1, 'z')
+        '2[3/2]*' → (0.5, None, 1, '') bracket notation: L not well defined
+        ''        → (None, None, 0, '')
 
     Returns:
-        (S_qn, L_qn, parity) where parity=0 is even, parity=1 is odd.
-        L_qn is None for bracket-notation terms.
+        (S_qn, L_qn, parity, term_label)
+        parity: 0=even, 1=odd.
+        L_qn: None for bracket-notation terms.
+        term_label: single-letter spectroscopic prefix, or '' if absent.
     """
     if not term_str:
-        return (None, None, 0)
+        return (None, None, 0, '')
+
+    # Strip spectroscopic label prefix: single lowercase letter + whitespace,
+    # e.g. 'a 4F' → label='a', remainder='4F'
+    m_label = re.match(r'^([a-z])\s+', term_str)
+    if m_label:
+        term_label = m_label.group(1)
+        term_str = term_str[m_label.end():]
+    else:
+        term_label = ''
 
     parity = 1 if '*' in term_str else 0
     clean = term_str.replace('*', '').strip()
@@ -239,16 +266,16 @@ def parse_term(term_str: str) -> tuple:
     if '[' in clean:
         m = re.match(r'^(\d+)\[', clean)
         S_qn = (int(m.group(1)) - 1) / 2 if m else None
-        return (S_qn, None, parity)
+        return (S_qn, None, parity, term_label)
 
     # Standard: <multiplicity><L-letter>
     m = re.match(r'^(\d+)([A-Z])', clean)
     if m:
         S_qn = (int(m.group(1)) - 1) / 2
         L_qn = TERM_L_MAP.get(m.group(2), None)
-        return (S_qn, L_qn, parity)
+        return (S_qn, L_qn, parity, term_label)
 
-    return (None, None, parity)
+    return (None, None, parity, term_label)
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +299,39 @@ def parse_j(j_str: str):
         return float(j_str)
     except (ValueError, ZeroDivisionError):
         return None
+
+
+def parse_lande_g(s: str):
+    """
+    Parse a Lande g-factor string to float.
+
+    Returns None if the string is empty or cannot be converted.
+    """
+    s = s.strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def parse_leading_pct(s: str):
+    """
+    Extract the dominant LS-coupling percentage from a NIST 'Leading percentages' field.
+
+    The field format is:
+        '  84             :    16  3d8.(1D).4s            2D   '
+    where the first integer is the percentage of the dominant component and
+    subsequent ':'-separated entries list secondary components.
+
+    Returns the dominant percentage as int, or None if the field is blank.
+    """
+    s = s.strip()
+    if not s:
+        return None
+    m = re.match(r'(\d+)', s)
+    return int(m.group(1)) if m else None
 
 
 # ---------------------------------------------------------------------------
@@ -328,18 +388,22 @@ def preprocess_element(element: str, data_dir: str = 'data') -> pd.DataFrame:
 
     multi_j_rows = 0
 
-    for _, row in df.iterrows():
-        config      = str(row.get('Configuration', '')).strip()
-        term        = str(row.get('Term', '')).strip()
-        j_str       = str(row.get('J', '')).strip()
-        prefix      = str(row.get('Prefix', '')).strip()
-        suffix      = str(row.get('Suffix', '')).strip()
-        level_str   = str(row.get('Level (cm-1)', '')).strip()
-        unc_str     = str(row.get('Uncertainty (cm-1)', '')).strip()
-        lande       = str(row.get('Lande', '')).strip() if 'Lande' in df.columns else ''
-        reference   = str(row.get('Reference', '')).strip()
+    has_lande       = 'Lande' in df.columns
+    has_leading_pct = 'Leading percentages' in df.columns
 
-        S_qn, L_qn, parity = parse_term(term)
+    for _, row in df.iterrows():
+        config           = str(row.get('Configuration', '')).strip()
+        term             = str(row.get('Term', '')).strip()
+        j_str            = str(row.get('J', '')).strip()
+        prefix           = str(row.get('Prefix', '')).strip()
+        suffix           = str(row.get('Suffix', '')).strip()
+        level_str        = str(row.get('Level (cm-1)', '')).strip()
+        unc_str          = str(row.get('Uncertainty (cm-1)', '')).strip()
+        lande            = str(row.get('Lande', '')).strip() if has_lande else ''
+        leading_pct_str  = str(row.get('Leading percentages', '')).strip() if has_leading_pct else ''
+        reference        = str(row.get('Reference', '')).strip()
+
+        S_qn, L_qn, parity, term_label = parse_term(term)
 
         try:
             occupancies = fill_orbital_occupancies(config, Z)
@@ -367,9 +431,12 @@ def preprocess_element(element: str, data_dir: str = 'data') -> pd.DataFrame:
             out_row = {
                 'Configuration':    config,
                 'Term':             term,
+                'term_label':       term_label,
                 'Prefix':           prefix,
                 'Suffix':           suffix,
                 'Lande':            lande,
+                'lande_g':          parse_lande_g(lande),
+                'leading_pct':      parse_leading_pct(leading_pct_str),
                 'Reference':        reference,
                 'Z':                Z,
                 'A':                A,
