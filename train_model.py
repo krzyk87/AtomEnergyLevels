@@ -24,9 +24,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
+import pandas as pd
 from typing import Tuple, Optional
 import time
 import os
+import json
 
 from AtomicDataset import AtomicDataset
 from AtomicModel import create_model
@@ -393,6 +395,83 @@ def train_model(config, model, train_loader, val_loader, device, val_dataset):
     return best_model_path, best_train_metrics, best_val_metrics
 
 
+def save_dataset_to_xlsx(train_dataset, config, output_path: str = None) -> str:
+    """
+    Save the prepared dataset with all derived features to an xlsx file for inspection.
+
+    Exports the full dataframe including engineered features, with a 'split' column
+    indicating train/val/test membership for each row. Includes a second sheet
+    with per-feature statistics.
+
+    Args:
+        train_dataset: AtomicDataset (train subset) — provides df, feature_columns, target_column
+        config: Configuration object
+        output_path: Path for the xlsx file. Defaults to data/<elements>_dataset_inspection.xlsx
+
+    Returns:
+        Path to the saved xlsx file
+    """
+    df = train_dataset.df.copy()
+
+    # Attach split labels from the saved split-index file
+    split_file = train_dataset._get_split_file_path()
+    if os.path.exists(split_file):
+        with open(split_file, 'r') as f:
+            splits = json.load(f)
+        split_map = (
+            {idx: 'train' for idx in splits.get('train', [])} |
+            {idx: 'val'   for idx in splits.get('val',   [])} |
+            {idx: 'test'  for idx in splits.get('test',  [])}
+        )
+        df['split'] = df.index.map(split_map).fillna('unknown')
+    else:
+        df['split'] = 'unknown'
+
+    # Determine output path
+    if output_path is None:
+        if hasattr(config.dataset, 'elements') and config.dataset.elements:
+            elements_str = '_'.join(sorted(config.dataset.elements))
+        else:
+            elements_str = df['Element'].iloc[0] if 'Element' in df.columns else 'dataset'
+        data_dir = config.dataset.get('data_dir', 'data')
+        output_path = os.path.join(data_dir, f"{elements_str}_dataset_inspection.xlsx")
+
+    # Column order: bookkeeping first, then model features, then everything else
+    priority = ['split', 'Element', train_dataset.target_column]
+    feature_cols = train_dataset.feature_columns
+    other_cols = [c for c in df.columns if c not in priority and c not in feature_cols]
+    ordered = (
+        [c for c in priority if c in df.columns] +
+        [c for c in feature_cols if c in df.columns] +
+        [c for c in other_cols if c in df.columns]
+    )
+    df = df[ordered]
+
+    # Feature statistics for the summary sheet
+    feature_summary = pd.DataFrame({
+        'Feature': feature_cols,
+        'Min':       [df[f].min()   if f in df.columns else None for f in feature_cols],
+        'Max':       [df[f].max()   if f in df.columns else None for f in feature_cols],
+        'Mean':      [df[f].mean()  if f in df.columns else None for f in feature_cols],
+        'Std':       [df[f].std()   if f in df.columns else None for f in feature_cols],
+        'NaN_count': [df[f].isna().sum() if f in df.columns else None for f in feature_cols],
+    })
+
+    try:
+        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Dataset', index=True)
+            feature_summary.to_excel(writer, sheet_name='Feature Summary', index=False)
+    except ImportError:
+        print("  ⚠ openpyxl not installed — falling back to CSV")
+        output_path = output_path.replace('.xlsx', '.csv')
+        df.to_csv(output_path, index=True)
+
+    print(f"\n  ✓ Dataset saved to: {output_path}")
+    print(f"    {len(df)} rows × {len(df.columns)} columns | "
+          f"{len(feature_cols)} model features")
+    return output_path
+
+
 def _extract_element_from_filename(filepath: str) -> str:
     """
     Extract element symbol from filename.
@@ -465,7 +544,9 @@ def train_one_run(config):
     # Check target range
     print(f"\nTarget ({train_dataset.target_column}):")
     print(f"  min={train_dataset.y.min():.2f}, max={train_dataset.y.max():.2f}, mean={train_dataset.y.mean():.2f}")
-    
+
+    save_dataset_to_xlsx(train_dataset, config)
+
     # For val/test, use the same scalers fitted on training data
     val_dataset = AtomicDataset(
         config, 
