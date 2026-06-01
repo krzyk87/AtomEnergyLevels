@@ -245,9 +245,23 @@ class AtomicDataset(Dataset):
         1. Single element: config.dataset.data_file
         2. Multiple elements: config.dataset.elements (list)
 
+        CSV format:
+            By default assumes comma-separated values with dot decimal (standard CSV).
+            Co_features.csv uses semicolon separators and comma decimals (European locale).
+            Override with config keys:
+                data_separator: ';'   # default ','
+                data_decimal:   ','   # default '.'
+            NOTE: the same separator/decimal is applied to ALL element files in a run.
+            Do not mix Co (sep=';') with Na/K/Rb/Cs (sep=',') in a single multi-element
+            training run without first converting all CSVs to a common format.
+
         Returns:
             Combined DataFrame with all data
         """
+        # Read CSV format settings from config (defaults: standard comma/dot)
+        sep = self.config.dataset.get('data_separator', ',')
+        decimal = self.config.dataset.get('data_decimal', '.')
+
         # Mode 1: Multiple elements
         if hasattr(self.config.dataset, 'elements') and self.config.dataset.elements:
             elements = self.config.dataset.elements
@@ -255,6 +269,7 @@ class AtomicDataset(Dataset):
 
             print(f"\nLoading multiple elements: {elements}")
             print(f"Data directory: {data_dir}")
+            print(f"CSV format: sep='{sep}', decimal='{decimal}'")
 
             all_dfs = []
 
@@ -268,7 +283,7 @@ class AtomicDataset(Dataset):
                     )
 
                 print(f"  Loading {element}: {data_file}")
-                df = pd.read_csv(data_file)
+                df = pd.read_csv(data_file, sep=sep, decimal=decimal)
 
                 # Add element identifier
                 df['Element'] = element
@@ -287,7 +302,8 @@ class AtomicDataset(Dataset):
         elif hasattr(self.config.dataset, 'data_file') and self.config.dataset.data_file:
             data_file = self.config.dataset.data_file
             print(f"\nLoading single element from: {data_file}")
-            df = pd.read_csv(data_file)
+            print(f"CSV format: sep='{sep}', decimal='{decimal}'")
+            df = pd.read_csv(data_file, sep=sep, decimal=decimal)
 
             # Add element column if not present
             if 'Element' not in df.columns:
@@ -657,7 +673,7 @@ class AtomicDataset(Dataset):
 
         if self.config.dataset.get('add_transition_metal_features', False):
             tm_cols = [
-                'J_sq', 'L_sq', 'S_sq', 'lande_so_term',
+                'J_sq', 'L_sq', 'S_sq', 'lande_so_term', 'term_known',
                 'n_3d', 'd_holes', 'd_from_half', 'is_half_filled',
                 'Z_eff', 'Z_eff_sq',
                 'zeta_3d', 'E_so_estimate',
@@ -760,6 +776,117 @@ class AtomicDataset(Dataset):
         if self.config.dataset.get('add_transition_metal_features', False):
             self._add_transition_metal_features()
 
+    def _impute_SL_from_lande_g(self):
+        """
+        Attempt to recover S and L quantum numbers from the measured Landé g-factor.
+
+        Physics background:
+            In LS (Russell-Saunders) coupling the Landé g-factor formula is:
+                g_J = 1 + [J(J+1) + S(S+1) - L(L+1)] / [2·J(J+1)]
+
+            Rearranging to isolate L(L+1) - S(S+1):
+                L(L+1) - S(S+1) = J(J+1) · [1 - 2·(g_J - 1)]
+
+            For a given (J, g_J) pair we enumerate all physically allowed (S, L)
+            combinations and keep the unique solution that satisfies the equation
+            within numerical tolerance.
+
+        Caveats:
+            This approximation is valid only when LS coupling is a good description.
+            Strongly mixed states (low `leading_pct` in NIST data) often produce
+            g-factors that deviate from the LS prediction; no match will be found.
+            Term_known remains 0 even for rows where imputation succeeds — the
+            imputed quantum numbers are not NIST-confirmed.
+
+        New columns:
+            S_qn_imputed     — imputed S value (NaN if unresolvable or g unknown)
+            L_qn_imputed     — imputed L value (NaN if unresolvable or g unknown)
+            imputation_unique — True if exactly one (S, L) pair matched
+
+        Only populates rows where the original S_qn is NaN.
+        Does NOT overwrite S_qn or L_qn.
+        """
+        print("\n  Running Landé g-factor imputation for unknown-term rows...")
+
+        # Rows missing NIST term assignment (Term = '*', '4*', etc.)
+        unknown_mask = self.df['S_qn'].isna()
+        n_unknown = unknown_mask.sum()
+
+        if n_unknown == 0:
+            print("  ℹ No unknown-term rows found — imputation skipped.")
+            self.df['S_qn_imputed'] = np.nan
+            self.df['L_qn_imputed'] = np.nan
+            self.df['imputation_unique'] = False
+            return
+
+        print(f"  Unknown-term rows: {n_unknown} / {len(self.df)} "
+              f"({100 * n_unknown / len(self.df):.1f}%)")
+
+        # Quantum number candidates observed in Co I NIST data
+        S_CANDIDATES = [0.5, 1.5, 2.5]        # total spin values (2S+1 = 2, 4, 6)
+        L_CANDIDATES = [0, 1, 2, 3, 4, 5]     # S, P, D, F, G, H orbital momenta
+        TOLERANCE = 0.15                        # |computed - target| must be < this
+
+        # Initialise result Series aligned with the full DataFrame index
+        s_imputed = pd.Series(np.nan, index=self.df.index, dtype=float)
+        l_imputed = pd.Series(np.nan, index=self.df.index, dtype=float)
+        imputation_unique = pd.Series(False, index=self.df.index, dtype=bool)
+
+        n_resolved = 0   # rows with exactly one matching (S, L) pair
+        n_no_g = 0       # rows where lande_g is missing
+
+        for idx, row in self.df.iterrows():
+            if not unknown_mask.loc[idx]:
+                continue   # skip rows that already have NIST S_qn
+
+            # lande_g may be absent (column missing) or NaN (value missing)
+            if 'lande_g' not in self.df.columns or pd.isna(row['lande_g']):
+                n_no_g += 1
+                continue
+
+            g_J = float(row['lande_g'])
+            J = float(row['J'])
+
+            # J=0 makes J(J+1)=0; g-factor formula undefined — skip
+            if J <= 0:
+                continue
+
+            J_sq = J * (J + 1)
+
+            # Target value from the Landé formula rearrangement
+            # L(L+1) - S(S+1) = J(J+1) · [1 - 2·(g_J - 1)]
+            target = J_sq * (1.0 - 2.0 * (g_J - 1.0))
+
+            matches = []
+            for S in S_CANDIDATES:
+                for L in L_CANDIDATES:
+                    # Triangle selection rule: |L - S| ≤ J ≤ L + S
+                    if not (abs(L - S) <= J <= L + S):
+                        continue
+
+                    computed = L * (L + 1) - S * (S + 1)   # L(L+1) - S(S+1)
+
+                    if abs(computed - target) <= TOLERANCE:
+                        matches.append((S, L))
+
+            if len(matches) == 1:
+                # Unique solution: store imputed values
+                s_imputed.loc[idx] = matches[0][0]
+                l_imputed.loc[idx] = matches[0][1]
+                imputation_unique.loc[idx] = True
+                n_resolved += 1
+            # 0 or ≥2 matches → leave NaN (ambiguous or no valid LS-coupling solution)
+
+        self.df['S_qn_imputed'] = s_imputed
+        self.df['L_qn_imputed'] = l_imputed
+        self.df['imputation_unique'] = imputation_unique
+
+        n_ambiguous = n_unknown - n_resolved - n_no_g
+        print(f"  Imputation results for {n_unknown} unknown-term rows:")
+        print(f"    Uniquely resolved : {n_resolved}")
+        print(f"    Ambiguous / no LS solution: {n_ambiguous}")
+        print(f"    No g-factor available      : {n_no_g}")
+
     def _add_transition_metal_features(self):
         """
         Add physics-based features for iron-group transition metal atoms (Fe, Co, Ni, Sc).
@@ -773,9 +900,19 @@ class AtomicDataset(Dataset):
           3. Effective nuclear charge (Slater's rules): determines the energy scale
              as Z_eff² analogous to hydrogen's Z²/n² structure
 
+        Unknown-term handling (Co data):
+            ~50 Co levels have Term='*' / '4*' / '13*' with no NIST S_qn / L_qn.
+            For these rows lande_so_term and E_so_estimate are set to 0.0 (neutral
+            prior: no spin-orbit correction applied).  A `term_known` flag lets the
+            MLP distinguish these rows from fully classified levels.
+            Optionally, S and L can be recovered from the Landé g-factor via
+            _impute_SL_from_lande_g() (set config.dataset.impute_unknown_terms=True).
+
         Features are computed in the following order (ordering matters — Feature 4
         depends on lande_so_term produced by Feature 1):
-          1. Angular momentum coupling products: J_sq, L_sq, S_sq, lande_so_term
+          0. Optional g-factor imputation (if impute_unknown_terms=True)
+          1. Angular momentum coupling products: J_sq, L_sq, S_sq, lande_so_term,
+                                                 term_known
           2. d-shell occupancy:                 n_3d, d_holes, d_from_half, is_half_filled
           3. Effective nuclear charge:           Z_eff, Z_eff_sq
           4. Spin-orbit energy estimate:         zeta_3d, E_so_estimate
@@ -784,16 +921,57 @@ class AtomicDataset(Dataset):
         print("\nAdding transition metal physics features...")
 
         # ----------------------------------------------------------------
+        # Step 0 (optional): impute S, L from Landé g-factor for unclassified rows.
+        # Must run BEFORE Feature 1 so that imputed values are available when
+        # computing lande_so_term.
+        # ----------------------------------------------------------------
+        if self.config.dataset.get('impute_unknown_terms', False):
+            self._impute_SL_from_lande_g()
+
+        # ----------------------------------------------------------------
         # Feature 1: Angular momentum coupling products (Landé interval rule)
         # The MLP needs J(J+1), L(L+1), S(S+1) as explicit features because
         # the spin-orbit energy is LINEAR in these products, not in J/L/S alone.
-        # lande_so_term = J(J+1) - L(L+1) - S(S+1)  ∝ spin-orbit energy shift
+        #
+        # Unknown-term rows (Co '*' levels):
+        #   S_qn and L_qn are NaN → L_sq and S_sq are NaN.
+        #   With imputation enabled, use imputed S/L for lande_so_term if available.
+        #   Without imputed values, fall back to 0.0 (neutral: no spin-orbit shift).
         # ----------------------------------------------------------------
-        self.df['J_sq'] = self.df['J'] * (self.df['J'] + 1)            # J(J+1)
-        self.df['L_sq'] = self.df['L_qn'] * (self.df['L_qn'] + 1)      # L(L+1)
-        self.df['S_sq'] = self.df['S_qn'] * (self.df['S_qn'] + 1)      # S(S+1)
-        # Landé spin-orbit term: proportional to the spin-orbit energy within a multiplet
-        self.df['lande_so_term'] = self.df['J_sq'] - self.df['L_sq'] - self.df['S_sq']
+        # Determine effective S and L for lande_so_term:
+        # prefer original NIST value; fill with imputed where available and requested
+        use_imputed = (
+            self.config.dataset.get('impute_unknown_terms', False)
+            and 'S_qn_imputed' in self.df.columns
+        )
+        if use_imputed:
+            # fillna: original NaN rows get imputed value; known rows unchanged
+            S_eff = self.df['S_qn'].fillna(self.df['S_qn_imputed'])
+            L_eff = self.df['L_qn'].fillna(self.df['L_qn_imputed'])
+        else:
+            S_eff = self.df['S_qn']
+            L_eff = self.df['L_qn']
+
+        self.df['J_sq'] = self.df['J'] * (self.df['J'] + 1)   # J(J+1) — always computable
+        self.df['L_sq'] = L_eff * (L_eff + 1)                  # L(L+1) — NaN if L unknown
+        self.df['S_sq'] = S_eff * (S_eff + 1)                  # S(S+1) — NaN if S unknown
+
+        # term_known: 1 if NIST assigned S_qn (confirmed LS term); 0 for '*' rows.
+        # Imputed rows keep term_known=0 — the assignment is not NIST-confirmed.
+        self.df['term_known'] = self.df['S_qn'].notna().astype(int)
+
+        # lande_so_term: 0.0 for unresolved rows (NaN S or L → fillna → neutral prior)
+        lande_raw = self.df['J_sq'] - self.df['L_sq'] - self.df['S_sq']
+        self.df['lande_so_term'] = lande_raw.fillna(0.0)   # ∝ spin-orbit energy shift
+
+        # Report unknown-term statistics
+        n_unknown = (self.df['term_known'] == 0).sum()
+        n_total = len(self.df)
+        print(f"  term_known: {n_total - n_unknown} known, {n_unknown} unknown "
+              f"({100 * n_unknown / n_total:.1f}% of dataset — lande_so_term set to 0.0)")
+        if use_imputed:
+            n_imputed_ok = (self.df['S_qn'].isna() & self.df['S_qn_imputed'].notna()).sum()
+            print(f"  Of {n_unknown} unknown: {n_imputed_ok} have imputed S/L from g-factor")
 
         # ----------------------------------------------------------------
         # Feature 2: d-electron count and half-shell features (Hund's rules)
@@ -859,6 +1037,9 @@ class AtomicDataset(Dataset):
         # where ζ₃d is the single-electron spin-orbit coupling constant (cm⁻¹).
         # The MLP learns the residual: corrections from configuration interaction, etc.
         # Requires lande_so_term from Feature 1.
+        #
+        # Unknown-term rows automatically get E_so_estimate = 0.0 because
+        # lande_so_term was already set to 0.0 in Feature 1 for those rows.
         # ----------------------------------------------------------------
         SPIN_ORBIT_CONSTANTS = {   # tabulated ζ₃d values (cm⁻¹) from atomic physics literature
             'Sc': 55.0,
@@ -903,7 +1084,7 @@ class AtomicDataset(Dataset):
         # Summary: report all added columns with value ranges
         # ----------------------------------------------------------------
         new_cols = [
-            'J_sq', 'L_sq', 'S_sq', 'lande_so_term',
+            'J_sq', 'L_sq', 'S_sq', 'lande_so_term', 'term_known',
             'n_3d', 'd_holes', 'd_from_half', 'is_half_filled',
             'Z_eff', 'Z_eff_sq',
             'zeta_3d', 'E_so_estimate',

@@ -21,7 +21,7 @@ model:
 
 dataset:
   # Simple: just list elements
-  elements: ['Li','Na','K','Rb','Cs','Fr']  # Or ['Na', 'K', 'Rb', 'Co', 'Ni']  # 'Na', 'Li','Rb','Cs','Fr'
+  elements: ['Co']  # Or ['Na', 'K', 'Rb', 'Co', 'Ni']  #  'Li','Na','K','Rb','Cs','Fr'
 
   # Data directory structure (assumes standard naming)
   data_dir: "data"
@@ -35,7 +35,7 @@ dataset:
 
   # Encoding strategy
   encode_valence_electrons: true  # Use explicit electron encoding (true) OR use full orbital occupancy (false)
-  max_valence_electrons: 1       # Maximum valence electrons to encode
+  max_valence_electrons: 9       # Maximum valence electrons to encode
 
   # Manually specify additional features (optional)
   force_include_features: ['J', ]  # Always include these
@@ -60,9 +60,16 @@ dataset:
   use_log_target: false
   
   # Feature engineering: whether to add derived features
-  add_derived_features: false    # Add total_electrons, valence_electrons, core_electrons, unpaired_electrons, max_principal_n
-  add_transition_metal_features: false   # Set to true for Fe, Co, Ni, Sc training
-  use_rydberg_features: true    # Add n_star and rydberg_pred as input features
+  add_derived_features: true    # Add total_electrons, valence_electrons, core_electrons, unpaired_electrons, max_principal_n
+  add_transition_metal_features: true   # Set to true for Fe, Co, Ni, Sc training
+  impute_unknown_terms: false   # Set true to use Lande g-factor to recover S, L for unclassified Co levels
+  use_rydberg_features: false    # Add n_star and rydberg_pred as input features
+
+  # CSV format (default: standard comma-separated, dot decimal)
+  # Co_features.csv uses European locale: set data_separator=';' and data_decimal=','
+  # NOTE: all element files in a run must share the same format
+  data_separator: ';'           # Field separator: ',' (standard) or ';' (Co data)
+  data_decimal: ','             # Decimal character: '.' (standard) or ',' (Co data)
   
   # Data normalization
   normalize_features: true      # Standardize features (zero mean, unit variance)
