@@ -11,13 +11,18 @@ The script:
   1. Reads the NIST Excel-exported CSV (special quoting format)
   2. Parses electron configurations into per-orbital occupancy columns
      (intermediate coupling terms in parentheses, e.g. '(3F)', are ignored)
-  3. Derives quantum numbers J, S_qn, L_qn, parity from the Term symbol,
-     and the spectroscopic label prefix (term_label) for multiplet atoms
+  3. Derives quantum numbers J, S_qn, L_qn, parity from the Term symbol;
+     strips the spectroscopic label prefix into a separate term_label column
+     so Term contains only the canonical symbol (e.g. '4F', '6F*')
   4. Adds atomic constants Z, A, proton_number, neutron_number
-  5. Filters out rows with approximated energies (marked with square brackets)
+  5. Filters out rows with approximated energies (Prefix='[') or questionable
+     level designations (Suffix='?')
   6. Parses Lande g-factor (lande_g) and leading LS-coupling percentage
      (leading_pct) for multiplet atoms (e.g. Co, Fe, Ni)
-  7. Saves the resulting feature CSV
+  7. Forward-fills Configuration across terms that share the same config, and
+     Uncertainty (cm-1) across J-levels of the same term group
+     (NIST omits repeated values within each group)
+  8. Saves the resulting feature CSV
 
 Usage:
     python preprocess/preprocess_nist.py --element K
@@ -362,14 +367,23 @@ def preprocess_element(element: str, data_dir: str = 'data') -> pd.DataFrame:
     df = read_nist_csv(nist_path)
     print(f"  Raw rows read: {len(df)}")
 
-    # Step 2 — filter out approximated energies (Prefix = '[')
+    # Step 2 — filter out uncertain / approximated energy levels:
+    #   Prefix = '['  → energy value given in square brackets (approximate)
+    #   Suffix = '?'  → level designation is uncertain / questionable
+    uncertain = pd.Series(False, index=df.index)
     if 'Prefix' in df.columns:
-        bracketed = df['Prefix'].str.strip() == '['
-        n_removed = int(bracketed.sum())
-        df = df[~bracketed].reset_index(drop=True)
-        print(f"  Removed {n_removed} approximated rows (Prefix='[')")
+        uncertain |= df['Prefix'].str.strip() == '['
     else:
         print("  Warning: 'Prefix' column not found — skipping bracket filter")
+    if 'Suffix' in df.columns:
+        uncertain |= df['Suffix'].str.strip() == '?'
+    else:
+        print("  Warning: 'Suffix' column not found — skipping '?' filter")
+    n_removed = int(uncertain.sum())
+    if n_removed:
+        df = df[~uncertain].reset_index(drop=True)
+        print(f"  Removed {n_removed} uncertain/approximated rows "
+              f"(Prefix='[' or Suffix='?')")
 
     print(f"  Rows after filtering: {len(df)}")
 
@@ -391,8 +405,18 @@ def preprocess_element(element: str, data_dir: str = 'data') -> pd.DataFrame:
     has_lande       = 'Lande' in df.columns
     has_leading_pct = 'Leading percentages' in df.columns
 
+    # Carry-forward values — NIST omits repeated values within a group:
+    #   Configuration: blank for all terms beyond the first that share a config.
+    #   Uncertainty:   blank for all J-levels beyond the first in a term group.
+    last_config  = ''
+    last_unc_val = None
+
     for _, row in df.iterrows():
         config           = str(row.get('Configuration', '')).strip()
+        if config:
+            last_config = config
+        else:
+            config = last_config
         term             = str(row.get('Term', '')).strip()
         j_str            = str(row.get('J', '')).strip()
         prefix           = str(row.get('Prefix', '')).strip()
@@ -402,6 +426,13 @@ def preprocess_element(element: str, data_dir: str = 'data') -> pd.DataFrame:
         lande            = str(row.get('Lande', '')).strip() if has_lande else ''
         leading_pct_str  = str(row.get('Leading percentages', '')).strip() if has_leading_pct else ''
         reference        = str(row.get('Reference', '')).strip()
+
+        # Strip spectroscopic label prefix from Term for the output column
+        # (e.g. 'a 4F' → term_clean='4F', term_label='a').
+        # parse_term() does the same stripping internally; we replicate it here
+        # so the saved 'Term' column contains only the canonical term symbol.
+        m_label = re.match(r'^([a-z])\s+', term)
+        term_clean = term[m_label.end():] if m_label else term
 
         S_qn, L_qn, parity, term_label = parse_term(term)
 
@@ -417,10 +448,13 @@ def preprocess_element(element: str, data_dir: str = 'data') -> pd.DataFrame:
         except ValueError:
             level_val = None
 
+        # Forward-fill uncertainty: use the last known value when the field is
+        # blank (NIST omits it for every J-level after the first in a group).
         try:
             unc_val = float(unc_str)
+            last_unc_val = unc_val          # update carry-forward
         except ValueError:
-            unc_val = None
+            unc_val = last_unc_val          # propagate last known value
 
         # Split multi-valued J fields (e.g. '7/2,9/2') into separate rows.
         j_parts = [v.strip() for v in j_str.split(',')]
@@ -430,7 +464,7 @@ def preprocess_element(element: str, data_dir: str = 'data') -> pd.DataFrame:
         for j_part in j_parts:
             out_row = {
                 'Configuration':    config,
-                'Term':             term,
+                'Term':             term_clean,
                 'term_label':       term_label,
                 'Prefix':           prefix,
                 'Suffix':           suffix,
