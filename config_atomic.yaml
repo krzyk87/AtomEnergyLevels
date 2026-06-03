@@ -1,3 +1,17 @@
+# Standalone feature-engineering step (preprocess_atomic.py).
+# Reads a raw Kurucz/Cowan level file and writes a rich feature XLSX containing
+# ALL computed features. AtomicDataset.py is intended to later just load this
+# file and select columns by name instead of recomputing features on-the-fly.
+preprocessing:
+  input_file: "data/kurucz/Co_kurucz_raw.xlsx"  # raw level file (xlsx or csv)
+  output_file: "data/Co_features_rich.xlsx"     # rich feature workbook to write
+  element: "Co"
+  Z: 27
+  A: 59
+  ionization_energy: 63564.0  # Co I ionization energy in cm⁻¹
+  max_valence: 9              # max valence electrons encoded as (n, l) slots
+  zeta_3d: 515.0             # Co I 3d spin-orbit coupling constant (cm⁻¹)
+
 general:
   epochs: 30000                   # Number of training epochs
   optimizer: Adam               # Optimizer: Adam / SGD / RMSprop
@@ -107,7 +121,7 @@ training:
 
   # Multi-task learning: predict energy AND experimental Landé g-factor simultaneously
   multitask_gj: false          # Enable multi-task learning (energy + gJ outputs)
-  multitask_alpha: 0.9         # Weight for energy loss; (1 - alpha) goes to gJ loss
+  multitask_alpha: 0.98         # Weight for energy loss; (1 - alpha) goes to gJ loss
   gj_criterion: MSE            # Loss function for the gJ head: MSE / MAE / Huber
   lr_scheduler: None  # LR scheduler: ReduceLROnPlateau / StepLR / None
   lr_scheduler_params:
