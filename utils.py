@@ -162,12 +162,25 @@ def create_loss_function(criterion_name: str, reduction: str = 'none'):
 
 
 def _get_elements_str(config) -> str:
-    """Return a string identifying the element(s) in the config."""
+    """Return a string identifying the element(s) and dataset source.
+
+    For the default NIST source the string is just the element name(s), e.g.
+    'Co'.  For any other source a suffix is appended so that model checkpoints,
+    metrics files, and results workbooks are kept separate per source:
+        'nist'   → 'Co'
+        'kurucz' → 'Co_kurucz'
+    """
     if hasattr(config.dataset, 'elements') and config.dataset.elements:
-        return '_'.join(sorted(config.dataset.elements))
+        base = '_'.join(sorted(config.dataset.elements))
     elif hasattr(config.dataset, 'data_file') and config.dataset.data_file:
-        return extract_element_from_filename(config.dataset.data_file)
-    return ''
+        base = extract_element_from_filename(config.dataset.data_file)
+    else:
+        base = ''
+
+    source = config.dataset.get('dataset_source', 'nist') if hasattr(config, 'dataset') else 'nist'
+    if source != 'nist' and base:
+        return f"{base}_{source}"
+    return base
 
 
 def get_experiment_tags(config) -> str:

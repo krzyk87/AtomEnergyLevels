@@ -29,6 +29,11 @@ dataset:
   #   data/Na_features.csv
   #   data/dataset_split_indices_Na.json
 
+  # Dataset source: selects which preprocessed CSV to load
+  #   'nist'   → {element}_features.csv        (European locale: sep=';', decimal=',')
+  #   'kurucz' → {element}_features_kurucz.csv  (standard CSV:   sep=',', decimal='.')
+  dataset_source: 'kurucz'
+
   # Or for single element (backward compatible):
 #  data_file: "data/K_features.csv"  # Path to input data file
 #  split_file: "dataset_split_indices_K.json"  # JSON file to save/load split indices (saved in data/)

@@ -224,6 +224,7 @@ class AtomicDataset(Dataset):
         key_dict['encode_valence_electrons'] = self.config.dataset.get('encode_valence_electrons', False)
         key_dict['max_valence_electrons'] = self.config.dataset.get('max_valence_electrons', 1)
         key_dict['stratify_energy_bins'] = self.config.dataset.get('stratify_energy_bins', 5)
+        key_dict['dataset_source'] = self.config.dataset.get('dataset_source', 'nist')
 
         # Convert to deterministic string
         key_str = json.dumps(key_dict, sort_keys=True)
@@ -258,9 +259,17 @@ class AtomicDataset(Dataset):
         Returns:
             Combined DataFrame with all data
         """
-        # Read CSV format settings from config (defaults: standard comma/dot)
-        sep = self.config.dataset.get('data_separator', ',')
-        decimal = self.config.dataset.get('data_decimal', '.')
+        # Determine dataset source and derive file suffix + CSV format
+        source = self.config.dataset.get('dataset_source', 'nist')
+        if source == 'kurucz':
+            # Kurucz CSVs use standard format (comma separator, dot decimal)
+            sep, decimal = ',', '.'
+            file_suffix = '_features_kurucz.csv'
+        else:
+            # NIST CSVs honour the per-config locale settings
+            sep = self.config.dataset.get('data_separator', ',')
+            decimal = self.config.dataset.get('data_decimal', '.')
+            file_suffix = '_features.csv'
 
         # Mode 1: Multiple elements
         if hasattr(self.config.dataset, 'elements') and self.config.dataset.elements:
@@ -269,13 +278,13 @@ class AtomicDataset(Dataset):
 
             print(f"\nLoading multiple elements: {elements}")
             print(f"Data directory: {data_dir}")
-            print(f"CSV format: sep='{sep}', decimal='{decimal}'")
+            print(f"Dataset source: '{source}'  |  CSV format: sep='{sep}', decimal='{decimal}'")
 
             all_dfs = []
 
             for element in elements:
-                # Construct filename: data/Na_features.csv
-                data_file = os.path.join(data_dir, f"{element}_features.csv")
+                # Construct filename: data/Co_features.csv or data/Co_features_kurucz.csv
+                data_file = os.path.join(data_dir, f"{element}{file_suffix}")
 
                 if not os.path.exists(data_file):
                     raise FileNotFoundError(
@@ -298,11 +307,11 @@ class AtomicDataset(Dataset):
 
             return combined_df
 
-        # Mode 2: Single file (backward compatible)
+        # Mode 2: Single file (backward compatible; file_suffix not applied here)
         elif hasattr(self.config.dataset, 'data_file') and self.config.dataset.data_file:
             data_file = self.config.dataset.data_file
             print(f"\nLoading single element from: {data_file}")
-            print(f"CSV format: sep='{sep}', decimal='{decimal}'")
+            print(f"Dataset source: '{source}'  |  CSV format: sep='{sep}', decimal='{decimal}'")
             df = pd.read_csv(data_file, sep=sep, decimal=decimal)
 
             # Add element column if not present
@@ -1460,15 +1469,24 @@ class AtomicDataset(Dataset):
                 print(f"Filled missing values with {fill_value}")
 
     def _get_split_file_path(self) -> str:
-        """Return the path to the split indices JSON file."""
+        """Return the path to the split indices JSON file.
+
+        The filename encodes the element(s) and, for non-NIST sources, the
+        dataset source so that NIST and Kurucz splits are stored separately:
+            data/dataset_split_indices_Co.json          (NIST)
+            data/dataset_split_indices_Co_kurucz.json   (Kurucz)
+        """
+        source = self.config.dataset.get('dataset_source', 'nist')
+        source_suffix = f'_{source}' if source != 'nist' else ''
+
         if hasattr(self.config.dataset, 'elements') and len(self.config.dataset.elements) > 1:
             # Multi-element: use combined name
             elements_str = '_'.join(sorted(self.config.dataset.elements))
-            split_file = f"dataset_split_indices_{elements_str}.json"
+            split_file = f"dataset_split_indices_{elements_str}{source_suffix}.json"
         else:
             # Single element: element-specific split file
             element = self.df['Element'].iloc[0]
-            split_file = f"dataset_split_indices_{element}.json"
+            split_file = f"dataset_split_indices_{element}{source_suffix}.json"
 
         # Add data_dir if specified
         if hasattr(self.config.dataset, 'data_dir'):
