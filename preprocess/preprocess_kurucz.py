@@ -330,7 +330,7 @@ def preprocess_kurucz(data_dir: str = 'data') -> pd.DataFrame:
     Returns the feature DataFrame.
     """
     kurucz_dir = os.path.join(data_dir, 'kurucz')
-    even_path  = os.path.join(kurucz_dir, 'Co-atom-AI.txt')
+    even_path  = os.path.join(kurucz_dir, 'Co-even-atom-AI.txt')
     odd_path   = os.path.join(kurucz_dir, 'Coi-odd-atom-AI.txt')
 
     for p in (even_path, odd_path):
