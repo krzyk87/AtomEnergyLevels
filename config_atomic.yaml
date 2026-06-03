@@ -96,6 +96,8 @@ dataset:
   drop_missing: false           # Whether to drop rows with missing values
   fill_missing_value: 0.0       # Value to fill missing data (if not dropping)
 
+  drop_zero_variance_features: false
+
 training:
   criterion: SmoothL1                # Loss function: MSE / MAE / Huber
   use_focal_loss: false

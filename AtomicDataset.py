@@ -716,6 +716,17 @@ class AtomicDataset(Dataset):
         # Verify all exist in dataframe
         features = [f for f in features if f in self.df.columns]
 
+        # TODO: check for zero_variance only in the training set
+        # Drop constant columns (not informative)
+        if self.config.dataset.get('drop_zero_variance_features', True):
+            before = len(features)
+            features = [f for f in features
+                        if f in self.df.columns and self.df[f].nunique() > 1]
+            dropped = before - len(features)
+            if dropped > 0:
+                print(f"  ✓ Dropped {dropped} zero-variance features")
+                print(f"    Kept: {features}")
+
         print(f"\n{'=' * 60}")
         print(f"✓ SELECTED {len(features)} TOTAL FEATURES")
         print(f"{'=' * 60}\n")
