@@ -193,7 +193,16 @@ class AtomicDataset(Dataset):
             self.sample_weights = self._compute_sample_weights()
         else:
             self.sample_weights = None
-        
+
+        # Prepare gJ second target for multi-task learning.
+        # Must run AFTER _create_splits() (needs self.indices) and AFTER scaler logic
+        # (gJ is not normalised — stored in raw units).
+        if config.training.get('multitask_gj', False):
+            self._prepare_gj_target()
+        else:
+            self.y_gj = None
+            self.gj_mask = None
+
         print(f"{subset.capitalize()} set: {len(self)} samples, {self.X.shape[1]} features")
 
     def _generate_cache_key(self) -> str:
@@ -692,6 +701,14 @@ class AtomicDataset(Dataset):
             features.extend(tm_added)
             print(f"  ✓ Added {len(tm_added)} transition metal features: {tm_added}")
 
+        if self.config.dataset.get('add_theoretical_lande_g', False):
+            # lande_g_theoretical: Landé formula value (0 where S/L unknown)
+            # has_lande_theoretical: 1 if formula was computable for this row, else 0
+            theo_g_cols = ['lande_g_theoretical', 'has_lande_theoretical']
+            added_theo = [c for c in theo_g_cols if c in self.df.columns]
+            features.extend(added_theo)
+            print(f"  ✓ Added {len(added_theo)} theoretical gJ features: {added_theo}")
+
         # ========================================
         # FORCE INCLUDE/EXCLUDE (from config)
         # ========================================
@@ -795,6 +812,10 @@ class AtomicDataset(Dataset):
         # For transition metal atoms: add iron-group physics features
         if self.config.dataset.get('add_transition_metal_features', False):
             self._add_transition_metal_features()
+
+        # Theoretical Landé g-factor as an additional physics-informed input feature
+        if self.config.dataset.get('add_theoretical_lande_g', False):
+            self._add_theoretical_lande_g()
 
     def _impute_SL_from_lande_g(self):
         """
@@ -1116,6 +1137,74 @@ class AtomicDataset(Dataset):
                 col_data = self.df[col].dropna()
                 print(f"    {col:20s}: min={col_data.min():.3f}, "
                       f"max={col_data.max():.3f}, mean={col_data.mean():.3f}")
+
+    def _add_theoretical_lande_g(self):
+        """
+        Compute the theoretical Landé g-factor from quantum numbers and add it as an input feature.
+
+        Physics: In LS (Russell-Saunders) coupling the Landé formula is:
+            g_J = 1 + [J(J+1) + S(S+1) − L(L+1)] / [2·J(J+1)]
+        Special case: J == 0 → g_J = 0.0 by convention (denominator is zero).
+
+        This theoretical value is a useful prior for the model because:
+          - For pure LS-coupled states it equals the experimental gJ exactly.
+          - For states with configuration mixing the residual (g_exp − g_theory)
+            encodes the deviation from ideal coupling, which the model can then
+            learn from the electronic structure.
+
+        New columns:
+            lande_g_theoretical  — float, Landé formula result; NaN where S or L unknown
+            has_lande_theoretical — int 0/1, 1 if formula was computable for this row
+
+        NaN rows (unknown S or L) are filled with 0.0 so the feature array has
+        no missing values; `has_lande_theoretical` flags those rows for the model.
+        """
+        print("\nComputing theoretical Landé g-factor features...")
+
+        if 'J' not in self.df.columns:
+            print("  ✗ Skipping: 'J' column not found.")
+            return
+
+        g_theoretical = []
+        has_theoretical = []
+
+        for idx, row in self.df.iterrows():
+            J = row['J']
+            S = row.get('S_qn', np.nan) if 'S_qn' in self.df.columns else np.nan
+            L = row.get('L_qn', np.nan) if 'L_qn' in self.df.columns else np.nan
+
+            # If J == 0 the formula's denominator 2·J(J+1) is zero — use g_J = 0 by convention
+            if J == 0:
+                g_theoretical.append(0.0)
+                has_theoretical.append(1 if not (pd.isna(S) or pd.isna(L)) else 0)
+                continue
+
+            # If either S or L is unknown we cannot evaluate the formula
+            if pd.isna(S) or pd.isna(L):
+                g_theoretical.append(np.nan)     # will be filled below
+                has_theoretical.append(0)
+                continue
+
+            # Full Landé formula: g_J = 1 + [J(J+1) + S(S+1) - L(L+1)] / [2·J(J+1)]
+            J_sq = J * (J + 1)
+            g = 1.0 + (J_sq + S * (S + 1) - L * (L + 1)) / (2.0 * J_sq)
+            g_theoretical.append(g)
+            has_theoretical.append(1)
+
+        self.df['lande_g_theoretical'] = g_theoretical
+        self.df['has_lande_theoretical'] = has_theoretical
+
+        # Fill NaN with 0.0 — model uses `has_lande_theoretical` flag to distinguish
+        n_computed = int(np.sum(has_theoretical))
+        n_total = len(has_theoretical)
+        n_filled = n_total - n_computed
+        self.df['lande_g_theoretical'] = self.df['lande_g_theoretical'].fillna(0.0)
+
+        print(f"  lande_g_theoretical: {n_computed} / {n_total} rows computed from formula "
+              f"({n_filled} rows filled with 0.0 — unknown S or L)")
+        col_data = self.df['lande_g_theoretical']
+        print(f"  Value range: min={col_data.min():.3f}, max={col_data.max():.3f}, "
+              f"mean={col_data.mean():.3f}")
 
     def _add_rydberg_features(self):
         """
@@ -1715,26 +1804,78 @@ class AtomicDataset(Dataset):
                 n_total = sum(self.df['Element'] == element)
                 print(f"    {element}: Train={n_train}, Val={n_val}, Test={n_test} (Total={n_total})")
 
+    def _prepare_gj_target(self):
+        """
+        Extract the experimental Landé g-factor as the second prediction target.
+
+        Physics: gJ is measured experimentally but is missing for many levels
+        (NIST lists it only when the term assignment is confident enough).  We store
+        the raw (unnormalized) values and a boolean mask so that the loss function
+        can skip unobserved rows — predicting on partial supervision.
+
+        gJ is NOT normalised: it is dimensionless with a small range (~−1 to 4 for
+        Co I) that does not benefit from StandardScaler standardisation the way that
+        energy (range ~60 000 cm⁻¹) does.
+
+        Stores:
+            self.y_gj    — np.float32, shape (N,), gJ values; 0.0 where unobserved
+            self.gj_mask — np.bool_,   shape (N,), True where experimental gJ exists
+        """
+        if 'lande_g' not in self.df.columns:
+            raise ValueError(
+                "multitask_gj=True requires a 'lande_g' column in the dataset. "
+                "Ensure the CSV contains experimental Landé g-factor values."
+            )
+
+        # Raw gJ values for the current subset rows (float, NaN where unobserved)
+        gj_raw = self.df.loc[self.indices, 'lande_g'].values.astype(float)
+
+        # Mask: True where gJ is observed (not NaN)
+        self.gj_mask = ~np.isnan(gj_raw)        # shape (N,), boolean
+
+        # Fill NaN positions with 0.0 — the mask tells the loss to ignore them
+        self.y_gj = gj_raw.copy()
+        self.y_gj[~self.gj_mask] = 0.0
+        self.y_gj = self.y_gj.astype(np.float32)  # shape (N,)
+
+        n_observed = int(self.gj_mask.sum())
+        n_total = len(self.gj_mask)
+        print(f"  gJ target ({self.subset}): {n_observed} / {n_total} rows have observed gJ "
+              f"({100.0 * n_observed / n_total:.1f}%)")
+
     def __len__(self) -> int:
         """Return the number of samples in this dataset."""
         return len(self.X)
     
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int):
         """
         Get a single sample from the dataset.
-        
-        Args:
-            idx: Index of the sample to retrieve
-            
-        Returns:
-            Tuple of (features, target) as PyTorch tensors
-            - features: Input features (electron config + quantum numbers)
-            - target: Energy level in cm⁻¹
+
+        Single-task mode (multitask_gj=False, the default):
+            Returns: (features, y_energy)
+            - features:  shape (input_dim,)
+            - y_energy:  shape (1,), normalised energy
+
+        Multi-task mode (multitask_gj=True):
+            Returns: (features, y_energy, y_gj, gj_mask)
+            - features:  shape (input_dim,)
+            - y_energy:  shape (1,), normalised energy  ← same as single-task
+            - y_gj:      shape (1,), raw experimental gJ (0.0 where unobserved)
+            - gj_mask:   shape (1,), float32 — 1.0 if gJ observed, 0.0 if missing
+
+        The single-task path is byte-for-byte identical to before this change.
         """
         # Convert numpy arrays to PyTorch tensors
         features = torch.FloatTensor(self.X[idx])
-        target = torch.FloatTensor(self.y[idx])
-        
+        target = torch.FloatTensor(self.y[idx])   # shape (1,) — normalised energy
+
+        if self.config.training.get('multitask_gj', False):
+            # Second target: raw experimental gJ value
+            y_gj = torch.FloatTensor([self.y_gj[idx]])            # shape (1,)
+            # Mask: 1.0 = observed, 0.0 = missing — used by MultiTaskLoss to skip NaN rows
+            gj_mask = torch.FloatTensor([float(self.gj_mask[idx])])  # shape (1,)
+            return features, target, y_gj, gj_mask
+
         return features, target
     
     def get_feature_names(self) -> list:
@@ -1783,6 +1924,24 @@ class AtomicDataset(Dataset):
             # RuntimeWarning: overflow encountered in exp
             y = np.exp(y)
 
+        return y
+
+    def inverse_transform_gj(self, y: np.ndarray) -> np.ndarray:
+        """
+        Identity transform for the gJ target — provided for API consistency.
+
+        Unlike the energy target, gJ is stored and predicted in raw (dimensionless)
+        units without any StandardScaler normalisation, so no inverse operation is
+        needed.  This method exists so that calling code can treat both outputs
+        symmetrically: inverse_transform_target() for energy,
+        inverse_transform_gj() for gJ.
+
+        Args:
+            y: gJ predictions from the model, any shape
+
+        Returns:
+            y unchanged
+        """
         return y
 
     def validate_term_symbol(self):

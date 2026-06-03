@@ -39,6 +39,81 @@ from utils import (
 )
 
 
+class MultiTaskLoss(nn.Module):
+    """
+    Combined loss for simultaneous energy and Landé g-factor prediction.
+
+    Physics motivation:
+        Atomic energy levels and gJ values are two complementary observables
+        of the same quantum state.  Training on both simultaneously forces the
+        shared trunk to encode physically meaningful electronic structure features
+        that explain BOTH observables, acting as an auxiliary regulariser for the
+        primary energy task.
+
+    The total loss is a weighted sum:
+        L_total = α · L_energy + (1 − α) · L_gJ_masked
+
+    where L_gJ_masked is averaged ONLY over rows where experimental gJ is available
+    (mask == 1.0).  If no observed gJ rows exist in a batch, the gJ term is 0.0
+    (the energy loss alone drives that batch's gradient).
+
+    Recommended α: 0.85 – 0.95.  Setting α = 1.0 exactly reproduces the single-task
+    energy loss, which is useful for sanity checks.
+
+    Args:
+        alpha:             Weight for energy task (0.0 – 1.0).  Default 0.9.
+        energy_criterion:  Loss type for energy head ('MSE', 'MAE', 'Huber', 'SmoothL1').
+        gj_criterion:      Loss type for gJ head   ('MSE', 'MAE', 'Huber').
+    """
+
+    def __init__(self, alpha: float = 0.9,
+                 energy_criterion: str = 'MSE',
+                 gj_criterion: str = 'MSE'):
+        super(MultiTaskLoss, self).__init__()
+        self.alpha = alpha
+
+        # Energy loss: standard mean reduction (used as a scalar in L_total)
+        self.energy_criterion = create_loss_function(energy_criterion, reduction='mean')
+
+        # gJ loss needs element-wise values so we can zero-out unobserved rows
+        # before averaging → instantiate with reduction='none'
+        self.gj_criterion_none = create_loss_function(gj_criterion, reduction='none')
+
+    def forward(
+        self,
+        energy_pred:   torch.Tensor,   # shape (B, 1), normalised energy prediction
+        energy_target: torch.Tensor,   # shape (B, 1), normalised energy target
+        gj_pred:       torch.Tensor,   # shape (B, 1), raw gJ prediction
+        gj_target:     torch.Tensor,   # shape (B, 1), raw experimental gJ (0 where missing)
+        gj_mask:       torch.Tensor,   # shape (B, 1), float32: 1.0=observed, 0.0=missing
+    ):
+        """
+        Compute combined multi-task loss.
+
+        Returns:
+            total_loss  — scalar tensor, used for backward()
+            energy_loss — Python float, for epoch-level logging
+            gj_loss     — Python float, 0.0 if no observed gJ in this batch
+        """
+        # Energy loss: standard mean over all batch rows (no masking needed)
+        energy_loss = self.energy_criterion(energy_pred, energy_target)
+
+        # gJ loss: element-wise, then mask out rows without observed gJ
+        gj_elementwise = self.gj_criterion_none(gj_pred, gj_target)   # shape (B, 1)
+        mask_sum = gj_mask.sum()
+        if mask_sum > 0:
+            # Average only over rows where experimental gJ is known
+            gj_loss = (gj_elementwise * gj_mask).sum() / mask_sum
+        else:
+            # Entire batch has no observed gJ — gJ term contributes nothing
+            gj_loss = torch.tensor(0.0, device=energy_pred.device)
+
+        total_loss = self.alpha * energy_loss + (1.0 - self.alpha) * gj_loss
+
+        # Return scalar tensor for backward() plus float values for logging
+        return total_loss, energy_loss.item(), gj_loss.item()
+
+
 def train_one_epoch(
     model: nn.Module,
     train_loader: DataLoader,
@@ -74,9 +149,15 @@ def train_one_epoch(
     # This enables dropout and batch normalization training behavior
     model.train()
 
+    # Detect multi-task mode once per epoch (avoids repeated config lookups)
+    is_multitask = config.training.get('multitask_gj', False)
+
     running_loss = 0.0
-    all_predictions = []
-    all_targets = []
+    all_predictions = []    # energy predictions (used for epoch MAE)
+    all_targets = []        # energy targets
+
+    # Multi-task: also accumulate gJ losses for per-epoch reporting
+    epoch_gj_losses = []    # individual batch gJ loss values (floats)
 
     use_focal = config.training.get('use_focal_loss', False)
     focal_alpha = config.training.get('focal_loss_alpha', 0.5)
@@ -86,94 +167,129 @@ def train_one_epoch(
     )
 
     # Iterate through batches of training data
-    for batch_idx, (features, targets) in enumerate(train_loader):
-        # Move data to GPU if available
-        features = features.to(device)
-        targets = targets.to(device)
-        
+    for batch_idx, batch in enumerate(train_loader):
+
+        # ----------------------------------------------------------------
+        # Unpack batch — shape differs between single-task and multi-task
+        # ----------------------------------------------------------------
+        if is_multitask:
+            # DataLoader returns 4-tuple: (features, y_energy, y_gj, gj_mask)
+            features, targets_energy, targets_gj, gj_mask = batch
+            features       = features.to(device)
+            targets_energy = targets_energy.to(device)
+            targets_gj     = targets_gj.to(device)
+            gj_mask        = gj_mask.to(device)
+        else:
+            # Single-task: standard 2-tuple (features, targets)
+            features, targets = batch
+            features = features.to(device)
+            targets  = targets.to(device)
+
         # Zero out gradients from previous iteration
         # PyTorch accumulates gradients, so we must clear them each time
         optimizer.zero_grad()
-        
-        # Forward pass: compute predictions
-        predictions = model(features)
-        
-        # Compute loss (how far are predictions from true values)
-        # Per-sample losses — shape: [batch_size, 1]
-        loss = criterion(predictions, targets)
 
-        # Start with uniform weights, shape: [batch_size, 1]
-        weights = torch.ones_like(loss)
+        # ----------------------------------------------------------------
+        # Forward pass + loss computation
+        # ----------------------------------------------------------------
+        if is_multitask:
+            # Model returns (energy_pred, gj_pred) for MultiTaskAtomicModel
+            pred_energy, pred_gj = model(features)
 
-        # --- Sample weights (static, from energy distribution) ---
-        if use_sample_weights:
-            # Resolve which dataset samples this batch corresponds to.
-            # train_loader.dataset.indices maps dataset positions to df row indices.
-            # batch_idx * batch_size : (batch_idx+1) * batch_size gives the
-            # position within the shuffled dataset for this batch.
-            start = batch_idx * config.general.batch_size
-            end = start + len(features)  # use len(features) not batch_size: last batch may be smaller
-            batch_positions = list(range(start, min(end, len(train_loader.dataset))))
+            # MultiTaskLoss combines energy and masked gJ losses with weighting α
+            total_loss, e_loss_val, g_loss_val = criterion(
+                pred_energy, targets_energy, pred_gj, targets_gj, gj_mask
+            )
+            loss = total_loss   # scalar tensor — drives backward()
+            epoch_gj_losses.append(g_loss_val)
 
-            sw = torch.FloatTensor([
-                train_loader.dataset.sample_weights[pos]
-                for pos in batch_positions
-            ]).to(device).unsqueeze(1)  # [batch_size, 1]
-            weights = weights * sw
+            # Track energy predictions for epoch-level MAE (single-task compatible)
+            all_predictions.append(pred_energy.detach().cpu().numpy())
+            all_targets.append(targets_energy.cpu().numpy())
 
-        # --- Focal weights (dynamic, based on current prediction error) ---
-        if use_focal:
-            # Weight by error magnitude: harder samples get more weight
-            # Alpha controls how aggressively to focus on hard samples
-            with torch.no_grad():
-                error_magnitude = torch.abs(predictions - targets).detach()
-                focal_weights = (1 + error_magnitude) ** focal_alpha  # alpha ~ 0.5-2.0
-                focal_weights = focal_weights / focal_weights.mean()  # normalize so average weight is 1.0
-            weights = weights * focal_weights
+        else:
+            # Single-task path: IDENTICAL to original code
+            # Forward pass: compute predictions
+            predictions = model(features)
 
-        # Normalize combined weights so loss scale stays comparable across runs
-        weights = weights / weights.mean()
-        loss = (loss * weights).mean()
+            # Compute per-sample losses — shape: [batch_size, 1]
+            loss = criterion(predictions, targets)
 
-        # Backward pass: compute gradients
-        # This calculates how much each weight contributed to the loss
+            # Start with uniform weights, shape: [batch_size, 1]
+            weights = torch.ones_like(loss)
+
+            # --- Sample weights (static, from energy distribution) ---
+            if use_sample_weights:
+                # Resolve which dataset samples this batch corresponds to.
+                # train_loader.dataset.indices maps dataset positions to df row indices.
+                # batch_idx * batch_size : (batch_idx+1) * batch_size gives the
+                # position within the shuffled dataset for this batch.
+                start = batch_idx * config.general.batch_size
+                end = start + len(features)  # use len(features) not batch_size: last batch may be smaller
+                batch_positions = list(range(start, min(end, len(train_loader.dataset))))
+
+                sw = torch.FloatTensor([
+                    train_loader.dataset.sample_weights[pos]
+                    for pos in batch_positions
+                ]).to(device).unsqueeze(1)  # [batch_size, 1]
+                weights = weights * sw
+
+            # --- Focal weights (dynamic, based on current prediction error) ---
+            if use_focal:
+                # Weight by error magnitude: harder samples get more weight
+                # Alpha controls how aggressively to focus on hard samples
+                with torch.no_grad():
+                    error_magnitude = torch.abs(predictions - targets).detach()
+                    focal_weights = (1 + error_magnitude) ** focal_alpha  # alpha ~ 0.5-2.0
+                    focal_weights = focal_weights / focal_weights.mean()  # normalize so average weight is 1.0
+                weights = weights * focal_weights
+
+            # Normalize combined weights so loss scale stays comparable across runs
+            weights = weights / weights.mean()
+            loss = (loss * weights).mean()
+
+            all_predictions.append(predictions.detach().cpu().numpy())
+            all_targets.append(targets.cpu().numpy())
+
+        # ----------------------------------------------------------------
+        # Backward pass and optimisation (identical for both modes)
+        # ----------------------------------------------------------------
+        # Backward pass: compute gradients — how much each weight contributed to loss
         loss.backward()
-        
+
         # Gradient clipping: prevent exploding gradients
         # If gradients become too large, they can destabilize training
         if config.training.gradient_clip > 0:
             torch.nn.utils.clip_grad_norm_(
-                model.parameters(), 
+                model.parameters(),
                 config.training.gradient_clip
             )
-        
+
         # Optimization step: update weights based on gradients
-        # The optimizer uses gradients to adjust weights to minimize loss
         optimizer.step()
 
-        # Track loss for this batch
+        # Track total loss for this batch (same meaning in both modes)
         running_loss += loss.item()
-
-        # Store predictions and targets for MAE calculation
-        all_predictions.append(predictions.detach().cpu().numpy())
-        all_targets.append(targets.cpu().numpy())
 
     # Average loss across all batches
     avg_loss = running_loss / len(train_loader)
 
-    # Combine all batches for MAE calculation
+    # Combine all energy predictions for epoch-level MAE (both modes)
     all_predictions = np.concatenate(all_predictions)
-    all_targets = np.concatenate(all_targets)
+    all_targets     = np.concatenate(all_targets)
 
-    # Inverse transform BEFORE computing MAE
+    # Inverse transform BEFORE computing MAE (undo StandardScaler + any target transform)
     predictions_cm = train_loader.dataset.inverse_transform_target(all_predictions)
-    targets_cm = train_loader.dataset.inverse_transform_target(all_targets)
+    targets_cm     = train_loader.dataset.inverse_transform_target(all_targets)
 
-    # Calculate average MAE in cm⁻¹
+    # Calculate average energy MAE in cm⁻¹
     avg_mae = np.mean(np.abs(predictions_cm - targets_cm))
     # RuntimeWarning: invalid value encountered in subtract
 
-    return avg_loss, avg_mae
+    # Average gJ loss across batches (nan in single-task mode — not used there)
+    avg_gj_loss = float(np.mean(epoch_gj_losses)) if epoch_gj_losses else float('nan')
+
+    return avg_loss, avg_mae, avg_gj_loss
 
 
 def validate(
@@ -181,72 +297,115 @@ def validate(
     val_loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
-    val_dataset: AtomicDataset
-) -> Tuple[float, float, float]:
+    val_dataset: AtomicDataset,
+    config=None,
+) -> Tuple[float, float, float, float]:
     """
     Evaluate the model on validation data.
-    
+
     Validation checks how well the model generalizes to unseen data.
     This is done without updating weights (no training).
-    
+
     Args:
-        model: Neural network model
+        model:      Neural network model
         val_loader: DataLoader for validation data
-        criterion: Loss function
-        device: CPU or GPU
-        val_dataset: dataset object used for validation
-    
+        criterion:  Loss function (MultiTaskLoss in multitask mode)
+        device:     CPU or GPU
+        val_dataset: Dataset object used for inverse transform
+        config:     Configuration object (needed for multitask detection)
+
     Returns:
-        Tuple of (loss, MAE, RMSE)
-        - loss: Average validation loss
-        - MAE: Mean Absolute Error in cm⁻¹
-        - RMSE: Root Mean Squared Error in cm⁻¹
+        Tuple of (loss, mae_energy, rmse_energy, mae_gj)
+        - loss:        Average validation loss (total, same for both modes)
+        - mae_energy:  Mean Absolute Error for energy (cm⁻¹)
+        - rmse_energy: Root Mean Squared Error for energy (cm⁻¹)
+        - mae_gj:      Mean Absolute Error for gJ (dimensionless);
+                       nan if single-task mode or no observed gJ in val set
     """
-    # Set model to evaluation mode
-    # This disables dropout and sets batch norm to evaluation mode
+    # Set model to evaluation mode (disables dropout; batch norm uses running stats)
     model.eval()
-    
+
+    is_multitask = (config is not None) and config.training.get('multitask_gj', False)
+
     running_loss = 0.0
-    all_predictions = []
-    all_targets = []
+    all_predictions = []   # energy predictions
+    all_targets     = []   # energy targets
     num_batches = 0
-    
-    # Disable gradient computation for efficiency
-    # We're only evaluating, not training, so we don't need gradients
+
+    # Multi-task: collect gJ predictions to compute gJ MAE over observed rows
+    all_gj_preds   = []
+    all_gj_targets = []
+    all_gj_masks   = []
+
+    # Disable gradient computation — only evaluating, not training
     with torch.no_grad():
-        for features, targets in val_loader:
-            features = features.to(device)
-            targets = targets.to(device)
-            
-            # Forward pass only
-            predictions = model(features)
-            
-            # Compute loss
-            loss = criterion(predictions, targets)
-            running_loss += loss.item()
+        for batch in val_loader:
+
+            if is_multitask:
+                features, targets_energy, targets_gj, gj_mask = batch
+                features       = features.to(device)
+                targets_energy = targets_energy.to(device)
+                targets_gj     = targets_gj.to(device)
+                gj_mask        = gj_mask.to(device)
+
+                pred_energy, pred_gj = model(features)
+
+                # MultiTaskLoss returns (total_loss_tensor, e_loss_float, gj_loss_float)
+                total_loss, _, _ = criterion(
+                    pred_energy, targets_energy, pred_gj, targets_gj, gj_mask
+                )
+                running_loss += total_loss.item()
+
+                all_predictions.append(pred_energy.cpu().numpy())
+                all_targets.append(targets_energy.cpu().numpy())
+                all_gj_preds.append(pred_gj.cpu().numpy())
+                all_gj_targets.append(targets_gj.cpu().numpy())
+                all_gj_masks.append(gj_mask.cpu().numpy())
+
+            else:
+                # Single-task path — identical to original validate()
+                features, targets = batch
+                features = features.to(device)
+                targets  = targets.to(device)
+
+                predictions = model(features)
+                loss = criterion(predictions, targets)
+                running_loss += loss.item()
+
+                all_predictions.append(predictions.cpu().numpy())
+                all_targets.append(targets.cpu().numpy())
+
             num_batches += 1
-            
-            # Store predictions and targets for metrics
-            all_predictions.append(predictions.cpu().numpy())
-            all_targets.append(targets.cpu().numpy())
-    
+
     # Combine all batches
     all_predictions = np.concatenate(all_predictions)
-    all_targets = np.concatenate(all_targets)
-    
-    # Compute metrics
+    all_targets     = np.concatenate(all_targets)
+
     avg_loss = running_loss / num_batches
 
-    # Inverse transform BEFORE computing metrics
+    # Inverse transform BEFORE computing energy metrics
     predictions_cm = val_dataset.inverse_transform_target(all_predictions)
-    targets_cm = val_dataset.inverse_transform_target(all_targets)
+    targets_cm     = val_dataset.inverse_transform_target(all_targets)
 
     # RuntimeWarning: invalid value encountered in subtract
-    mae = np.mean(np.abs(predictions_cm - targets_cm))
+    mae  = np.mean(np.abs(predictions_cm - targets_cm))
     rmse = np.sqrt(np.mean((predictions_cm - targets_cm) ** 2))
     # RuntimeWarning: overflow encountered in square
-    
-    return avg_loss, mae, rmse
+
+    # gJ MAE — only meaningful in multitask mode with at least one observed row
+    if is_multitask and all_gj_preds:
+        all_gj_preds   = np.concatenate(all_gj_preds).flatten()   # (N,)
+        all_gj_targets = np.concatenate(all_gj_targets).flatten()  # (N,)
+        all_gj_masks   = np.concatenate(all_gj_masks).flatten()    # (N,)
+        observed = all_gj_masks == 1.0
+        if observed.sum() > 0:
+            mae_gj = float(np.mean(np.abs(all_gj_preds[observed] - all_gj_targets[observed])))
+        else:
+            mae_gj = float('nan')  # no observed gJ in validation set
+    else:
+        mae_gj = float('nan')  # single-task mode — gJ MAE not applicable
+
+    return avg_loss, mae, rmse, mae_gj
 
 
 def train_model(config, model, train_loader, val_loader, device, val_dataset):
@@ -271,9 +430,31 @@ def train_model(config, model, train_loader, val_loader, device, val_dataset):
     Returns:
         Path to saved best model
     """
-    # Create loss function
-    criterion_train = create_loss_function(config.training.criterion, reduction='none')
-    criterion_val = create_loss_function(config.training.criterion, reduction='mean')
+    # Create loss function(s).
+    # In multi-task mode both train and val use MultiTaskLoss, which handles
+    # masking internally.  In single-task mode the existing per-element loss
+    # (reduction='none') and mean loss (reduction='mean') are used unchanged.
+    is_multitask = config.training.get('multitask_gj', False)
+    if is_multitask:
+        alpha   = config.training.get('multitask_alpha', 0.9)
+        gj_crit = config.training.get('gj_criterion', 'MSE')
+        # One instance for training (used inside train_one_epoch)
+        criterion_train = MultiTaskLoss(
+            alpha=alpha,
+            energy_criterion=config.training.criterion,
+            gj_criterion=gj_crit
+        )
+        # Separate instance for validation (stateless, but kept distinct for clarity)
+        criterion_val = MultiTaskLoss(
+            alpha=alpha,
+            energy_criterion=config.training.criterion,
+            gj_criterion=gj_crit
+        )
+        print(f"\nMulti-task mode: predicting energy (α={alpha:.2f}) + gJ (α={1 - alpha:.2f})")
+        print(f"  Energy criterion: {config.training.criterion} | gJ criterion: {gj_crit}")
+    else:
+        criterion_train = create_loss_function(config.training.criterion, reduction='none')
+        criterion_val   = create_loss_function(config.training.criterion, reduction='mean')
     
     # Create optimizer
     # Optimizer adjusts model weights to minimize loss
@@ -338,14 +519,14 @@ def train_model(config, model, train_loader, val_loader, device, val_dataset):
     for epoch in range(1, config.general.epochs + 1):
         epoch_start = time.time()
         
-        # Train for one epoch
-        train_loss, train_mae = train_one_epoch(
+        # Train for one epoch — returns (avg_loss, energy_mae, gj_loss_avg)
+        train_loss, train_mae, train_gj_loss = train_one_epoch(
             model, train_loader, criterion_train, optimizer, device, epoch, config
         )
-        
-        # Validate
-        val_loss, val_mae, val_rmse = validate(
-            model, val_loader, criterion_val, device, val_dataset
+
+        # Validate — returns (loss, mae_energy, rmse_energy, mae_gj)
+        val_loss, val_mae, val_rmse, val_mae_gj = validate(
+            model, val_loader, criterion_val, device, val_dataset, config
         )
         
         # Update learning rate if using scheduler
@@ -356,20 +537,29 @@ def train_model(config, model, train_loader, val_loader, device, val_dataset):
         
         # Print progress
         if epoch % config.logging.log_interval == 0 or epoch == 1:
-            print(f"Epoch {epoch:3d}/{config.general.epochs} | "
-                  f"Train Loss: {train_loss:.4f} | "
-                  f"Val Loss: {val_loss:.4f} | "
-                  f"Train MAE: {train_mae:.4f} cm⁻¹ | "
-                  f"Val MAE: {val_mae:.2f} cm⁻¹ | "
-                  f"Val RMSE: {val_rmse:.2f} cm⁻¹ | "
-                  f"Time: {format_time(epoch_time)}")
+            log_line = (
+                f"Epoch {epoch:3d}/{config.general.epochs} | "
+                f"Train Loss: {train_loss:.4f} | "
+                f"Val Loss: {val_loss:.4f} | "
+                f"Train MAE: {train_mae:.4f} cm⁻¹ | "
+                f"Val MAE: {val_mae:.2f} cm⁻¹ | "
+                f"Val RMSE: {val_rmse:.2f} cm⁻¹ | "
+            )
+            # In multi-task mode append gJ MAE so we can monitor both tasks
+            if config.training.get('multitask_gj', False) and not np.isnan(val_mae_gj):
+                log_line += f"Val gJ MAE: {val_mae_gj:.4f} | "
+            log_line += f"Time: {format_time(epoch_time)}"
+            print(log_line)
         
         # Check if this is the best model so far
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
             best_train_metrics = {'loss': train_loss, 'mae': train_mae}
-            best_val_metrics = {'loss': val_loss, 'mae': val_mae, 'rmse': val_rmse}
+            best_val_metrics = {
+                'loss': val_loss, 'mae': val_mae, 'rmse': val_rmse,
+                'mae_gj': val_mae_gj,  # nan in single-task mode
+            }
 
             # Save the best model
             save_checkpoint(
@@ -393,6 +583,35 @@ def train_model(config, model, train_loader, val_loader, device, val_dataset):
     print(f"{'='*60}\n")
     
     return best_model_path, best_train_metrics, best_val_metrics
+
+
+# =============================================================================
+# MULTI-TASK TESTING CHECKLIST
+# Run these manual checks after any change to the multi-task code path.
+# =============================================================================
+#
+# [ ] Single-task run (multitask_gj: false) produces identical results to before:
+#     - train_one_epoch returns 3 values; third value (avg_gj_loss) is nan
+#     - validate returns 4 values; fourth value (mae_gj) is nan
+#     - epoch log line does NOT include "Val gJ MAE"
+#     - model file has NO '_mtask' suffix
+#
+# [ ] Multi-task run starts without error with Co data (266/306 rows have lande_g):
+#     - MultiTaskLoss prints "Using loss function: ..." twice (energy + gJ)
+#     - "Multi-task mode: predicting energy (α=0.90) + gJ (α=0.10)" line printed
+#     - "_prepare_gj_target" prints gJ observed counts for train, val, test
+#
+# [ ] Val gJ MAE is printed each log_interval epoch in multi-task mode
+#
+# [ ] gJ predictions are saved in the output CSV (columns: gj_predicted,
+#     gj_observed, gj_mask) via test_model.py / save_predictions_excel
+#
+# [ ] Model file has '_mtask' suffix in multitask mode (e.g., best_model_Co_..._mtask.pt)
+#
+# [ ] alpha=1.0 in multitask mode reproduces single-task energy loss exactly:
+#     MultiTaskLoss.forward → total = 1.0 * energy_loss + 0.0 * gj_loss = energy_loss
+#
+# =============================================================================
 
 
 def save_dataset_to_xlsx(train_dataset, config, output_path: str = None) -> str:

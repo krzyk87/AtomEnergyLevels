@@ -98,10 +98,17 @@ dataset:
 
   drop_zero_variance_features: false
 
+  add_theoretical_lande_g: false   # Add theoretical gJ (from Landé formula) as input feature; set true for Co/Fe/Ni with known S_qn/L_qn
+
 training:
   criterion: SmoothL1                # Loss function: MSE / MAE / Huber
   use_focal_loss: false
   gradient_clip: 0.0            # Gradient clipping value (0.0 to disable)
+
+  # Multi-task learning: predict energy AND experimental Landé g-factor simultaneously
+  multitask_gj: false          # Enable multi-task learning (energy + gJ outputs)
+  multitask_alpha: 0.9         # Weight for energy loss; (1 - alpha) goes to gJ loss
+  gj_criterion: MSE            # Loss function for the gJ head: MSE / MAE / Huber
   lr_scheduler: None  # LR scheduler: ReduceLROnPlateau / StepLR / None
   lr_scheduler_params:
     factor: 0.5                 # Multiply LR by this factor when reducing

@@ -253,6 +253,8 @@ def get_model_name_from_config(config) -> str:
     elements_str = _get_elements_str(config)
     layers_str = '-'.join(str(h) for h in config.model.hidden_layers)
     tags = get_experiment_tags(config)
+    # Append _mtask so multi-task checkpoints are distinct from single-task ones
+    mtask_suffix = '_mtask' if config.training.get('multitask_gj', False) else ''
     return (
         f"best_model_{elements_str}"
         f"_{config.general.optimizer}"
@@ -260,7 +262,7 @@ def get_model_name_from_config(config) -> str:
         f"_bs{config.general.batch_size}"
         f"_{layers_str}"
         f"_drop{config.model.dropout}"
-        f"_{tags}.pt"
+        f"_{tags}{mtask_suffix}.pt"
     )
 
 

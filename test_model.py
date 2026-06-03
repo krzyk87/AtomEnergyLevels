@@ -130,54 +130,111 @@ def test_model(
     model: nn.Module,
     test_loader: DataLoader,
     device: torch.device,
-    test_dataset: AtomicDataset
+    test_dataset: AtomicDataset,
+    config=None,
 ) -> tuple:
     """
     Evaluate model on test set.
-    
+
+    Single-task mode (multitask_gj=False):
+        Returns: (metrics, predictions_cm, targets_cm, None)
+        - metrics:        energy metrics dict
+        - predictions_cm: energy predictions in original units (cm⁻¹)
+        - targets_cm:     energy targets in original units (cm⁻¹)
+        - gj_results:     None
+
+    Multi-task mode (multitask_gj=True):
+        Returns: (metrics, predictions_cm, targets_cm, gj_results)
+        - gj_results: dict with keys
+            'gj_predicted' (N,), 'gj_observed' (N,), 'gj_mask' (N,), 'metrics' dict
+
     Args:
-        model: Trained neural network
+        model:       Trained neural network
         test_loader: DataLoader for test data
-        device: CPU or GPU
+        device:      CPU or GPU
         test_dataset: Test dataset (for inverse transform)
-    
-    Returns:
-        Tuple of (metrics, predictions, targets)
+        config:      Config object (needed to detect multitask_gj)
     """
-    # Set model to evaluation mode
+    # Set model to evaluation mode (disables dropout; batch norm uses running stats)
     model.eval()
-    
-    all_predictions = []
-    all_targets = []
-    
+
+    is_multitask = (config is not None) and config.training.get('multitask_gj', False)
+
+    all_predictions = []    # energy predictions
+    all_targets     = []    # energy targets
+    all_gj_preds    = []    # gJ predictions  (multitask only)
+    all_gj_targets  = []    # gJ true values  (multitask only)
+    all_gj_masks    = []    # gJ mask         (multitask only)
+
     print("Evaluating on test set...")
-    
+
     # No gradient computation needed for evaluation
     with torch.no_grad():
-        for features, targets in test_loader:
-            features = features.to(device)
-            targets = targets.to(device)
-            
-            # Get predictions
-            predictions = model(features)
-            
-            # Store results
-            all_predictions.append(predictions.cpu().numpy())
-            all_targets.append(targets.cpu().numpy())
-    
+        for batch in test_loader:
+            if is_multitask:
+                features, targets_energy, targets_gj, gj_mask = batch
+                features       = features.to(device)
+                targets_energy = targets_energy.to(device)
+
+                pred_energy, pred_gj = model(features)
+
+                all_predictions.append(pred_energy.cpu().numpy())
+                all_targets.append(targets_energy.cpu().numpy())
+                all_gj_preds.append(pred_gj.cpu().numpy())
+                all_gj_targets.append(targets_gj.numpy())
+                all_gj_masks.append(gj_mask.numpy())
+
+            else:
+                features, targets = batch
+                features = features.to(device)
+                targets  = targets.to(device)
+
+                predictions = model(features)
+                all_predictions.append(predictions.cpu().numpy())
+                all_targets.append(targets.cpu().numpy())
+
     # Combine all batches
     predictions = np.concatenate(all_predictions)
-    targets = np.concatenate(all_targets)
-    
-    # Convert back to original scale (cm⁻¹)
-    # The model was trained on normalized data, so we need to denormalize
+    targets     = np.concatenate(all_targets)
+
+    # Convert energy predictions back to original scale (undo scaler + any target transform)
     predictions_cm = test_dataset.inverse_transform_target(predictions)
-    targets_cm = test_dataset.inverse_transform_target(targets)
-    
-    # Compute metrics on original scale
+    targets_cm     = test_dataset.inverse_transform_target(targets)
+
+    # Compute energy metrics
     metrics = compute_metrics(predictions_cm, targets_cm)
-    
-    return metrics, predictions_cm, targets_cm
+
+    # Build gJ results dict (multitask only)
+    gj_results = None
+    if is_multitask and all_gj_preds:
+        gj_pred_all   = np.concatenate(all_gj_preds).flatten()    # (N,)
+        gj_target_all = np.concatenate(all_gj_targets).flatten()   # (N,)
+        gj_mask_all   = np.concatenate(all_gj_masks).flatten()     # (N,)
+
+        # gJ is not normalised — inverse_transform_gj is identity, called for API symmetry
+        gj_pred_all = test_dataset.inverse_transform_gj(gj_pred_all)
+
+        observed = gj_mask_all == 1.0
+        n_observed = int(observed.sum())
+
+        if n_observed > 0:
+            # Compute gJ metrics on observed rows only
+            gj_metrics = compute_metrics(
+                gj_pred_all[observed].reshape(-1, 1),
+                gj_target_all[observed].reshape(-1, 1)
+            )
+        else:
+            gj_metrics = {}
+
+        gj_results = {
+            'gj_predicted': gj_pred_all,
+            'gj_observed':  gj_target_all,
+            'gj_mask':      gj_mask_all,
+            'metrics':      gj_metrics,
+            'n_observed':   n_observed,
+        }
+
+    return metrics, predictions_cm, targets_cm, gj_results
 
 
 def save_predictions(
@@ -237,6 +294,7 @@ def save_predictions_excel(
     targets: np.ndarray,
     test_dataset: AtomicDataset,
     config,
+    gj_results=None,
 ):
     """
     Append a prediction column for the current run to results/predictions_{element}.xlsx.
@@ -278,6 +336,13 @@ def save_predictions_excel(
 
     run_df["True_Energy_cm-1"] = targets.flatten()
     run_df[pred_col] = predictions.flatten()
+
+    # Append gJ columns when running in multi-task mode
+    if gj_results is not None:
+        run_df["gj_predicted"] = gj_results["gj_predicted"]
+        run_df["gj_observed"]  = gj_results["gj_observed"]
+        run_df["gj_mask"]      = gj_results["gj_mask"].astype(int)  # 1=observed, 0=missing
+
     run_df = run_df.sort_values("True_Energy_cm-1", ascending=True).reset_index(drop=True)
 
     # --- Merge with existing file or create fresh ---
@@ -310,12 +375,14 @@ def save_predictions_excel(
         print(f"Warning: could not write Excel ({exc}). Saved to {fallback} instead.")
 
 
-def print_metrics(metrics: Dict[str, float]):
+def print_metrics(metrics: Dict[str, float], gj_results=None):
     """
     Print evaluation metrics in a formatted way.
-    
+
     Args:
-        metrics: Dictionary of metric names and values
+        metrics:    Energy metrics dict (from compute_metrics)
+        gj_results: Optional dict returned by test_model in multi-task mode.
+                    When provided, a second gJ section is printed below the energy section.
     """
     print("\n" + "="*60)
     print("TEST SET PERFORMANCE")
@@ -328,6 +395,19 @@ def print_metrics(metrics: Dict[str, float]):
     print(f"Mean Absolute % Error (MAPE):    {metrics['mape']:>12.2f}%")
     print(f"Maximum Error:                   {metrics['max_error']:>12.2f} cm⁻¹")
     print("="*60 + "\n")
+
+    # gJ section — only printed in multi-task mode
+    if gj_results is not None and gj_results.get('metrics'):
+        gj_m = gj_results['metrics']
+        n_obs = gj_results.get('n_observed', '?')
+        print("GJ PREDICTION PERFORMANCE (observed rows only: N={})".format(n_obs))
+        print("="*60)
+        print(f"Mean Absolute Error (MAE):          {gj_m.get('mae', float('nan')):>10.4f}")
+        print(f"Root Mean Squared Error (RMSE):     {gj_m.get('rmse', float('nan')):>10.4f}")
+        print(f"R² Score:                           {gj_m.get('r2', float('nan')):>10.4f}")
+        print()
+        print("  Note: gJ values are dimensionless (typical range -1 to 4 for Co I)")
+        print("="*60 + "\n")
 
 
 def test_one_run(
@@ -401,8 +481,9 @@ def test_one_run(
     # After this, predictions_cm and targets_cm are in the actual target space:
     #   - binding energy (cm⁻¹)  if use_binding_energy=True
     #   - absolute E_level (cm⁻¹) otherwise
-    metrics, predictions_cm, targets_cm = test_model(
-        model, test_loader, device, test_dataset
+    # gj_results is None in single-task mode; a dict in multi-task mode.
+    metrics, predictions_cm, targets_cm, gj_results = test_model(
+        model, test_loader, device, test_dataset, config
     )
 
     # If trained on binding energies, convert predictions back to absolute energy levels
@@ -443,8 +524,8 @@ def test_one_run(
         targets_cm = abs_targets
         metrics = compute_metrics(predictions_cm, targets_cm)
 
-    # Print results
-    print_metrics(metrics)
+    # Print results — gJ section shown automatically when gj_results is not None
+    print_metrics(metrics, gj_results=gj_results)
 
     features_config = {
         "n_features": test_dataset.get_input_dim(),
@@ -461,7 +542,9 @@ def test_one_run(
     )
 
     # Save predictions (appended as a new column to the shared Excel file)
-    save_predictions_excel(predictions_cm, targets_cm, test_dataset, config)
+    # gj_results is forwarded so gJ columns are added when running in multi-task mode
+    save_predictions_excel(predictions_cm, targets_cm, test_dataset, config,
+                           gj_results=gj_results)
     
     return metrics
 
