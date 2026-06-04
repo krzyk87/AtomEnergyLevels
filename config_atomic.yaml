@@ -110,13 +110,14 @@ training:
 
   # Multi-task learning: predict energy AND experimental Landé g-factor simultaneously
   multitask_gj: true          # Enable multi-task learning (energy + gJ outputs)
-  multitask_alpha: 0.98         # Weight for energy loss; (1 - alpha) goes to gJ loss
+  multitask_alpha: 0.9         # Weight for energy loss; (1 - alpha) goes to gJ loss
   gj_criterion: MSE            # Loss function for the gJ head: MSE / MAE / Huber
   lr_scheduler: None  # LR scheduler: ReduceLROnPlateau / StepLR / None
   lr_scheduler_params:
     factor: 0.5                 # Multiply LR by this factor when reducing
     patience: 100                # Epochs to wait before reducing LR
     min_lr: 0.00001             # Minimum learning rate
+  debug_multitask: true
 
 permutation_importance:
   n_repeats: 30
