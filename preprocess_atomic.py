@@ -136,6 +136,7 @@ def load_preprocessing_config(config_path):
         'ionization_energy': 63564.0,
         'max_valence': 9,
         'zeta_3d': 515.0,
+        'inverse_target_scale': 100000.0,  # A in Inverse_Binding_Energy = A / binding
     }
     for key, val in defaults.items():
         pp.setdefault(key, val)
@@ -397,6 +398,13 @@ def compute_row_features(row, cfg):
     feat['lande_so_term'] = lande_so_term if pd.notna(lande_so_term) else 0.0
 
     # --- TASK 3b: theoretical Landé g-factor (LS coupling) --------------
+    # WARNING: lande_g_theoretical uses the pure LS-coupling Landé formula.
+    # For alkali atoms (single valence electron, pure LS coupling) this is accurate.
+    # For iron-group atoms (Co, Fe, Ni) with strong configuration mixing and
+    # intermediate coupling, this formula gives values far from experiment.
+    # DO NOT use as a model input feature for transition metal atoms.
+    # Magda's calc_gJ (from Cowan code diagonalization) is the correct theoretical value,
+    # but it is semi-empirical and must not be used as a training feature either
     if J == 0:
         lande_g_theo = 0.0                          # formula undefined; g_J ≡ 0
         has_lande = 1 if feat['term_known'] else 0
@@ -471,6 +479,45 @@ def compute_row_features(row, cfg):
 # Output column ordering (TASK 6)
 # ===========================================================================
 
+def add_element_targets_and_rydberg(df, cfg):
+    """
+    Add the element label, pre-computed energy-target transforms, and Rydberg
+    placeholder columns to the features DataFrame (in place).
+
+    These columns let AtomicDataset.py select a target purely by name and toggle
+    feature groups without recomputing anything:
+
+      Element                      element symbol (needed for stratified splits
+                                   and multi-element merging downstream).
+      Binding_Energy_cm-1          E_ion - OBS.LEVEL, clipped at 0 (continuum).
+      Log_Binding_Energy_cm-1      log(binding); NaN where binding <= 0.
+      Inverse_Binding_Energy_cm-1  A / binding; NaN where binding <= 0.
+      n_star, rydberg_prediction, one_over_nstar_sq
+                                   Rydberg series features. These are meaningful
+                                   only for single-valence-electron (alkali) atoms;
+                                   for transition metals such as Co they are 0.0.
+    """
+    E_ion = float(cfg['ionization_energy'])          # ionization energy (cm^-1)
+    scale = float(cfg['inverse_target_scale'])       # A in A / binding
+
+    df['Element'] = cfg['element']                    # constant for a single-element file
+
+    # Binding energy = how far below the ionization limit the level sits.
+    binding = (E_ion - df['OBS.LEVEL']).clip(lower=0.0)
+    df['Binding_Energy_cm-1'] = binding
+
+    # Log / inverse transforms are undefined at binding == 0 (continuum) → NaN.
+    positive = binding.where(binding > 0)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        df['Log_Binding_Energy_cm-1'] = np.log(positive)
+        df['Inverse_Binding_Energy_cm-1'] = scale / positive
+
+    # Rydberg features are not applicable to transition metals → zeros.
+    df['n_star'] = 0.0
+    df['rydberg_prediction'] = 0.0
+    df['one_over_nstar_sq'] = 0.0
+
+
 def build_column_order(max_valence):
     """Return the explicit output column order described in TASK 6."""
     valence_cols = []
@@ -479,9 +526,10 @@ def build_column_order(max_valence):
 
     return (
         # Identifiers (not model inputs)
-        ['Configuration_raw', 'Term_raw', 'J', 'parity_flag', 'Reference']
-        # Raw energy (target + Cowan baseline)
-        + ['OBS.LEVEL', 'EIGENVALUE', 'delta_e_theory']
+        ['Configuration_raw', 'Term_raw', 'J', 'parity_flag', 'Reference', 'Element']
+        # Raw energy (target + Cowan baseline) + pre-computed target transforms
+        + ['OBS.LEVEL', 'EIGENVALUE', 'delta_e_theory',
+           'Binding_Energy_cm-1', 'Log_Binding_Energy_cm-1', 'Inverse_Binding_Energy_cm-1']
         # Experimental gJ (multi-task target)
         + ['obs_gj', 'has_obs_gj']
         # Theoretical gJ (input feature)
@@ -505,6 +553,8 @@ def build_column_order(max_valence):
         + valence_cols
         # Valence summary
         + ['valence_electrons', 'total_electrons', 'core_electrons', 'max_principal_n']
+        # Rydberg features (zeros for transition metals; populated for alkalis)
+        + ['n_star', 'rydberg_prediction', 'one_over_nstar_sq']
         # Orbital occupancies (raw)
         + ORBITAL_COLUMNS
         # Atomic constants
@@ -516,8 +566,9 @@ def build_column_order(max_valence):
 # Summary sheet (TASK 6, sheet 2)
 # ===========================================================================
 
-# The five leading identifier columns are excluded from the numeric summary.
-IDENTIFIER_COLUMNS = ['Configuration_raw', 'Term_raw', 'J', 'parity_flag', 'Reference']
+# Leading identifier columns are excluded from the numeric summary.
+IDENTIFIER_COLUMNS = ['Configuration_raw', 'Term_raw', 'J', 'parity_flag',
+                      'Reference', 'Element']
 
 
 def build_summary_df(df):
@@ -746,6 +797,9 @@ def main():
         records.append(compute_row_features(row, cfg))
 
     features_df = pd.DataFrame.from_records(records)
+
+    # Add element label + pre-computed target transforms + Rydberg placeholders.
+    add_element_targets_and_rydberg(features_df, cfg)
 
     # Enforce the TASK 6 column order (any unexpected columns appended at end).
     column_order = build_column_order(max_valence)
