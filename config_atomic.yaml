@@ -122,7 +122,7 @@ training:
     factor: 0.5                 # Multiply LR by this factor when reducing
     patience: 100                # Epochs to wait before reducing LR
     min_lr: 0.00001             # Minimum learning rate
-  debug_multitask: true
+  debug_multitask: false
 
 permutation_importance:
   n_repeats: 30

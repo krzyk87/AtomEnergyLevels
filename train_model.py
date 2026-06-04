@@ -50,88 +50,137 @@ class MultiTaskLoss(nn.Module):
         that explain BOTH observables, acting as an auxiliary regulariser for the
         primary energy task.
 
-    The total loss is a weighted sum:
-        L_total = α · L_energy + (1 − α) · L_gJ_masked
+    Gradient-balance design:
+        The two losses can be on wildly different scales:
+          - unnormalised energy:   L_energy  ≈ 44 000  (SmoothL1, linear region)
+          - raw gJ:                L_gJ      ≈ 0.5 – 4  (MSE)
 
-    where L_gJ_masked is averaged ONLY over rows where experimental gJ is available
-    (mask == 1.0).  If no observed gJ rows exist in a batch, the gJ term is 0.0
-    (the energy loss alone drives that batch's gradient).
+        Naively writing  total = alpha*L_energy + (1-alpha)*L_gJ  does NOT give
+        alpha-fraction of gradient from energy, because the gradient magnitudes
+        are proportional to the loss values, not to alpha.
 
-    Recommended α: 0.85 – 0.95.  Setting α = 1.0 exactly reproduces the single-task
-    energy loss, which is useful for sanity checks.
+        The fix is to pre-scale gJ at criterion-creation time so that both raw
+        losses start at approximately the same magnitude:
+
+            gj_loss_multiplier = initial_energy_scale / initial_gJ_scale
+
+        Then the combined loss is:
+
+            total = alpha * L_energy + (1-alpha) * (L_gJ × multiplier)
+
+        After this, alpha truly controls the gradient fraction:
+            ∂total/∂θ_energy  ∝  alpha × ∂L_energy/∂θ
+            ∂total/∂θ_gJ      ∝  (1-alpha) × multiplier × ∂L_gJ/∂θ
+
+        and both terms are of comparable magnitude.
+
+        Note: dividing losses by a running scale (as in some multi-task papers)
+        does NOT work when SmoothL1 is in its linear region, because the gradient
+        of L_energy w.r.t. θ_energy is ∝ 1 (constant), so dividing L_energy by
+        its running scale s_e gives ∂(L_e/s_e)/∂θ_e ∝ 1/s_e — too small when
+        s_e is large.  The multiplier approach avoids this by never dividing.
 
     Args:
-        alpha:             Weight for energy task (0.0 – 1.0).  Default 0.9.
-        energy_criterion:  Loss type for energy head ('MSE', 'MAE', 'Huber', 'SmoothL1').
-        gj_criterion:      Loss type for gJ head   ('MSE', 'MAE', 'Huber').
+        alpha:                 Weight for energy task (0.0 – 1.0).  Default 0.9.
+        energy_criterion:      Loss type for energy head ('MSE', 'MAE', 'Huber', 'SmoothL1').
+        gj_criterion:          Loss type for gJ head   ('MSE', 'MAE', 'Huber').
+        ema_decay:             EMA decay for monitoring buffers (not used in loss computation).
+        initial_energy_scale:  Initial value for the energy EMA buffer (monitoring only).
+        initial_gj_scale:      Initial value for the gJ EMA buffer (monitoring only).
+        gj_loss_multiplier:    Pre-scale factor applied to gJ loss before combining.
+                               Computed as initial_energy_scale / initial_gJ_scale at
+                               training start so both terms start at similar magnitude.
     """
 
     def __init__(self, alpha: float = 0.9,
                  energy_criterion: str = 'MSE',
                  gj_criterion: str = 'MSE',
                  ema_decay: float = 0.95,
-                 initial_energy_scale=1.0, initial_gj_scale=1.0):
+                 initial_energy_scale: float = 1.0,
+                 initial_gj_scale: float = 1.0,
+                 gj_loss_multiplier: float = 1.0):
         super(MultiTaskLoss, self).__init__()
         self.alpha = alpha
-        self.ema_decay = ema_decay  # e.g. 0.99
-        self.register_buffer('energy_loss_scale', torch.tensor(float(initial_energy_scale)))
-        self.register_buffer('gj_loss_scale', torch.tensor(float(initial_gj_scale)))
+        self.ema_decay = ema_decay
+        # gj_loss_multiplier: fixed at training start, brings gJ loss to energy magnitude.
+        # After scaling: (1-alpha)*L_gJ_scaled and alpha*L_energy are comparable, so
+        # alpha correctly controls the gradient fraction for each task.
+        self.gj_loss_multiplier = gj_loss_multiplier
 
-        # Energy loss: standard mean reduction (used as a scalar in L_total)
+        # EMA buffers for monitoring — track scaled losses so we can print
+        # gJ_scale_ratio = gj_loss_scale / energy_loss_scale each epoch.
+        # They do NOT enter the backward pass; the multiplier is the only balancing term.
+        self.register_buffer('energy_loss_scale', torch.tensor(float(initial_energy_scale)))
+        self.register_buffer('gj_loss_scale',     torch.tensor(float(initial_gj_scale * gj_loss_multiplier)))
+
+        # Energy loss: mean over batch (no masking — all rows have energy labels)
         self.energy_criterion = create_loss_function(energy_criterion, reduction='mean')
 
-        # gJ loss needs element-wise values so we can zero-out unobserved rows
-        # before averaging → instantiate with reduction='none'
+        # gJ loss: element-wise so we can zero out unobserved rows before averaging
         self.gj_criterion_none = create_loss_function(gj_criterion, reduction='none')
 
     def forward(
         self,
-        energy_pred:   torch.Tensor,   # shape (B, 1), normalised energy prediction
-        energy_target: torch.Tensor,   # shape (B, 1), normalised energy target
-        gj_pred:       torch.Tensor,   # shape (B, 1), raw gJ prediction
-        gj_target:     torch.Tensor,   # shape (B, 1), raw experimental gJ (0 where missing)
-        gj_mask:       torch.Tensor,   # shape (B, 1), float32: 1.0=observed, 0.0=missing
+        energy_pred:   torch.Tensor,   # (B, 1)  normalised energy prediction
+        energy_target: torch.Tensor,   # (B, 1)  normalised energy target
+        gj_pred:       torch.Tensor,   # (B, 1)  raw gJ prediction
+        gj_target:     torch.Tensor,   # (B, 1)  raw experimental gJ (0.0 where unobserved)
+        gj_mask:       torch.Tensor,   # (B, 1)  float32: 1.0=observed, 0.0=missing
     ):
         """
-        Compute combined multi-task loss.
+        Compute the combined multi-task loss using pre-scaled gJ term.
+
+        The gj_loss_multiplier (= initial_energy_scale / initial_gj_scale) was fixed
+        at criterion-creation time to bring the gJ loss to the same order of magnitude
+        as the energy loss.  This makes alpha behave as advertised — the fraction of
+        gradient from the energy task — regardless of whether target normalisation is
+        enabled and regardless of the raw loss scales.
+
+        Crucially, neither loss is divided by any running scale.  Raw gradients flow
+        through backward() at their natural magnitude; only the mixing ratio changes.
 
         Returns:
             total_loss  — scalar tensor, used for backward()
-            energy_loss — Python float, for epoch-level logging
-            gj_loss     — Python float, 0.0 if no observed gJ in this batch
+            energy_loss — Python float (raw, unscaled), for logging in physical units
+            gj_loss     — Python float (raw, unscaled), for logging in physical units
         """
-        # Energy loss: standard mean over all batch rows (no masking needed)
+        # --- Energy loss: mean over all batch rows (no masking needed) ---
         energy_loss = self.energy_criterion(energy_pred, energy_target)
 
-        # gJ loss: element-wise, then mask out rows without observed gJ
+        # --- gJ loss: masked mean over rows where experimental gJ is available ---
         gj_elementwise = self.gj_criterion_none(gj_pred, gj_target)   # shape (B, 1)
         mask_sum = gj_mask.sum()
         if mask_sum > 0:
-            # Average only over rows where experimental gJ is known
+            # Only rows with observed gJ contribute — avoids bias from missing labels
             gj_loss = (gj_elementwise * gj_mask).sum() / mask_sum
         else:
-            # Entire batch has no observed gJ — gJ term contributes nothing
+            # Entire batch has no observed gJ; gJ term is silenced this step
             gj_loss = torch.tensor(0.0, device=energy_pred.device)
 
-        # --- Update running scale estimates (EMA, detached from graph) ---
-        # Only update during training (when losses have gradients)
+        # --- Pre-scale gJ loss to match energy magnitude ---
+        # multiplier is a fixed scalar set at training start — does not change per step.
+        # Scaling happens BEFORE combining with energy_loss, so both terms contribute
+        # gradients of comparable magnitude to the trunk.
+        gj_loss_scaled = gj_loss * self.gj_loss_multiplier
+
+        # --- EMA monitoring (detached — does NOT affect backward pass) ---
+        # Tracks running average of each scaled term so we can print gJ_scale_ratio.
+        # gJ_scale_ratio = gj_loss_scale / energy_loss_scale should stay near 1.0
+        # throughout training if the multiplier is calibrated correctly.
         if self.training:
             with torch.no_grad():
-                # self.energy_loss_scale = (self.ema_decay * self.energy_loss_scale + (1 - self.ema_decay) * energy_loss.detach())
-                self.energy_loss_scale.mul_(self.ema_decay).add_((1 - self.ema_decay) * energy_loss.detach())
+                self.energy_loss_scale.mul_(self.ema_decay).add_(
+                    (1.0 - self.ema_decay) * energy_loss.detach())
                 if mask_sum > 0:
-                    # self.gj_loss_scale = (self.ema_decay * self.gj_loss_scale + (1 - self.ema_decay) * gj_loss.detach())
-                    self.gj_loss_scale.mul_(self.ema_decay).add_((1.0 - self.ema_decay) * gj_loss.detach())
+                    self.gj_loss_scale.mul_(self.ema_decay).add_(
+                        (1.0 - self.ema_decay) * gj_loss_scaled.detach())
 
-        # Normalize each loss by its running scale before weighting
-        # Dividing by the running scale makes both losses dimensionless (~1.0)
-        # so alpha truly controls the task balance, not the loss magnitude ratio
-        energy_loss_normalized = energy_loss / self.energy_loss_scale
-        gj_loss_normalized = gj_loss / self.gj_loss_scale
+        # --- Combine with alpha weighting ---
+        # After pre-scaling, energy_loss ≈ gj_loss_scaled ≈ O(1), so alpha is meaningful:
+        #   alpha=0.9 → 90% of gradient from energy, 10% from gJ (approximately)
+        total_loss = self.alpha * energy_loss + (1.0 - self.alpha) * gj_loss_scaled
 
-        total_loss = self.alpha * energy_loss_normalized + (1.0 - self.alpha) * gj_loss_normalized
-
-        # Return scalar tensor for backward() plus float values for logging
+        # Return raw (unscaled) gJ loss for logging in physical units
         return total_loss, energy_loss.item(), gj_loss.item()
 
 
@@ -536,20 +585,24 @@ def debug_multitask_setup(model, train_loader, criterion_train, optimizer, devic
         print("    self.energy_loss_scale.mul_(self.ema_decay).add_((1-self.ema_decay)*energy_loss.detach())")
 
     # ------------------------------------------------------------------ #
-    # [4] Raw loss values                                                  #
+    # [4] Raw loss values and scaled gJ loss                              #
     # ------------------------------------------------------------------ #
-    print("\n[4] Raw loss values (before normalisation)")
+    print("\n[4] Raw loss values and multiplier scaling")
     # Need gradients for backward check in [7]
     optimizer.zero_grad()
     pred_e2, pred_gj2 = model(features)
     total_loss, e_loss_val, gj_loss_val = criterion_train(
         pred_e2, targets_e, pred_gj2, targets_gj, gj_mask
     )
-    print(f"  energy_loss (raw)  : {e_loss_val:.4f}")
-    print(f"  gj_loss    (raw)   : {gj_loss_val:.6f}")
-    print(f"  total_loss (normed): {total_loss.item():.6f}")
-    print(f"  expected total     ≈ alpha*1.0 + (1-alpha)*1.0 = 1.0  "
-          f"{'✓ close' if abs(total_loss.item() - 1.0) < 0.5 else '⚠ far from 1.0 — scales may be wrong'}")
+    mult = getattr(criterion_train, 'gj_loss_multiplier', 1.0)
+    gj_loss_scaled_val = gj_loss_val * mult
+    ratio_to_energy = gj_loss_scaled_val / (e_loss_val + 1e-8)
+    print(f"  energy_loss (raw)    : {e_loss_val:.4f}")
+    print(f"  gj_loss (raw)        : {gj_loss_val:.6f}")
+    print(f"  gj_loss (scaled)     : {gj_loss_scaled_val:.4f}  (×multiplier={mult:.2f})")
+    print(f"  ratio scaled_gJ/energy (should be ≈1): {ratio_to_energy:.4f}  "
+          f"{'✓' if 0.1 <= ratio_to_energy <= 10 else '⚠ far from 1.0 — multiplier may be wrong'}")
+    print(f"  total_loss           : {total_loss.item():.6f}")
 
     # ------------------------------------------------------------------ #
     # [5] EMA update check                                                 #
@@ -567,26 +620,28 @@ def debug_multitask_setup(model, train_loader, criterion_train, optimizer, devic
     print(f"  EMA tracking gJ    : {g_updated}  {'✓' if g_updated else '⚠ scale unchanged or no observed gJ'}")
 
     # ------------------------------------------------------------------ #
-    # [6] Effective gradient split                                         #
+    # [6] Effective gradient contribution split                           #
     # ------------------------------------------------------------------ #
     print("\n[6] Effective gradient contribution split")
     alpha = criterion_train.alpha
-    e_norm = e_loss_val / (e_scale_after + 1e-8)
-    g_norm = gj_loss_val / (g_scale_after + 1e-8)
-    e_contrib = alpha * e_norm
-    g_contrib = (1 - alpha) * g_norm
+    mult  = getattr(criterion_train, 'gj_loss_multiplier', 1.0)
+    # With the multiplier formulation, contributions are:
+    #   energy: alpha × L_energy
+    #   gJ:     (1-alpha) × L_gJ × multiplier
+    e_contrib  = alpha * e_loss_val
+    g_contrib  = (1.0 - alpha) * gj_loss_val * mult
     total_contrib = e_contrib + g_contrib + 1e-12
-    print(f"  alpha={alpha:.3f}")
-    print(f"  energy_norm = {e_loss_val:.4f} / {e_scale_after:.4f} = {e_norm:.4f}  "
-          f"→ weighted: {e_contrib:.4f}  ({100*e_contrib/total_contrib:.1f}% of gradient)")
-    print(f"  gj_norm     = {gj_loss_val:.6f} / {g_scale_after:.6f} = {g_norm:.4f}  "
-          f"→ weighted: {g_contrib:.4f}  ({100*g_contrib/total_contrib:.1f}% of gradient)")
+    print(f"  alpha={alpha:.3f}   multiplier={mult:.2f}")
+    print(f"  energy contrib  = {alpha:.3f} × {e_loss_val:.4f}            = {e_contrib:.4f}  "
+          f"({100*e_contrib/total_contrib:.1f}% of total)")
+    print(f"  gJ contrib      = {1-alpha:.3f} × {gj_loss_val:.6f} × {mult:.2f} = {g_contrib:.4f}  "
+          f"({100*g_contrib/total_contrib:.1f}% of total)")
     if 100*g_contrib/total_contrib < 1.0:
         print(f"  ⚠ gJ share < 1% — gJ head is effectively receiving no gradient")
-        print(f"    Consider: lower alpha, or check that gj_loss_scale is not too large")
+        print(f"    Check: is gj_loss_multiplier correct?  multiplier={mult:.4f}")
     elif 100*e_contrib/total_contrib < 10.0:
         print(f"  ⚠ energy share < 10% — energy head may be starved")
-        print(f"    Consider: higher alpha, or check that energy_loss_scale is not too small")
+        print(f"    Consider: higher alpha or smaller gj_loss_multiplier")
     else:
         print(f"  ✓ Both heads receive meaningful gradient signal")
 
@@ -668,19 +723,21 @@ def debug_multitask_setup(model, train_loader, criterion_train, optimizer, devic
     with torch.no_grad():
         pred_e3, pred_gj3 = model(features)
 
-    # Use a fresh criterion instance (so EMA scale is at init values, for fair comparison)
+    # Use a fresh criterion instance (so EMA is at init values, for a fair before/after comparison).
+    # Pass the same gj_loss_multiplier so the total loss is computed identically.
     crit_check = criterion_train.__class__(
         alpha=alpha,
         energy_criterion=config.training.criterion,
         gj_criterion=config.training.get('gj_criterion', 'MSE'),
         initial_energy_scale=e_loss_val,
         initial_gj_scale=max(gj_loss_val, 1e-6),
+        gj_loss_multiplier=getattr(criterion_train, 'gj_loss_multiplier', 1.0),
     )
     crit_check.eval()
     with torch.no_grad():
         total3, e3, gj3 = crit_check(pred_e3, targets_e, pred_gj3, targets_gj, gj_mask)
 
-    print(f"  After : energy_loss={e3:.2f}  gj_loss={gj3:.6f}  total={total3.item():.6f}")
+    print(f"  After : energy_loss={e3:.4f}  gj_loss={gj3:.6f}  total={total3.item():.6f}")
     e_dec   = e3 < e_loss_val
     gj_dec  = gj3 < gj_loss_val or n_obs == 0
     tot_dec = total3.item() < total_loss.item()
@@ -736,12 +793,26 @@ def train_model(config, model, train_loader, val_loader, device, val_dataset):
         alpha   = config.training.get('multitask_alpha', 0.9)
         gj_crit = config.training.get('gj_criterion', 'MSE')
 
-        # Quick forward pass on the full training set to estimate initial loss scales
+        # ----------------------------------------------------------------
+        # Estimate initial loss scales with a forward pass on ≤10 batches.
+        #
+        # Why: the gj_loss_multiplier = initial_energy_scale / initial_gJ_scale
+        # pre-scales the gJ term so that both raw losses start at comparable
+        # magnitude.  This makes alpha correctly control the gradient fraction
+        # for each task regardless of whether target normalisation is on/off.
+        # ----------------------------------------------------------------
+        print(f"\nMulti-task mode: predicting energy (α={alpha:.2f}) + gJ (α={1 - alpha:.2f})")
+        print(f"  Energy criterion: {config.training.criterion} | gJ criterion: {gj_crit}")
+        print(f"  Estimating initial loss scales (10 training batches)...")
+
+        model.eval()   # eval mode so BN/dropout don't interfere with the scale estimate
         with torch.no_grad():
-            sample_e_losses = []
+            sample_e_losses  = []
             sample_gj_losses = []
-            temp_e_crit = create_loss_function(config.training.criterion, reduction='mean')
-            temp_gj_crit = create_loss_function(gj_crit, reduction='mean')
+            # Use criterion functions with the exact same reduction settings that
+            # MultiTaskLoss will use internally, so the numbers are comparable.
+            temp_e_crit  = create_loss_function(config.training.criterion, reduction='mean')
+            temp_gj_crit = create_loss_function(gj_crit, reduction='none')
 
             for i, batch in enumerate(train_loader):
                 features, targets_e, targets_gj, gj_mask = [b.to(device) for b in batch]
@@ -751,37 +822,59 @@ def train_model(config, model, train_loader, val_loader, device, val_dataset):
 
                 mask_sum = gj_mask.sum()
                 if mask_sum > 0:
-                    gj_el = temp_gj_crit.__class__(reduction='none')(pred_gj, targets_gj)
+                    # Masked mean — same as MultiTaskLoss.forward computes
+                    gj_el = temp_gj_crit(pred_gj, targets_gj)   # (B, 1)
                     sample_gj_losses.append(((gj_el * gj_mask).sum() / mask_sum).item())
 
                 if i >= 9:
                     break
-        initial_energy_scale = float(np.mean(sample_e_losses))
-        initial_gj_scale = float(np.mean(sample_gj_losses)) if sample_gj_losses else 0.5
 
-        print(f"  Initial loss scales — energy: {initial_energy_scale:.4f}, gJ: {initial_gj_scale:.4f}")
+        model.train()  # restore training mode before creating the real criteria
 
-        # One instance for training (used inside train_one_epoch)
-        criterion_train = MultiTaskLoss(
-            alpha=alpha,
-            energy_criterion=config.training.criterion,
-            gj_criterion=gj_crit,
-            initial_energy_scale=initial_energy_scale,
-            initial_gj_scale=initial_gj_scale,
+        initial_energy_scale = float(np.mean(sample_e_losses)) if sample_e_losses else 1.0
+        initial_gj_scale     = float(np.mean(sample_gj_losses)) if sample_gj_losses else 1.0
+
+        # The multiplier brings gJ loss to the same order of magnitude as energy loss.
+        # Dividing by scale is intentionally avoided here: raw gradients flow through
+        # backward() at their natural magnitude; only the mixing ratio is adjusted.
+        gj_loss_multiplier = initial_energy_scale / (initial_gj_scale + 1e-8)
+
+        print(f"  Initial scales — energy: {initial_energy_scale:.4f}, "
+              f"gJ: {initial_gj_scale:.4f}, "
+              f"gJ multiplier: {gj_loss_multiplier:.4f}")
+        print(f"  Scaled gJ loss at init ≈ {initial_gj_scale * gj_loss_multiplier:.4f}  "
+              f"(target: ≈ energy loss = {initial_energy_scale:.4f})")
+
+        # ---- Task 5 sanity assertion ----
+        # Verify the multiplier actually brought the losses to comparable scale.
+        # If this fires, initial_gj_scale was 0 or NaN — check the lande_g column.
+        assert 0.1 <= (initial_gj_scale * gj_loss_multiplier) / (initial_energy_scale + 1e-8) <= 10.0, (
+            f"gJ multiplier ({gj_loss_multiplier:.2f}) does not bring losses to comparable scale. "
+            f"energy_scale={initial_energy_scale:.4f}, "
+            f"gJ_scale×multiplier={initial_gj_scale * gj_loss_multiplier:.4f}  "
+            f"(ratio must be in [0.1, 10])"
         )
-        # Separate instance for validation (stateless, but kept distinct for clarity)
-        criterion_val = MultiTaskLoss(
-            alpha=alpha,
-            energy_criterion=config.training.criterion,
-            gj_criterion=gj_crit,
-            initial_energy_scale=initial_energy_scale,
-            initial_gj_scale=initial_gj_scale,
-        )
-        print(f"\nMulti-task mode: predicting energy (α={alpha:.2f}) + gJ (α={1 - alpha:.2f})")
-        print(f"  Energy criterion: {config.training.criterion} | gJ criterion: {gj_crit}")
+        print(f"  ✓ Loss scales balanced: energy={initial_energy_scale:.4f}, "
+              f"gJ×mult={initial_gj_scale * gj_loss_multiplier:.4f}")
+
+        def _make_multitask_criterion():
+            """Helper to create a fresh MultiTaskLoss with the calibrated multiplier."""
+            return MultiTaskLoss(
+                alpha=alpha,
+                energy_criterion=config.training.criterion,
+                gj_criterion=gj_crit,
+                ema_decay=0.95,
+                initial_energy_scale=initial_energy_scale,
+                initial_gj_scale=initial_gj_scale,
+                gj_loss_multiplier=gj_loss_multiplier,
+            )
+
+        criterion_train = _make_multitask_criterion()
+        criterion_val   = _make_multitask_criterion()  # separate instance, identical config
     else:
         criterion_train = create_loss_function(config.training.criterion, reduction='none')
         criterion_val   = create_loss_function(config.training.criterion, reduction='mean')
+        gj_loss_multiplier = 1.0   # unused in single-task, defined for scope safety
     
     # Create optimizer
     # Optimizer adjusts model weights to minimize loss
@@ -829,19 +922,11 @@ def train_model(config, model, train_loader, val_loader, device, val_dataset):
         initial_energy_scale = float(np.mean(sample_e))
         initial_gj_scale = float(np.mean(sample_gj)) if sample_gj else 3.6
 
-        criterion_train = MultiTaskLoss(
-            alpha=alpha, energy_criterion=config.training.criterion,
-            gj_criterion=gj_crit,
-            initial_energy_scale=initial_energy_scale,
-            initial_gj_scale=initial_gj_scale,
-        )
-        criterion_val = MultiTaskLoss(
-            alpha=alpha, energy_criterion=config.training.criterion,
-            gj_criterion=gj_crit,
-            initial_energy_scale=initial_energy_scale,
-            initial_gj_scale=initial_gj_scale,
-        )
-        print(f"  Re-estimated scales after debug — energy: {initial_energy_scale:.4f}, gJ: {initial_gj_scale:.4f}")
+        gj_loss_multiplier = initial_energy_scale / (initial_gj_scale + 1e-8)
+        criterion_train = _make_multitask_criterion()
+        criterion_val   = _make_multitask_criterion()
+        print(f"  Re-estimated after debug — energy: {initial_energy_scale:.4f}, "
+              f"gJ: {initial_gj_scale:.4f}, multiplier: {gj_loss_multiplier:.4f}")
     # Learning rate scheduler (optional)
     # Reduces learning rate when validation loss stops improving
     # This helps fine-tune the model in later epochs
@@ -906,9 +991,19 @@ def train_model(config, model, train_loader, val_loader, device, val_dataset):
                 f"Val MAE: {val_mae:.2f} cm⁻¹ | "
                 f"Val RMSE: {val_rmse:.2f} cm⁻¹ | "
             )
-            # In multi-task mode append gJ MAE so we can monitor both tasks
-            if config.training.get('multitask_gj', False) and not np.isnan(val_mae_gj):
-                log_line += f"Val gJ MAE: {val_mae_gj:.4f} | "
+            # In multi-task mode append gJ MAE and scale-ratio health indicator
+            if config.training.get('multitask_gj', False):
+                if not np.isnan(val_mae_gj):
+                    log_line += f"Val gJ MAE: {val_mae_gj:.4f} | "
+                # gJ_scale_ratio = gj_loss_scale / energy_loss_scale
+                # Both EMA buffers track the scaled (multiplied) gJ loss and energy loss,
+                # so the ratio should stay near 1.0 throughout training when the
+                # multiplier is calibrated correctly.  Values far from [0.5, 2.0]
+                # signal that one task is drifting and may need alpha re-tuning.
+                e_ema = float(criterion_train.energy_loss_scale)
+                g_ema = float(criterion_train.gj_loss_scale)
+                scale_ratio = g_ema / (e_ema + 1e-8)
+                log_line += f"gJ_scale_ratio: {scale_ratio:.3f} | "
             log_line += f"Time: {format_time(epoch_time)}"
             print(log_line)
         
