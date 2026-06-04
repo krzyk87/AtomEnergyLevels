@@ -110,6 +110,11 @@ training:
 
   # Multi-task learning: predict energy AND experimental Landé g-factor simultaneously
   multitask_gj: true          # Enable multi-task learning (energy + gJ outputs)
+  gj_target_mode: 'residual'  # gJ prediction target:
+                               #   'raw'      → predict obs_gj directly
+                               #   'residual' → predict obs_minus_calc_gj (obs_gj − calc_gj)
+                               # Residual mode is preferred: the Cowan code already captures
+                               # most of the gJ variance, so the ML head learns a small correction.
   multitask_alpha: 0.9         # Weight for energy loss; (1 - alpha) goes to gJ loss
   gj_criterion: MSE            # Loss function for the gJ head: MSE / MAE / Huber
   lr_scheduler: None  # LR scheduler: ReduceLROnPlateau / StepLR / None

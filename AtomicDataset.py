@@ -281,6 +281,7 @@ class AtomicDataset(Dataset):
             'normalize_features': ds.normalize_features,
             'normalize_target': ds.normalize_target,
             'multitask_gj': self.config.training.get('multitask_gj', False),
+            'gj_target_mode': self.config.training.get('gj_target_mode', 'raw'),
             'drop_zero_variance_features': ds.get('drop_zero_variance_features', True),
         }
 
@@ -851,45 +852,79 @@ class AtomicDataset(Dataset):
 
     def _prepare_gj_target(self):
         """
-        Extract the experimental Landé g-factor as the second prediction target.
+        Extract the Landé g-factor auxiliary target for multi-task learning.
 
-        Physics: gJ is measured experimentally but is missing for many levels
-        (listed only when the term assignment is confident enough). We store the
-        raw (unnormalized) values and a boolean mask so the loss function can skip
-        unobserved rows — predicting on partial supervision.
+        Two modes, controlled by config.training.gj_target_mode:
 
-        gJ is NOT normalised: it is dimensionless with a small range (~−1 to 4 for
-        Co I) that does not benefit from StandardScaler standardisation the way that
-        energy (range ~60 000 cm⁻¹) does.
+        'raw' (default for backward compatibility):
+            Target = obs_gj (experimental gJ, NaN where unobserved).
+            The model predicts the absolute gJ value directly.
 
-        Reads pre-computed columns from the rich XLSX:
-            obs_gj      — experimental gJ (NaN where unobserved)
-            has_obs_gj  — 0/1 mask (1 = observed)
+        'residual' (preferred for Co I):
+            Target = obs_minus_calc_gj = obs_gj − calc_gj.
+            The Cowan code already captures the dominant LS-coupling variance in
+            gJ, so the ML head learns only the residual correction. This reduces
+            the effective prediction range from ~3 units to ~0.1 units, which
+            improves convergence and avoids the model wasting capacity on physics
+            already handled by the semi-empirical baseline.
+            self.calc_gj is stored so that inverse_transform_gj() can recover
+            the original obs_gj scale for evaluation.
+
+        In both modes:
+            gJ is NOT normalised — it is dimensionless with a small numeric range
+            (~−1 to 4 for Co I) that does not benefit from StandardScaler
+            normalisation.
+
+        Reads from the rich XLSX (preprocess_atomic.py output):
+            obs_gj           — experimental gJ (NaN where unobserved)
+            obs_minus_calc_gj — obs_gj − calc_gj (NaN where obs_gj is absent)
+            calc_gj          — Cowan-code gJ (always present)
+            has_obs_gj       — 0/1 mask (1 = observed)
 
         Stores:
-            self.y_gj    — np.float32, shape (N,), gJ values; 0.0 where unobserved
-            self.gj_mask — np.float32, shape (N,), 1.0 where experimental gJ exists
+            self.y_gj    — np.float32 (N,), target values; 0.0 where unobserved
+            self.gj_mask — np.float32 (N,), 1.0 where gJ is observed, else 0.0
+            self.calc_gj — np.float32 (N,) or None; Cowan baseline for 'residual'
+                           mode inverse transform; None in 'raw' mode
         """
-        if 'obs_gj' not in self.df.columns:
-            raise ValueError(
-                "multitask_gj=True requires an 'obs_gj' column in the rich feature "
-                "file. Ensure preprocess_atomic.py produced it."
-            )
+        gj_mode = self.config.training.get('gj_target_mode', 'raw')
 
-        # Raw gJ values for the current subset rows; NaN → 0.0 (mask handles them)
-        self.y_gj = self.df.loc[self.indices, 'obs_gj'].fillna(0.0).values.astype(np.float32)
+        if gj_mode == 'residual':
+            target_col = 'obs_minus_calc_gj'
+            if target_col not in self.df.columns:
+                raise ValueError(
+                    "gj_target_mode='residual' requires an 'obs_minus_calc_gj' column "
+                    "in the rich feature file. Ensure preprocess_atomic.py produced it."
+                )
+        else:
+            target_col = 'obs_gj'
+            if target_col not in self.df.columns:
+                raise ValueError(
+                    "multitask_gj=True requires an 'obs_gj' column in the rich feature "
+                    "file. Ensure preprocess_atomic.py produced it."
+                )
 
-        # Mask: pre-computed has_obs_gj column (1.0 = observed, 0.0 = missing)
+        # Target values for current subset; NaN → 0.0 (mask excludes these rows from loss)
+        self.y_gj = self.df.loc[self.indices, target_col].fillna(0.0).values.astype(np.float32)
+
+        # Mask: has_obs_gj has the same NaN pattern as obs_gj in both modes
         if 'has_obs_gj' in self.df.columns:
             self.gj_mask = self.df.loc[self.indices, 'has_obs_gj'].values.astype(np.float32)
         else:
-            # Fallback (should not happen with the rich xlsx): derive from NaN
+            # Fallback: derive from obs_gj NaN (source of truth for the mask)
             self.gj_mask = (~self.df.loc[self.indices, 'obs_gj'].isna()).values.astype(np.float32)
+
+        # Residual mode: cache calc_gj for this subset so inverse_transform_gj()
+        # can add it back and return predictions in the original obs_gj scale.
+        if gj_mode == 'residual' and 'calc_gj' in self.df.columns:
+            self.calc_gj = self.df.loc[self.indices, 'calc_gj'].values.astype(np.float32)
+        else:
+            self.calc_gj = None
 
         n_observed = int(self.gj_mask.sum())
         n_total = len(self.gj_mask)
-        print(f"  gJ target ({self.subset}): {n_observed} / {n_total} rows have observed gJ "
-              f"({100.0 * n_observed / n_total:.1f}%)")
+        print(f"  gJ target ({self.subset}, mode='{gj_mode}'): '{target_col}' — "
+              f"{n_observed} / {n_total} rows observed ({100.0 * n_observed / n_total:.1f}%)")
 
     def __len__(self) -> int:
         """Return the number of samples in this dataset."""
@@ -968,22 +1003,45 @@ class AtomicDataset(Dataset):
 
         return y
 
-    def inverse_transform_gj(self, y: np.ndarray) -> np.ndarray:
+    def inverse_transform_gj(self, y: np.ndarray,
+                              calc_gj: np.ndarray = None) -> np.ndarray:
         """
-        Identity transform for the gJ target — provided for API consistency.
+        Recover obs_gj predictions from model output.
 
-        Unlike the energy target, gJ is stored and predicted in raw (dimensionless)
-        units without any StandardScaler normalisation, so no inverse operation is
-        needed. This method exists so that calling code can treat both outputs
-        symmetrically.
+        In 'raw' mode (gj_target_mode='raw'):
+            The model predicts obs_gj directly — no inversion needed (identity).
+
+        In 'residual' mode (gj_target_mode='residual'):
+            The model predicts obs_minus_calc_gj = obs_gj − calc_gj, so
+            recovering obs_gj requires adding the Cowan baseline back:
+                obs_gj ≈ y_pred + calc_gj
 
         Args:
-            y: gJ predictions from the model, any shape
+            y:        Model gJ predictions, any shape (batch or full-subset array).
+            calc_gj:  Cowan-code baseline values, same shape as y.
+                      Required when gj_target_mode='residual'; ignored otherwise.
+                      If None in residual mode, self.calc_gj is used as a fallback
+                      (works when y covers the entire stored subset).
 
         Returns:
-            y unchanged
+            np.ndarray: obs_gj predictions in raw (dimensionless) units.
         """
-        return y
+        gj_mode = self.config.training.get('gj_target_mode', 'raw')
+        if gj_mode != 'residual':
+            return y
+
+        # Residual mode: add Cowan baseline back to recover the obs_gj scale
+        if calc_gj is not None:
+            return y + calc_gj
+
+        # Fallback: use the stored subset array (only valid for full-subset evaluation)
+        if self.calc_gj is not None:
+            return y + self.calc_gj
+
+        raise ValueError(
+            "inverse_transform_gj: gj_target_mode='residual' but no calc_gj was "
+            "provided and self.calc_gj is None. Pass calc_gj explicitly."
+        )
 
     def validate_term_symbol(self):
         """
