@@ -219,8 +219,8 @@ class MultiTaskAtomicModel(nn.Module):
 
         # Two independent output heads: each is a single linear projection from the
         # last hidden dimension.  No activation: regression outputs are unbounded.
-        self.energy_head = nn.Linear(hidden_dims[-1], 1)  # predicts normalised energy
-        self.gj_head     = nn.Linear(hidden_dims[-1], 1)  # predicts raw gJ
+        self.energy_head = nn.Linear(hidden_dims[-1], 1)  # predicts energy
+        self.gj_head     = nn.Linear(hidden_dims[-1], 1)  # predicts gJ
 
         # Kaiming weight initialisation across trunk and both heads
         self._init_weights()

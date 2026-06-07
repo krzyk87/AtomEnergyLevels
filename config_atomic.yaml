@@ -74,7 +74,7 @@ dataset:
   force_exclude_features: []     # Always remove these column names
 
   # Drop columns with zero variance in the TRAIN set (checked on train indices only)
-  drop_zero_variance_features: true
+  drop_zero_variance_features: false
 
   # === Data normalization ===
   normalize_features: true      # Standardize features (zero mean, unit variance)
