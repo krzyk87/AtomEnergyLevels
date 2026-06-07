@@ -163,54 +163,114 @@ _ORBITAL_RE = re.compile(r'(\d)([spdf])(\d+)?')
 # Config loading
 # ===========================================================================
 
-def load_preprocessing_config(config_path):
+# Per-element defaults, applied when a key is missing from an entry. They match
+# the Co I dataset so a minimal/legacy config still runs.
+_ELEMENT_DEFAULTS = {
+    'Z': 27,
+    'A': 59,
+    'ionization_energy': 63564.0,
+    'max_valence': 9,
+    'zeta_3d': 515.0,
+    'inverse_target_scale': 100000.0,  # A in Inverse_Binding_Energy = A / binding
+}
+
+
+def _normalize_element_cfg(entry, defaults, data_dir, source):
     """
-    Load the ``preprocessing`` section from the YAML config file.
+    Fill one element entry to the flat shape the rest of this module consumes.
 
-    Returns a plain dict with sensible defaults filled in so the script runs
-    even if some keys are missing.  We read YAML directly (rather than through
-    utils.load_config / OmegaConf) to keep this script dependency-light.
+    Accepts ``symbol`` (the per-element table in config_preprocess.yaml) or the
+    legacy ``element`` key. Returns a dict with: element, Z, A, ionization_energy,
+    max_valence, zeta_3d, inverse_target_scale, input_files, output_file,
+    dataset_source.
+    """
+    cfg = dict(_ELEMENT_DEFAULTS)
+    cfg.update(defaults or {})
+    cfg.update(entry or {})
 
-    The active dataset source (``nist`` / ``kurucz``) is taken from the
-    ``dataset.dataset_source`` config key so that this preprocessing step and the
-    training pipeline always agree on which raw data to use. Per-source raw input
-    files are read from ``preprocessing.input_files`` (a {source: path} mapping);
-    the legacy single ``preprocessing.input_file`` is kept as a fallback.
+    element = cfg.get('symbol') or cfg.get('element')
+    if not element:
+        raise ValueError(f"Element entry is missing a 'symbol'/'element' key: {entry!r}")
+    cfg['element'] = element
+
+    # Per-source raw input files (kurucz/nist). Fall back to the legacy single
+    # 'input_file' (treated as the kurucz input) when the mapping is absent.
+    input_files = dict(cfg.get('input_files') or {})
+    if cfg.get('input_file') and 'kurucz' not in input_files:
+        input_files['kurucz'] = cfg['input_file']
+    cfg['input_files'] = input_files
+
+    # Rich-feature output base path; the '_<source>' suffix is appended later by
+    # with_source_suffix() in process_element().
+    if not cfg.get('output_file'):
+        cfg['output_file'] = os.path.join(data_dir, f"{element}_features_rich.xlsx")
+
+    cfg['dataset_source'] = source
+    return cfg
+
+
+def load_preprocessing_configs(config_path, elements=None, source=None):
+    """
+    Load per-element preprocessing configs from a YAML file.
+
+    Two layouts are supported (read as raw YAML to stay dependency-light):
+
+      * NEW    — a top-level ``elements:`` list (config_preprocess.yaml). Each
+                 entry is a self-contained element table; top-level ``source`` /
+                 ``data_dir`` / ``defaults`` apply to every entry.
+      * LEGACY — a flat ``preprocessing:`` block plus ``dataset.dataset_source``
+                 (the old single-element config_atomic.yaml); wrapped as one entry.
+
+    Args:
+        config_path: path to the YAML file.
+        elements:    optional list of symbols to keep (default: all in the file).
+        source:      override the active raw source (nist/kurucz).
+
+    Returns:
+        list of flat per-element dicts (see _normalize_element_cfg).
     """
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
     with open(config_path, 'r', encoding='utf-8') as fh:
-        full_cfg = yaml.safe_load(fh)
+        full_cfg = yaml.safe_load(fh) or {}
 
-    pp = (full_cfg or {}).get('preprocessing', {}) or {}
-    ds = (full_cfg or {}).get('dataset', {}) or {}
+    entries_in = full_cfg.get('elements')
+    if isinstance(entries_in, list) and entries_in and all(isinstance(e, dict) for e in entries_in):
+        # NEW layout
+        defaults = full_cfg.get('defaults') or {}
+        data_dir = full_cfg.get('data_dir', 'data')
+        active_source = (source or full_cfg.get('source') or 'kurucz').lower()
+        entries = entries_in
+    else:
+        # LEGACY flat layout (preprocessing: + dataset.dataset_source)
+        pp = full_cfg.get('preprocessing') or {}
+        ds = full_cfg.get('dataset') or {}
+        defaults = {}
+        data_dir = ds.get('data_dir', 'data')
+        active_source = (source or ds.get('dataset_source') or 'kurucz').lower()
+        entries = [pp]
 
-    # Defaults match the Co I dataset described in the task.
-    defaults = {
-        'output_file': 'data/Co_features_rich.xlsx',  # base; source suffix appended
-        'element': 'Co',
-        'Z': 27,
-        'A': 59,
-        'ionization_energy': 63564.0,
-        'max_valence': 9,
-        'zeta_3d': 515.0,
-        'inverse_target_scale': 100000.0,  # A in Inverse_Binding_Energy = A / binding
-    }
-    for key, val in defaults.items():
-        pp.setdefault(key, val)
+    cfgs = [_normalize_element_cfg(e, defaults, data_dir, active_source) for e in entries]
 
-    # Per-source raw input files (kurucz/nist). Fall back to the legacy single
-    # 'input_file' (treated as the kurucz input) when the mapping is absent.
-    input_files = dict(pp.get('input_files') or {})
-    if 'input_file' in pp and 'kurucz' not in input_files:
-        input_files['kurucz'] = pp['input_file']
-    pp['input_files'] = input_files
+    if elements:
+        wanted = {e.lower() for e in elements}
+        found = {(c['element'] or '').lower() for c in cfgs}
+        missing = wanted - found
+        if missing:
+            raise ValueError(
+                f"Requested elements not found in {config_path}: {sorted(missing)}"
+            )
+        cfgs = [c for c in cfgs if (c['element'] or '').lower() in wanted]
 
-    # Active source comes from dataset.dataset_source (default: kurucz).
-    pp['dataset_source'] = (ds.get('dataset_source') or 'kurucz').lower()
+    if not cfgs:
+        raise ValueError(f"No element entries found in {config_path}")
+    return cfgs
 
-    return pp
+
+def load_preprocessing_config(config_path):
+    """Backward-compatible single-element loader (returns the first entry)."""
+    return load_preprocessing_configs(config_path)[0]
 
 
 # ===========================================================================
@@ -947,29 +1007,21 @@ def read_raw_input(input_file, source, cfg):
         raise ValueError(f"Unsupported input extension '{ext}' (expected .xlsx or .csv)")
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Build a rich atomic-feature XLSX from a raw level file."
-    )
-    parser.add_argument('--config', type=str, default='config_atomic.yaml',
-                        help="Path to the YAML config (default: config_atomic.yaml)")
-    parser.add_argument('--source', type=str, default=None, choices=list(SOURCE_SUFFIXES),
-                        help="Override dataset source (nist/kurucz). "
-                             "Default: dataset.dataset_source from the config.")
-    args = parser.parse_args()
+def process_element(cfg):
+    """
+    Run the full raw → rich feature pipeline for one normalized element config.
 
-    cfg = load_preprocessing_config(args.config)
-
-    # Active source: CLI override wins, else dataset.dataset_source from config.
-    source = (args.source or cfg['dataset_source']).lower()
+    Returns the path of the rich-feature XLSX written.
+    """
+    source = cfg['dataset_source']
 
     # Select the raw input file for this source (per-source mapping preferred).
     input_files = cfg.get('input_files') or {}
     input_file = input_files.get(source) or cfg.get('input_file')
     if not input_file:
         raise ValueError(
-            f"No raw input file configured for source '{source}'. "
-            f"Set preprocessing.input_files.{source} in {args.config}."
+            f"[{cfg['element']}] No raw input file configured for source '{source}'. "
+            f"Set input_files.{source} for this element."
         )
 
     # Output rich file carries the source suffix so nist/kurucz never collide.
@@ -977,7 +1029,7 @@ def main():
     max_valence = cfg['max_valence']
 
     print("=" * 60)
-    print("ATOMIC FEATURE PREPROCESSING")
+    print(f"ATOMIC FEATURE PREPROCESSING - {cfg['element']}")
     print("=" * 60)
     print(f"Dataset source : {source}")
     print(f"Element        : {cfg['element']}  (Z={cfg['Z']}, A={cfg['A']})")
@@ -1021,6 +1073,34 @@ def main():
 
     print(f"\nOutput written to: {output_file} "
           f"({len(features_df)} rows, {len(features_df.columns)} columns)")
+    return output_file
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Build rich atomic-feature XLSX file(s) from raw level data."
+    )
+    parser.add_argument('--config', type=str, default='config_preprocess.yaml',
+                        help="Path to the YAML config (default: config_preprocess.yaml)")
+    parser.add_argument('--elements', nargs='+', default=None,
+                        help="Subset of element symbols to process (default: all in the config).")
+    parser.add_argument('--source', type=str, default=None, choices=list(SOURCE_SUFFIXES),
+                        help="Override dataset source (nist/kurucz). Default: top-level "
+                             "'source' (or dataset.dataset_source) from the config.")
+    args = parser.parse_args()
+
+    cfgs = load_preprocessing_configs(args.config, elements=args.elements, source=args.source)
+
+    print(f"Processing {len(cfgs)} element(s): {[c['element'] for c in cfgs]}\n")
+    outputs = []
+    for cfg in cfgs:
+        outputs.append(process_element(cfg))
+        print()
+
+    print("=" * 60)
+    print(f"DONE - wrote {len(outputs)} file(s):")
+    for o in outputs:
+        print(f"  {o}")
 
 
 if __name__ == '__main__':

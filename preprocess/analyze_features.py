@@ -1,101 +1,230 @@
 """
-analyze_features.py
+analyze_features.py — unified feature analysis for the atomic energy-level project.
 
-Standalone feature analysis script for the atomic energy level ML project.
-Reads element CSV files directly (does not require AtomicDataset), applies
-the same preprocessing logic, and produces a PDF of diagnostic plots.
+Combines the two previous analysis scripts into one tool that runs for any element
+or group of elements and produces a shareable report in three formats (PDF, XLSX,
+HTML).
 
-Usage:
-    python analyze_features.py --elements K
-    python analyze_features.py --elements K Na Li --data-dir data
-    python analyze_features.py --elements K Na --out reports/features_KNa.pdf
+Two analysis modes:
 
-Plots produced:
-    1.  Feature distributions — histogram per feature, coloured by element
-    2.  Correlation matrix — catches redundancies (e.g. L_qn vs val_e1_l)
-    3.  Mutual information ranking — 2×2 subplots for log_binding_energy,
-        raw_energy (Level cm-1), binding_energy, inverse_binding_energy
-    4.  Feature vs log-binding-energy scatter — reveals Rydberg structure
-    4b. Feature vs raw-energy (Level cm-1) scatter
-    4c. Feature vs binding-energy scatter
-    5.  Rydberg residuals — (true level − rydberg_pred) vs n_star, coloured by l
-    6.  n* distribution — validates quantum defect per element & series
-    7.  Quantum defect stability — δ vs n, coloured by l (ideally flat lines)
-    8.  Feature range comparison across elements — shows scale mismatch
+  * Model-free (always)   — distributions, correlation matrix, mutual-information
+    ranking per target, feature-range comparison, feature/target scatter and (for
+    single-valence "alkali-like" atoms) Rydberg residuals, quantum-defect stability
+    and n* distributions.
+  * Model-based (optional)— permutation feature importance for a trained MLP. Runs
+    only when a checkpoint is supplied or auto-found; skipped gracefully otherwise.
+
+Input is auto-detected per element:
+
+  * rich xlsx  ``data/<El>_features_rich_<source>.xlsx`` (output of
+    preprocess_atomic.py) when present — columns are read directly, no recomputation.
+  * legacy CSV ``data/<El>_features.csv`` otherwise — valence/Rydberg/derived
+    features are computed on the fly (the alkali path).
+
+Per-element constants (ionization energy, Z, A …) come from config_preprocess.yaml.
+
+Usage::
+
+    python preprocess/analyze_features.py --elements Li Na K Rb Cs Fr
+    python preprocess/analyze_features.py --elements Co
+    python preprocess/analyze_features.py --elements Co --checkpoint saved_models/<model>.pt
+    python preprocess/analyze_features.py --config config_preprocess.yaml --source nist --elements K
+
+Author: Aga (unified with Claude Code)
 """
 
+from __future__ import annotations
+
 import argparse
+import datetime as _dt
+import json
 import os
 import sys
 import warnings
+
 warnings.filterwarnings("ignore")
+
+# Console output contains unicode (→, cm⁻¹, ★); make stdout/stderr UTF-8 so it does
+# not crash on Windows' default cp1252 code page.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 import numpy as np
 import pandas as pd
+import yaml
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 from matplotlib.backends.backend_pdf import PdfPages
 
+from sklearn.feature_selection import mutual_info_regression
+from sklearn.preprocessing import StandardScaler
+
+# Make the project root importable so we can (optionally) reuse FEATURE_GROUPS.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_THIS_DIR)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+
 # ---------------------------------------------------------------------------
-# Constants (same as AtomicDataset.py)
+# Constants
 # ---------------------------------------------------------------------------
 
-IONIZATION_ENERGIES = {
-    "Li": (3,  43487.114),
-    "Na": (11, 41449.451),
-    "K":  (19, 35009.814),
-    "Rb": (37, 33690.81),
-    "Cs": (55, 31406.467),
-    "Fr": (87, 32848.872),
-}
-R_INF = 109737.316   # Rydberg constant, cm⁻¹
+R_INF = 109737.316   # Rydberg constant, cm^-1
 
+# Canonical column names every loader maps onto, so the plotting/report code is
+# source-agnostic.
+LEVEL_COL = "Level (cm-1)"     # raw experimental energy (the headline target)
+
+L_NAMES = {0: "s", 1: "p", 2: "d", 3: "f", 4: "g", 5: "h"}
+L_COLORS = ["#1D9E75", "#378ADD", "#BA7517", "#D4537E", "#7F77DD", "#888780"]
+
+# Stable colours for the alkali atoms; any other element is assigned from a palette.
 ELEMENT_COLORS = {
     "Li": "#E24B4A", "Na": "#BA7517", "K": "#1D9E75",
     "Rb": "#378ADD", "Cs": "#7F77DD", "Fr": "#D4537E",
 }
-L_NAMES = {0: "s", 1: "p", 2: "d", 3: "f", 4: "g", 5: "h"}
-L_COLORS = ["#1D9E75", "#378ADD", "#BA7517", "#D4537E", "#7F77DD", "#888780"]
+_PALETTE = ["#8B5CF6", "#0EA5E9", "#22C55E", "#F59E0B", "#EF4444", "#14B8A6",
+            "#6366F1", "#EC4899", "#84CC16", "#F97316"]
+
+# Canonical model-free feature set shared by every input source.
+# NOTE: val_ei_n / val_ei_l columns are added dynamically in select_features()
+# based on the per-element max_valence from config_preprocess.yaml, so that
+# transition metals (e.g. Co, max_valence=9) get all 9 (n, l) pairs while
+# alkali metals (max_valence=1) get only the single outer-electron pair.
+_BASE_FEATURES_FIXED = ["J"]          # always included (valence slots added dynamically)
+_QUANTUM_FEATURES    = ["S_qn", "L_qn"]
+_ATOMIC_FEATURES     = ["Z", "A"]
+_RYDBERG_FEATURES    = ["n_star", "rydberg_pred", "one_over_nstar_sq"]
+_DERIVED_FEATURES    = ["total_electrons", "max_principal_n", "valence_electrons",
+                         "core_electrons", "unpaired_electrons"]
+
+# Extra transition-metal physics features, only added when every element comes
+# from a rich xlsx. Mirrors the relevant groups in AtomicDataset.FEATURE_GROUPS.
+_RICH_PHYSICS_FALLBACK = ["J_sq", "L_sq", "S_sq", "lande_so_term",
+                           "n_3d", "d_holes", "d_from_half", "is_half_filled",
+                           "Z_eff", "Z_eff_sq", "E_so_estimate"]
+
+# Parity and subterm decomposition columns — only present in rich xlsx files
+# (generated by preprocess_atomic.py). These encode information about whether the
+# NIST term is a pure LS state or a mixture of several components, which the
+# model uses when add_transition_metal_features=True.
+_RICH_SUBTERM_FEATURES = [
+    "parity_computed",                  # 0/1 parity flag computed from orbital occupancy
+    "term_known",                       # 1 if NIST assigned S_qn (confirmed LS term)
+    "comp1_S", "comp1_L",              # leading-component (S, L) quantum numbers
+    "comp2_S", "comp2_L",              # second-component (S, L)
+    "comp3_S", "comp3_L",              # third-component  (S, L)
+    "subres_S", "subres_L",            # sub-resultant (S, L) from all components
+    "n_components", "has_subresultant", # number of LS components; flag for sub-resultant
+]
+
+# Candidate targets, in display order. Only those present (with data) are used.
+_TARGET_CANDIDATES = [
+    ("log_binding_energy",     "log_binding_energy"),
+    (LEVEL_COL,                f"raw_energy ({LEVEL_COL})"),
+    ("binding_energy",         "binding_energy"),
+    ("inverse_binding_energy", "inverse_binding_energy"),
+]
+
+
+def ensure_element_colors(elements):
+    """Assign a stable colour to every element (keeps the known alkali colours)."""
+    i = 0
+    for el in elements:
+        if el not in ELEMENT_COLORS:
+            ELEMENT_COLORS[el] = _PALETTE[i % len(_PALETTE)]
+            i += 1
+
+
+def get_rich_physics_features():
+    """
+    Return the transition-metal physics feature columns, reusing
+    AtomicDataset.FEATURE_GROUPS when importable (it pulls in torch) and falling
+    back to a local list otherwise so the model-free path never needs torch.
+    """
+    try:
+        from AtomicDataset import FEATURE_GROUPS
+        cols = []
+        for group in ("angular_momentum", "d_electron", "screening", "spin_orbit"):
+            cols.extend(FEATURE_GROUPS.get(group, []))
+        return cols
+    except Exception:
+        return list(_RICH_PHYSICS_FALLBACK)
+
 
 # ---------------------------------------------------------------------------
-# CLI
+# Config
 # ---------------------------------------------------------------------------
+
+def load_preprocess_config(config_path):
+    """
+    Read config_preprocess.yaml and return (settings, element_info).
+
+    settings: {source, data_dir, report_dir}
+    element_info: {symbol: {Z, A, ionization_energy, max_valence, ...}}
+    """
+    if not os.path.exists(config_path):
+        sys.exit(f"ERROR: config not found: {config_path}")
+    with open(config_path, "r", encoding="utf-8") as fh:
+        cfg = yaml.safe_load(fh) or {}
+
+    settings = {
+        "source": (cfg.get("source") or "kurucz").lower(),
+        "data_dir": cfg.get("data_dir", "data"),
+        "report_dir": cfg.get("report_dir", os.path.join("preprocess", "reports")),
+    }
+    defaults = cfg.get("defaults") or {}
+    element_info = {}
+    for entry in (cfg.get("elements") or []):
+        e = dict(defaults)
+        e.update(entry or {})
+        sym = e.get("symbol") or e.get("element")
+        if sym:
+            element_info[sym] = e
+    return settings, element_info
+
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Feature analysis for atomic energy level data")
-    p.add_argument("--elements", nargs="+", default=["Li","Na","K","Rb","Cs","Fr"],
-                   help="Element symbols to analyse (default: K)")
-    p.add_argument("--data-dir", default="../data",
-                   help="Directory containing {Element}_features.csv files")
+    p = argparse.ArgumentParser(description="Unified feature analysis for atomic energy-level data")
+    p.add_argument("--config", default=os.path.join(_ROOT, "config_preprocess.yaml"),
+                   help="Path to config_preprocess.yaml (per-element constants)")
+    p.add_argument("--elements", nargs="+", default=None,
+                   help="Element symbols to analyse (default: all in the config)")
+    p.add_argument("--source", default=None,
+                   help="Rich-xlsx source suffix to prefer (nist/kurucz). Default: config 'source'.")
+    p.add_argument("--data-dir", default=None,
+                   help="Directory holding the feature files (default: config 'data_dir')")
     p.add_argument("--out", default=None,
-                   help="Output PDF path (default: reports/features_{'_'.join(elements)}.pdf)")
-    p.add_argument("--level-col", default="Level (cm-1)",
-                   help="Name of the energy level column in CSV")
+                   help="Output base path WITHOUT extension "
+                        "(default: <report_dir>/features_<elements>_<source>)")
+    p.add_argument("--formats", default="pdf,xlsx,html",
+                   help="Comma-separated subset of pdf,xlsx,html (default: all)")
     p.add_argument("--no-rydberg", action="store_true",
-                   help="Skip Rydberg feature computation")
+                   help="Skip Rydberg-specific diagnostic pages")
+    # Model-based (permutation importance) options
+    p.add_argument("--checkpoint", default=None,
+                   help="Trained .pt checkpoint → enables permutation importance")
+    p.add_argument("--training-config", default=os.path.join(_ROOT, "config_atomic.yaml"),
+                   help="Training config used to rebuild the dataset/model for permutation importance")
+    p.add_argument("--no-permutation", action="store_true",
+                   help="Never run permutation importance, even if a checkpoint is found")
     return p.parse_args()
 
-# ---------------------------------------------------------------------------
-# Data loading & preprocessing
-# ---------------------------------------------------------------------------
 
-def load_element(element: str, data_dir: str, level_col: str) -> pd.DataFrame:
-    path = os.path.join(data_dir, f"{element}_features.csv")
-    if not os.path.exists(path):
-        sys.exit(f"ERROR: {path} not found")
-    df = pd.read_csv(path)
-    df["Element"] = element
-    if level_col not in df.columns:
-        sys.exit(f"ERROR: column '{level_col}' not in {path}. Available: {df.columns.tolist()}")
-    return df
-
+# ---------------------------------------------------------------------------
+# CSV-path feature computation (legacy {El}_features.csv → canonical columns)
+# ---------------------------------------------------------------------------
 
 def add_valence_encoding(df: pd.DataFrame, max_valence: int = 1) -> pd.DataFrame:
     """
-    Minimal valence encoding matching AtomicDataset logic:
-    sorts electrons by Madelung rule, keeps last max_valence, pads at front.
+    Minimal valence encoding matching AtomicDataset logic: sort electrons by the
+    Madelung rule, keep the outermost ``max_valence``, pad at the front.
     """
     import re
     orbital_pattern = re.compile(r"^(\d+)([spdfgh])$")
@@ -109,12 +238,9 @@ def add_valence_encoding(df: pd.DataFrame, max_valence: int = 1) -> pd.DataFrame
 
     orbital_cols_sorted = sorted(orbital_cols, key=orbital_order)
 
-    feature_cols = [f"val_e{i+1}_n" for i in range(max_valence)] + \
-                   [f"val_e{i+1}_l" for i in range(max_valence)]
-    # Interleave: val_e1_n, val_e1_l, val_e2_n, val_e2_l, ...
     feature_cols = []
     for i in range(max_valence):
-        feature_cols.extend([f"val_e{i+1}_n", f"val_e{i+1}_l"])
+        feature_cols.extend([f"val_e{i + 1}_n", f"val_e{i + 1}_l"])
 
     rows = []
     for _, row in df.iterrows():
@@ -124,7 +250,7 @@ def add_valence_encoding(df: pd.DataFrame, max_valence: int = 1) -> pd.DataFrame
             if pd.isna(val) or int(val) == 0:
                 continue
             m = orbital_pattern.match(col)
-            n, l_let = int(m.group(1)), m.group(2)  # group(1) captures full digit sequence
+            n, l_let = int(m.group(1)), m.group(2)
             l = {"s": 0, "p": 1, "d": 2, "f": 3, "g": 4, "h": 5}[l_let]
             electrons.extend([(n, l)] * int(val))
 
@@ -141,16 +267,18 @@ def add_valence_encoding(df: pd.DataFrame, max_valence: int = 1) -> pd.DataFrame
     return pd.concat([df, enc], axis=1)
 
 
-def add_rydberg_features(df: pd.DataFrame, level_col: str) -> pd.DataFrame:
+def add_rydberg_features(df: pd.DataFrame, level_col: str, ie_map: dict) -> pd.DataFrame:
     """
-    Compute quantum defect (δ) from all rows, then per-element per-l mean,
-    and derive n_star and rydberg_pred. Uses the outermost valence electron.
-    """
-    ALKALI = set(IONIZATION_ENERGIES.keys())
+    Compute the quantum defect (delta), then per-(element, l) mean defect, and
+    derive n_star / rydberg_pred / one_over_nstar_sq / binding_energy.
 
+    ie_map: {element_symbol: ionization_energy_cm-1}. Elements absent from the map
+    get NaN Rydberg features (they are not single-valence Rydberg series).
+    """
+    alkali = set(ie_map.keys())
     max_ev = sum(1 for c in df.columns if c.startswith("val_e") and c.endswith("_n"))
-    n_cols = [f"val_e{i+1}_n" for i in range(max_ev)]
-    l_cols = [f"val_e{i+1}_l" for i in range(max_ev)]
+    n_cols = [f"val_e{i + 1}_n" for i in range(max_ev)]
+    l_cols = [f"val_e{i + 1}_l" for i in range(max_ev)]
 
     def outer_electron(row):
         for nc, lc in zip(reversed(n_cols), reversed(l_cols)):
@@ -159,131 +287,319 @@ def add_rydberg_features(df: pd.DataFrame, level_col: str) -> pd.DataFrame:
                 return int(n), int(row[lc])
         return None, None
 
-    # Step 1: compute quantum defect for every alkali row
+    df = df.copy()
+
+    # Step 1: quantum defect per row.
     defects = []
     for _, row in df.iterrows():
         el = row["Element"]
-        if el not in ALKALI:
+        if el not in alkali:
             defects.append(np.nan)
             continue
-        n, l = outer_electron(row)
+        n, _l = outer_electron(row)
         if n is None:
             defects.append(np.nan)
             continue
-        E_ion = IONIZATION_ENERGIES[el][1]
-        level = float(row[level_col])
-        binding = E_ion - level
+        binding = ie_map[el] - float(row[level_col])
         if binding <= 0:
             defects.append(np.nan)
             continue
         n_star_val = np.sqrt(R_INF / binding)
         defects.append(n - n_star_val)
-
-    df = df.copy()
     df["quantum_defect"] = defects
 
-    # Step 2: mean δ per (element, l) — use ALL data as proxy for training
+    # Step 2: mean defect per (element, l) — proxy for the series-level defect.
     delta_map = (
-        df.groupby(["Element", "val_e1_l"])["quantum_defect"]
-        .mean()
-        .to_dict()
+        df.groupby(["Element", "val_e1_l"])["quantum_defect"].mean().to_dict()
     )
 
-    # Step 3: apply
+    # Step 3: apply.
     n_stars, ryd_preds, one_over = [], [], []
     for _, row in df.iterrows():
         el = row["Element"]
-        if el not in ALKALI:
+        if el not in alkali:
             n_stars.append(np.nan); ryd_preds.append(np.nan); one_over.append(np.nan)
             continue
         n, l = outer_electron(row)
         if n is None:
             n_stars.append(np.nan); ryd_preds.append(np.nan); one_over.append(np.nan)
             continue
-        E_ion = IONIZATION_ENERGIES[el][1]
         delta = delta_map.get((el, l), 0.0)
         n_eff = n - delta
         if n_eff <= 0:
             n_stars.append(np.nan); ryd_preds.append(np.nan); one_over.append(np.nan)
             continue
         n_stars.append(n_eff)
-        ryd_preds.append(E_ion - R_INF / n_eff**2)
-        one_over.append(1.0 / n_eff**2)
+        ryd_preds.append(ie_map[el] - R_INF / n_eff ** 2)
+        one_over.append(1.0 / n_eff ** 2)
 
-    df["n_star"]            = n_stars
-    df["rydberg_pred"]      = ryd_preds
+    df["n_star"] = n_stars
+    df["rydberg_pred"] = ryd_preds
     df["one_over_nstar_sq"] = one_over
-    df["binding_energy"]    = df.apply(
-        lambda r: IONIZATION_ENERGIES.get(r["Element"], (None, np.nan))[1] - r[level_col],
-        axis=1
-    )
+    df["binding_energy"] = df["Element"].map(ie_map).astype(float) - df[level_col]
     return df
 
-# -----
-def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute derived features: total electrons, valence electrons, core electrons,
-    unpaired electrons, max principal quantum number.
 
-    Bug fixed: uses regex to parse n from orbital names so n>=10 (e.g. 10s, 46d)
-    are handled correctly. The old code used int(col[0]) which gave 1 for '10s'.
-    """
+def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Total / valence / core electron counts and max principal n from orbital columns."""
     import re
     orbital_pattern = re.compile(r"^(\d+)([spdfgh])$")
     orbital_cols = [c for c in df.columns if orbital_pattern.match(c)]
 
     df = df.copy()
-    total_electrons = []
-    max_principal_ns = []
-    valence_electrons_list = []
+    total_electrons, max_principal_ns, valence_electrons_list = [], [], []
 
     for _, row in df.iterrows():
-        total = 0
-        max_n = 0
+        total, max_n = 0, 0
         for col in orbital_cols:
             val = row.get(col, 0)
             if pd.isna(val):
                 continue
             count = int(val)
             if count > 0:
-                m = orbital_pattern.match(col)
-                n = int(m.group(1))  # correct: captures "46" from "46d"
+                n = int(orbital_pattern.match(col).group(1))
                 total += count
                 max_n = max(max_n, n)
         total_electrons.append(total)
         max_principal_ns.append(max_n)
 
-        # Valence electrons: those in orbitals with n == max_n
         valence = 0
         for col in orbital_cols:
             val = row.get(col, 0)
             if pd.isna(val):
                 continue
             count = int(val)
-            if count > 0:
-                m = orbital_pattern.match(col)
-                n = int(m.group(1))
-                if n == max_n:
-                    valence += count
+            if count > 0 and int(orbital_pattern.match(col).group(1)) == max_n:
+                valence += count
         valence_electrons_list.append(valence)
 
-    df["total_electrons"]   = total_electrons
-    df["max_principal_n"]   = max_principal_ns
+    df["total_electrons"] = total_electrons
+    df["max_principal_n"] = max_principal_ns
     df["valence_electrons"] = valence_electrons_list
-    df["core_electrons"]    = df["total_electrons"] - df["valence_electrons"]
+    df["core_electrons"] = df["total_electrons"] - df["valence_electrons"]
     if "S_qn" in df.columns:
         df["unpaired_electrons"] = (2 * df["S_qn"]).round().astype(int)
     else:
         df["unpaired_electrons"] = 0
-
     return df
 
-# Plotting helpers
+
+# ---------------------------------------------------------------------------
+# Loaders (auto-detect rich xlsx vs legacy CSV) → canonical schema
 # ---------------------------------------------------------------------------
 
-FIGSIZE_FULL = (14, 8)
-STYLE = {"alpha": 0.75, "edgecolor": "none"}
+def rich_xlsx_path(element, data_dir, source):
+    return os.path.join(data_dir, f"{element}_features_rich_{source}.xlsx")
 
+
+def csv_path(element, data_dir):
+    return os.path.join(data_dir, f"{element}_features.csv")
+
+
+# rich column -> canonical column
+_RICH_RENAME = {
+    "OBS.LEVEL": LEVEL_COL,
+    "result_S": "S_qn",
+    "result_L": "L_qn",
+    "rydberg_prediction": "rydberg_pred",
+    "Binding_Energy_cm-1": "binding_energy",
+    "Log_Binding_Energy_cm-1": "log_binding_energy",
+    "Inverse_Binding_Energy_cm-1": "inverse_binding_energy",
+}
+
+
+def load_rich_element(element, data_dir, source) -> pd.DataFrame:
+    """Load a rich xlsx and map it onto the canonical schema (no recomputation)."""
+    path = rich_xlsx_path(element, data_dir, source)
+    df = pd.read_excel(path, sheet_name="features")
+    df["Element"] = element
+    for src, dst in _RICH_RENAME.items():
+        if src in df.columns and dst not in df.columns:
+            df = df.rename(columns={src: dst})
+    # Columns the rich file does not carry but the canonical schema expects.
+    if "quantum_defect" not in df.columns:
+        df["quantum_defect"] = np.nan
+    if "unpaired_electrons" not in df.columns:
+        df["unpaired_electrons"] = (2 * df["S_qn"]).round().astype(int) \
+            if "S_qn" in df.columns else 0
+    return df
+
+
+def load_csv_element(element, data_dir, ionization_energy) -> pd.DataFrame:
+    """Load a legacy {El}_features.csv and compute the canonical features."""
+    path = csv_path(element, data_dir)
+    df = pd.read_csv(path)
+    df["Element"] = element
+    if LEVEL_COL not in df.columns:
+        sys.exit(f"ERROR: column '{LEVEL_COL}' not in {path}. Available: {df.columns.tolist()}")
+    df = add_valence_encoding(df, max_valence=1)
+    df = add_rydberg_features(df, LEVEL_COL, {element: ionization_energy})
+    df["log_binding_energy"] = np.log(df["binding_energy"].clip(lower=1e-6))
+    df["inverse_binding_energy"] = 1.0 / df["binding_energy"].replace(0, np.nan)
+    df = add_derived_features(df)
+    return df
+
+
+def load_elements(elements, data_dir, source, element_info):
+    """
+    Auto-detect and load every element into one canonical DataFrame.
+
+    Returns (df, modes) where modes maps element → 'rich' | 'csv'.
+    """
+    frames, modes = [], {}
+    for el in elements:
+        rpath = rich_xlsx_path(el, data_dir, source)
+        cpath = csv_path(el, data_dir)
+        if os.path.exists(rpath):
+            d = load_rich_element(el, data_dir, source)
+            modes[el] = "rich"
+            src_desc = os.path.basename(rpath)
+        elif os.path.exists(cpath):
+            ie = (element_info.get(el) or {}).get("ionization_energy")
+            if ie is None:
+                sys.exit(f"ERROR: {el} has no rich xlsx and no ionization_energy in config "
+                         f"(needed to compute Rydberg features from {cpath}).")
+            d = load_csv_element(el, data_dir, float(ie))
+            modes[el] = "csv"
+            src_desc = os.path.basename(cpath)
+        else:
+            sys.exit(f"ERROR: no feature file for {el}: tried {rpath} and {cpath}")
+        lo = d[LEVEL_COL].min()
+        hi = d[LEVEL_COL].max()
+        print(f"  {el:<3} [{modes[el]:<4}] {len(d):>4} samples  "
+              f"level {lo:.0f}-{hi:.0f} cm^-1  ({src_desc})")
+        frames.append(d)
+
+    df = pd.concat(frames, ignore_index=True)
+    return df, modes
+
+
+# ---------------------------------------------------------------------------
+# Feature / target selection
+# ---------------------------------------------------------------------------
+
+def _build_valence_features(df, modes, element_info):
+    """
+    Return the list of val_ei_n / val_ei_l columns to include in analysis.
+
+    The number of slots equals the maximum max_valence across the elements being
+    analysed (read from element_info / config_preprocess.yaml).  For transition
+    metals like Co (max_valence=9) this yields 18 features (9 n/l pairs); for
+    alkali metals (max_valence=1) it yields the single outer-electron pair.
+
+    Including all slots — not just slot 1 — lets the analysis *reveal* which
+    slots matter for each element (e.g. for Co: slots 1, 8, 9 are the physically
+    active ones for the 3d-4s configuration space).
+    """
+    elements_in_run = list(modes.keys()) if modes else list(df["Element"].unique())
+
+    if element_info:
+        max_val = max(
+            (int((element_info.get(el) or {}).get("max_valence", 1))
+             for el in elements_in_run),
+            default=1,
+        )
+    else:
+        # Fallback: detect from column names already present in df
+        slot_nums = [
+            int(c.split("_e")[1].split("_")[0])
+            for c in df.columns
+            if c.startswith("val_e") and c.endswith("_n")
+        ]
+        max_val = max(slot_nums, default=1)
+
+    feats = []
+    for i in range(1, max_val + 1):
+        feats.extend([f"val_e{i}_n", f"val_e{i}_l"])
+    return feats
+
+
+def select_features(df, modes, element_info=None):
+    """
+    Pick the canonical features present in df with real variance.
+
+    Feature groups included (in order):
+      - val_ei_n / val_ei_l for i in 1..max_valence  (dynamic, per config_preprocess.yaml)
+      - J (total angular momentum, always)
+      - S_qn, L_qn (quantum numbers)
+      - Z, A (atomic properties, skipped when constant = single-element dataset)
+      - n_star, rydberg_pred, one_over_nstar_sq (Rydberg, when available)
+      - total_electrons, max_principal_n, valence_electrons, core_electrons, unpaired_electrons
+
+    Rich-mode extras (only when every element comes from a rich xlsx):
+      - transition-metal physics: J_sq, L_sq, S_sq, lande_so_term, n_3d, d_holes, …
+      - parity and subterm decomposition: parity_computed, term_known, comp*_S/L, …
+    """
+    valence_feats = _build_valence_features(df, modes, element_info)
+
+    feats = valence_feats + list(_BASE_FEATURES_FIXED)
+    for group in (_QUANTUM_FEATURES, _ATOMIC_FEATURES, _RYDBERG_FEATURES, _DERIVED_FEATURES):
+        feats.extend(group)
+
+    if modes and all(m == "rich" for m in modes.values()):
+        feats.extend(get_rich_physics_features())   # angular-momentum, d-electron, screening, SO
+        feats.extend(_RICH_SUBTERM_FEATURES)         # parity, term_known, subterm components
+
+    # Deduplicate (preserve order), keep only columns present with >1 distinct non-null value.
+    seen, out = set(), []
+    for f in feats:
+        if f in seen or f not in df.columns:
+            continue
+        seen.add(f)
+        if df[f].dropna().nunique() > 1:
+            out.append(f)
+    return out
+
+
+def get_targets(df):
+    """Return (col, label) target tuples that exist with usable data."""
+    out = []
+    for col, label in _TARGET_CANDIDATES:
+        if col in df.columns and df[col].dropna().nunique() > 1:
+            out.append((col, label))
+    return out
+
+
+def compute_mi_table(df, features, targets):
+    """Return {label: DataFrame[feature, mutual_information]} sorted descending."""
+    results = {}
+    for col, label in targets:
+        avail = [f for f in features if f in df.columns and f != col]
+        if not avail:
+            continue
+        target_vals = df[col].dropna()
+        common = df[avail].dropna().index.intersection(target_vals.index)
+        if len(common) < 3:
+            continue
+        X = StandardScaler().fit_transform(df.loc[common, avail].values)
+        y = df.loc[common, col].values
+        mi = mutual_info_regression(X, y, random_state=42)
+        results[label] = (
+            pd.DataFrame({"feature": avail, "mutual_information": mi})
+            .sort_values("mutual_information", ascending=False)
+            .reset_index(drop=True)
+        )
+    return results
+
+
+def build_summary_table(df, features):
+    """Per-feature descriptive stats over the combined dataset."""
+    rows = []
+    for f in features:
+        s = pd.to_numeric(df[f], errors="coerce").dropna()
+        rows.append({
+            "feature": f,
+            "count": int(s.shape[0]),
+            "n_unique": int(s.nunique()),
+            "mean": s.mean(), "std": s.std(),
+            "min": s.min(), "max": s.max(),
+        })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Plotting helpers
+# ---------------------------------------------------------------------------
 
 def _suptitle(fig, text):
     fig.suptitle(text, fontsize=13, fontweight="bold", y=1.01)
@@ -293,184 +609,113 @@ def _legend_elements(elements):
     from matplotlib.patches import Patch
     return [Patch(facecolor=ELEMENT_COLORS.get(e, "gray"), label=e) for e in elements]
 
-# ---------------------------------------------------------------------------
-# Plot 1: Feature distributions
-# ---------------------------------------------------------------------------
 
-def plot_feature_distributions(df: pd.DataFrame, features: list, elements: list,
-                                level_col: str, pdf: PdfPages):
+def plot_feature_distributions(df, features, elements, pdf):
     n = len(features)
     ncols = 4
     nrows = (n + ncols - 1) // ncols
-
     fig, axes = plt.subplots(nrows, ncols, figsize=(14, 3 * nrows))
     axes = np.array(axes).flatten()
-
+    i = -1
     for i, feat in enumerate(features):
         ax = axes[i]
-        if feat not in df.columns:
-            ax.set_visible(False)
-            continue
         for el in elements:
             sub = df[df["Element"] == el][feat].dropna()
             if sub.empty:
                 continue
-            color = ELEMENT_COLORS.get(el, "gray")
-            ax.hist(sub, bins=20, color=color, label=el,
-                    alpha=0.6, edgecolor="none", density=True)
+            ax.hist(sub, bins=20, color=ELEMENT_COLORS.get(el, "gray"),
+                    label=el, alpha=0.6, edgecolor="none", density=True)
         ax.set_title(feat, fontsize=10)
         ax.set_xlabel("value", fontsize=8)
         ax.set_ylabel("density", fontsize=8)
         ax.tick_params(labelsize=7)
-
     for j in range(i + 1, len(axes)):
         axes[j].set_visible(False)
-
     if len(elements) > 1:
-        fig.legend(handles=_legend_elements(elements), loc="upper right",
-                   fontsize=9, title="Element")
-
+        fig.legend(handles=_legend_elements(elements), loc="upper right", fontsize=9, title="Element")
     _suptitle(fig, "Feature distributions (by element)")
     fig.tight_layout()
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
 
-# ---------------------------------------------------------------------------
-# Plot 2: Correlation matrix
-# ---------------------------------------------------------------------------
 
-def plot_correlation_matrix(df: pd.DataFrame, features: list, pdf: PdfPages,
-                             targets: list = None):
-    """
-    targets: list of additional column names (target variables) to append to the matrix,
-    letting you see which features correlate with each target type.
-    """
-    all_cols = list(features)
-    if targets:
-        all_cols += [t for t in targets if t in df.columns and t not in all_cols]
+def plot_correlation_matrix(df, features, targets, pdf):
+    target_cols = [c for c, _ in targets]
+    all_cols = list(features) + [t for t in target_cols if t not in features]
     available = [f for f in all_cols if f in df.columns]
     corr = df[available].corr()
     n = len(available)
     n_feat = len([f for f in features if f in df.columns])
 
-    fig, ax = plt.subplots(figsize=(max(8, n * 0.75),
-                                    max(6, n * 0.72)))
+    fig, ax = plt.subplots(figsize=(max(8, n * 0.75), max(6, n * 0.72)))
     im = ax.imshow(corr.values, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
     plt.colorbar(im, ax=ax, fraction=0.03)
     ax.set_xticks(range(n))
     ax.set_yticks(range(n))
-    # Bold target column/row labels
-    xlabels = [f"★ {c}" if (targets and c in targets) else c for c in available]
-    ylabels = xlabels
-    ax.set_xticklabels(xlabels, rotation=45, ha="right", fontsize=9)
-    ax.set_yticklabels(ylabels, fontsize=9)
+    labels = [f"★ {c}" if c in target_cols else c for c in available]
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=9)
+    ax.set_yticklabels(labels, fontsize=9)
     for i in range(n):
         for j in range(n):
             v = corr.values[i, j]
             if abs(v) > 0.25:
                 ax.text(j, i, f"{v:.2f}", ha="center", va="center",
                         fontsize=7, color="white" if abs(v) > 0.7 else "black")
-    # Draw separator line between features and targets
-    if targets:
+    if target_cols:
         sep = n_feat - 0.5
         ax.axhline(sep, color="white", lw=2)
         ax.axvline(sep, color="white", lw=2)
     _suptitle(fig, "Feature correlation matrix  (★ = target variables)\n"
-              "|r|>0.8 suggests redundancy; look for L_qn≈val_e1_l, S_qn constant")
+                   "|r|>0.8 suggests redundancy")
     fig.tight_layout()
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
 
-# ---------------------------------------------------------------------------
-# Plot 3: Mutual information ranking — multiple targets as subplots
-# ---------------------------------------------------------------------------
 
-def plot_mutual_information(df: pd.DataFrame, features: list,
-                             targets: list, pdf: PdfPages):
-    """
-    Render MI ranking for every target in *targets* as subplots on one PDF page.
-
-    targets: list of (column_name, display_label) tuples.
-             column_name must exist in df; display_label is shown in the subplot title.
-    """
-    from sklearn.feature_selection import mutual_info_regression
-    from sklearn.preprocessing import StandardScaler
-
-    n_targets = len(targets)
+def plot_mutual_information(mi_results, pdf):
+    if not mi_results:
+        return
+    n_targets = len(mi_results)
     ncols = 2
     nrows = (n_targets + ncols - 1) // ncols
-    bar_height_per_feat = 0.38
-    subplot_h = max(4, len(features) * bar_height_per_feat)
-
-    fig, axes = plt.subplots(nrows, ncols,
-                              figsize=(18, subplot_h * nrows))
+    n_feat = max(len(res) for res in mi_results.values())
+    subplot_h = max(4, n_feat * 0.38)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(18, subplot_h * nrows))
     axes = np.array(axes).flatten()
-
-    for i, (col_name, label) in enumerate(targets):
+    for i, (label, res) in enumerate(mi_results.items()):
         ax = axes[i]
-        if col_name not in df.columns:
-            ax.set_visible(False)
-            continue
-
-        available = [f for f in features if f in df.columns and f != col_name]
-        target_vals = df[col_name].dropna()
-        common_idx = df[available].dropna().index.intersection(target_vals.index)
-        if len(common_idx) == 0:
-            ax.set_visible(False)
-            continue
-
-        X = df.loc[common_idx, available].values
-        y = df.loc[common_idx, col_name].values
-
-        X_sc = StandardScaler().fit_transform(X)
-        mi = mutual_info_regression(X_sc, y, random_state=42)
-
-        order = np.argsort(mi)[::-1]
-        sorted_feats = [available[k] for k in order]
-        sorted_mi = mi[order]
-        median_mi = np.median(sorted_mi)
-
-        colors = ["#1D9E75" if v > median_mi else "#888780" for v in sorted_mi]
-        bars = ax.barh(sorted_feats[::-1], sorted_mi[::-1],
-                       color=colors[::-1], height=0.6)
+        feats = res["feature"].tolist()
+        mi = res["mutual_information"].values
+        median_mi = np.median(mi)
+        colors = ["#1D9E75" if v > median_mi else "#888780" for v in mi]
+        bars = ax.barh(feats[::-1], mi[::-1], color=colors[::-1], height=0.6)
         ax.set_xlabel("Mutual information", fontsize=9)
         ax.axvline(median_mi, color="#BA7517", ls="--", lw=1, label="median")
         ax.legend(fontsize=8)
         ax.set_title(f"target: {label}", fontsize=10, fontweight="bold")
         ax.tick_params(labelsize=7)
-        x_pad = max(sorted_mi) * 0.01 if max(sorted_mi) > 0 else 0.001
-        for bar, val in zip(bars, sorted_mi[::-1]):
+        x_pad = max(mi) * 0.01 if max(mi) > 0 else 0.001
+        for bar, val in zip(bars, mi[::-1]):
             ax.text(val + x_pad, bar.get_y() + bar.get_height() / 2,
                     f"{val:.3f}", va="center", fontsize=7)
-
     for j in range(n_targets, len(axes)):
         axes[j].set_visible(False)
-
-    _suptitle(fig,
-              "Mutual information ranking — feature importance per target\n"
-              "(higher = more informative; near-zero = essentially noise for that target)")
+    _suptitle(fig, "Mutual information ranking — feature importance per target\n"
+                   "(higher = more informative; near-zero = essentially noise for that target)")
     fig.tight_layout()
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
 
-# ---------------------------------------------------------------------------
-# Plot 4: Feature vs target scatter
-# ---------------------------------------------------------------------------
 
-def plot_feature_target_scatter(df: pd.DataFrame, features: list,
-                                  target: str, elements: list, pdf: PdfPages):
+def plot_feature_target_scatter(df, features, target, elements, pdf):
     n = len(features)
     ncols = 3
     nrows = (n + ncols - 1) // ncols
-
     fig, axes = plt.subplots(nrows, ncols, figsize=(14, 3.5 * nrows))
     axes = np.array(axes).flatten()
-
+    i = -1
     for i, feat in enumerate(features):
         ax = axes[i]
-        if feat not in df.columns or target not in df.columns:
-            ax.set_visible(False)
-            continue
         for el in elements:
             sub = df[df["Element"] == el][[feat, target]].dropna()
             if sub.empty:
@@ -481,51 +726,36 @@ def plot_feature_target_scatter(df: pd.DataFrame, features: list,
         ax.set_ylabel(target, fontsize=8)
         ax.set_title(f"{feat} vs {target}", fontsize=9)
         ax.tick_params(labelsize=7)
-
     for j in range(i + 1, len(axes)):
         axes[j].set_visible(False)
-
     if len(elements) > 1:
-        fig.legend(handles=_legend_elements(elements), loc="upper right",
-                   fontsize=9, title="Element")
-
+        fig.legend(handles=_legend_elements(elements), loc="upper right", fontsize=9, title="Element")
     _suptitle(fig, f"Feature vs target ({target}) scatter plots")
     fig.tight_layout()
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
 
-# ---------------------------------------------------------------------------
-# Plot 5: Rydberg residuals
-# ---------------------------------------------------------------------------
 
-def plot_rydberg_residuals(df: pd.DataFrame, level_col: str,
-                            elements: list, pdf: PdfPages):
+def plot_rydberg_residuals(df, elements, pdf):
     if "rydberg_pred" not in df.columns or "n_star" not in df.columns:
         return
-
     df = df.copy()
-    df["rydberg_residual"] = df[level_col] - df["rydberg_pred"]
-
+    df["rydberg_residual"] = df[LEVEL_COL] - df["rydberg_pred"]
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    # Left: residual vs n_star, coloured by l
     ax = axes[0]
-    unique_ls = sorted(df["val_e1_l"].dropna().unique())
-    for l_val in unique_ls:
+    for l_val in sorted(df["val_e1_l"].dropna().unique()):
         sub = df[df["val_e1_l"] == l_val][["n_star", "rydberg_residual"]].dropna()
         if sub.empty:
             continue
-        color = L_COLORS[int(l_val) % len(L_COLORS)]
         ax.scatter(sub["n_star"], sub["rydberg_residual"], s=15, alpha=0.6,
-                   color=color, label=L_NAMES.get(int(l_val), str(int(l_val))))
+                   color=L_COLORS[int(l_val) % len(L_COLORS)],
+                   label=L_NAMES.get(int(l_val), str(int(l_val))))
     ax.axhline(0, color="black", lw=0.8, ls="--")
     ax.set_xlabel("n* (effective quantum number)", fontsize=10)
     ax.set_ylabel("Residual: true − Rydberg prediction (cm⁻¹)", fontsize=10)
     ax.set_title("Rydberg residuals vs n*", fontsize=11)
     ax.legend(title="l", fontsize=9, title_fontsize=9)
     ax.tick_params(labelsize=8)
-
-    # Right: residual vs n_star, coloured by element
     ax = axes[1]
     for el in elements:
         sub = df[df["Element"] == el][["n_star", "rydberg_residual"]].dropna()
@@ -539,81 +769,61 @@ def plot_rydberg_residuals(df: pd.DataFrame, level_col: str,
     ax.set_title("Rydberg residuals by element", fontsize=11)
     ax.legend(title="Element", fontsize=9)
     ax.tick_params(labelsize=8)
-
-    _suptitle(fig,
-        "Rydberg residuals  (true level − Rydberg prediction)\n"
-        "Large residuals at low n* = extrapolation challenge; "
-        "ideally residuals should be small and symmetric around 0")
+    _suptitle(fig, "Rydberg residuals (true level − Rydberg prediction)")
     fig.tight_layout()
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
 
-# ---------------------------------------------------------------------------
-# Plot 6: Quantum defect stability
-# ---------------------------------------------------------------------------
 
-def plot_quantum_defect(df: pd.DataFrame, elements: list, pdf: PdfPages):
-    if "quantum_defect" not in df.columns or "val_e1_n" not in df.columns:
+def plot_quantum_defect(df, elements, pdf):
+    if "quantum_defect" not in df.columns or df["quantum_defect"].dropna().empty:
         return
-
     unique_ls = sorted(df["val_e1_l"].dropna().unique())
+    if not unique_ls:
+        return
     ncols = min(len(unique_ls), 3)
     nrows = (len(unique_ls) + ncols - 1) // ncols
-
     fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
     axes = np.array(axes).flatten()
-
+    i = -1
     for i, l_val in enumerate(unique_ls):
         ax = axes[i]
         for el in elements:
             sub = df[(df["Element"] == el) & (df["val_e1_l"] == l_val)][
-                ["val_e1_n", "quantum_defect"]
-            ].dropna()
+                ["val_e1_n", "quantum_defect"]].dropna()
             if sub.empty:
                 continue
             sub = sub.sort_values("val_e1_n")
-            ax.plot(sub["val_e1_n"], sub["quantum_defect"],
-                    "o-", color=ELEMENT_COLORS.get(el, "gray"), ms=5,
-                    alpha=0.8, label=el)
+            ax.plot(sub["val_e1_n"], sub["quantum_defect"], "o-",
+                    color=ELEMENT_COLORS.get(el, "gray"), ms=5, alpha=0.8, label=el)
         ax.set_title(f"l={int(l_val)} ({L_NAMES.get(int(l_val), '?')})", fontsize=10)
         ax.set_xlabel("n (principal quantum number)", fontsize=9)
         ax.set_ylabel("δ = n − n*", fontsize=9)
         ax.tick_params(labelsize=8)
-        # Ideal: flat line (constant quantum defect)
         mean_delta = df[df["val_e1_l"] == l_val]["quantum_defect"].mean()
         if not np.isnan(mean_delta):
             ax.axhline(mean_delta, color="gray", ls="--", lw=0.8, label=f"mean δ={mean_delta:.3f}")
         ax.legend(fontsize=8)
-
     for j in range(i + 1, len(axes)):
         axes[j].set_visible(False)
-
-    _suptitle(fig,
-        "Quantum defect δ = n − n* per angular momentum series\n"
-        "Ideally a flat horizontal line; slope indicates Rydberg-Ritz correction needed")
+    _suptitle(fig, "Quantum defect δ = n − n* per angular-momentum series\n"
+                   "Ideally a flat horizontal line")
     fig.tight_layout()
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
 
-# ---------------------------------------------------------------------------
-# Plot 7: Feature range comparison across elements
-# ---------------------------------------------------------------------------
 
-def plot_feature_ranges(df: pd.DataFrame, features: list,
-                         elements: list, pdf: PdfPages):
+def plot_feature_ranges(df, features, elements, pdf):
     available = [f for f in features if f in df.columns]
     n = len(available)
     if n == 0:
         return
-
     fig, axes = plt.subplots(1, n, figsize=(max(10, 2 * n), 5))
     if n == 1:
         axes = [axes]
-
     for i, feat in enumerate(available):
         ax = axes[i]
-        data_by_el = []
-        labels = []
+        data_by_el, labels = [], []
         for el in elements:
             sub = df[df["Element"] == el][feat].dropna()
             if not sub.empty:
@@ -622,58 +832,315 @@ def plot_feature_ranges(df: pd.DataFrame, features: list,
         if not data_by_el:
             ax.set_visible(False)
             continue
-        parts = ax.violinplot(data_by_el, showmedians=True,
-                               showextrema=True)
+        parts = ax.violinplot(data_by_el, showmedians=True, showextrema=True)
         for j, pc in enumerate(parts["bodies"]):
-            el = labels[j]
-            pc.set_facecolor(ELEMENT_COLORS.get(el, "gray"))
+            pc.set_facecolor(ELEMENT_COLORS.get(labels[j], "gray"))
             pc.set_alpha(0.7)
         ax.set_xticks(range(1, len(labels) + 1))
         ax.set_xticklabels(labels, fontsize=9)
         ax.set_title(feat, fontsize=10)
         ax.set_ylabel("value", fontsize=8)
         ax.tick_params(labelsize=7)
-
-    _suptitle(fig,
-        "Feature value ranges per element (violin plots)\n"
-        "Mismatched ranges across elements can confuse StandardScaler — look for outliers")
+    _suptitle(fig, "Feature value ranges per element (violin plots)")
     fig.tight_layout()
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
 
-# ---------------------------------------------------------------------------
-# Plot 8: n_star distribution — validates Rydberg computation
-# ---------------------------------------------------------------------------
 
-def plot_nstar_distribution(df: pd.DataFrame, elements: list, pdf: PdfPages):
-    if "n_star" not in df.columns:
+def plot_nstar_distribution(df, elements, pdf):
+    if "n_star" not in df.columns or df["n_star"].dropna().empty:
         return
-
-    fig, axes = plt.subplots(1, len(elements), figsize=(5 * len(elements), 4),
-                              squeeze=False)
+    fig, axes = plt.subplots(1, len(elements), figsize=(5 * len(elements), 4), squeeze=False)
     axes = axes[0]
-
     for i, el in enumerate(elements):
         ax = axes[i]
         sub = df[df["Element"] == el][["n_star", "val_e1_l"]].dropna()
-        unique_ls = sorted(sub["val_e1_l"].unique())
-        for l_val in unique_ls:
+        for l_val in sorted(sub["val_e1_l"].unique()):
             lsub = sub[sub["val_e1_l"] == l_val]["n_star"]
-            color = L_COLORS[int(l_val) % len(L_COLORS)]
-            ax.hist(lsub, bins=15, color=color, alpha=0.6, edgecolor="none",
-                    label=L_NAMES.get(int(l_val), str(int(l_val))))
+            ax.hist(lsub, bins=15, color=L_COLORS[int(l_val) % len(L_COLORS)],
+                    alpha=0.6, edgecolor="none", label=L_NAMES.get(int(l_val), str(int(l_val))))
         ax.set_title(f"{el}", fontsize=11)
         ax.set_xlabel("n* (effective quantum number)", fontsize=9)
         ax.set_ylabel("count", fontsize=9)
         ax.legend(title="l", fontsize=8, title_fontsize=8)
         ax.tick_params(labelsize=8)
-
-    _suptitle(fig,
-        "n* (effective principal quantum number) distribution per element and series\n"
-        "Gaps at low n* identify states where Rydberg extrapolation is required")
+    _suptitle(fig, "n* distribution per element and series")
     fig.tight_layout()
     pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_permutation_importance(perm_df, baseline_mae, pdf):
+    d = perm_df.sort_values("mean_mae_increase", ascending=True)
+    fig, ax = plt.subplots(figsize=(10, max(6, len(d) * 0.35)))
+    y = np.arange(len(d))
+    ax.barh(y, d["mean_mae_increase"], xerr=d["std_mae_increase"],
+            color="#378ADD", ecolor="black", capsize=3, height=0.7)
+    ax.axvline(0, color="black", ls="--", lw=0.8)
+    ax.set_yticks(y)
+    ax.set_yticklabels(d["feature"], fontsize=9)
+    ax.set_xlabel("Mean MAE increase (cm⁻¹)", fontsize=11)
+    _suptitle(fig, f"Permutation feature importance  (baseline MAE = {baseline_mae:.1f} cm⁻¹)\n"
+                   "MAE increase when each feature is shuffled — higher = more relied upon")
+    fig.tight_layout()
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Model-based: permutation importance (optional)
+# ---------------------------------------------------------------------------
+
+def run_permutation_importance(training_config_path, checkpoint_path):
+    """
+    Compute permutation importance for a trained MLP. Returns (DataFrame, baseline_mae)
+    or (None, None) on any failure (missing torch, no checkpoint, etc.).
+    """
+    try:
+        import torch
+        from AtomicDataset import AtomicDataset
+        from AtomicModel import create_model
+        from utils import load_checkpoint, get_model_name_from_config, load_config
+    except Exception as exc:
+        print(f"  [permutation] skipped — could not import training stack: {exc}")
+        return None, None
+
+    try:
+        config = load_config(training_config_path)
+        device = torch.device("cuda" if (config.general.device == "cuda" and torch.cuda.is_available()) else "cpu")
+
+        train_ds = AtomicDataset(config, subset="train")
+        test_ds = AtomicDataset(config, subset="test",
+                                scaler_features=train_ds.scaler_features,
+                                scaler_target=train_ds.scaler_target)
+
+        if checkpoint_path is None:
+            checkpoint_path = os.path.join(config.logging.save_dir, get_model_name_from_config(config))
+        if not os.path.exists(checkpoint_path):
+            print(f"  [permutation] skipped — checkpoint not found: {checkpoint_path}")
+            return None, None
+
+        model = create_model(config, test_ds.get_input_dim()).to(device)
+        optimizer = torch.optim.Adam(model.parameters())
+        load_checkpoint(model, optimizer, checkpoint_path, device)
+        model.eval()
+        print(f"  [permutation] loaded model: {checkpoint_path}")
+
+        X = test_ds.X.astype(np.float32)
+        y = test_ds.inverse_transform_target(test_ds.y).flatten()
+        feature_names = test_ds.get_feature_names()
+
+        def predict(arr):
+            with torch.no_grad():
+                out = model(torch.FloatTensor(arr).to(device))
+                # MultiTaskAtomicModel returns a (energy_pred, gj_pred) tuple;
+                # single-task model returns a plain tensor.  Always take the
+                # energy head (first element) so permutation importance measures
+                # the effect on energy prediction regardless of model type.
+                energy_out = out[0] if isinstance(out, tuple) else out
+                raw = energy_out.cpu().numpy()
+            return test_ds.inverse_transform_target(raw).flatten()
+
+        baseline_mae = float(np.mean(np.abs(predict(X) - y)))
+        rng = np.random.default_rng(42)
+        records = []
+        for i in range(len(feature_names)):
+            inc = []
+            for _ in range(30):
+                Xp = X.copy()
+                Xp[:, i] = rng.permutation(Xp[:, i])
+                inc.append(float(np.mean(np.abs(predict(Xp) - y))) - baseline_mae)
+            records.append({"feature": feature_names[i],
+                            "mean_mae_increase": float(np.mean(inc)),
+                            "std_mae_increase": float(np.std(inc))})
+        out = (pd.DataFrame(records)
+               .sort_values("mean_mae_increase", ascending=False)
+               .reset_index(drop=True))
+        out.insert(0, "rank", range(1, len(out) + 1))
+        print(f"  [permutation] baseline MAE {baseline_mae:.2f} cm⁻¹, "
+              f"{len(out)} features ranked")
+        return out, baseline_mae
+    except Exception as exc:
+        print(f"  [permutation] skipped — {type(exc).__name__}: {exc}")
+        return None, None
+
+
+# ---------------------------------------------------------------------------
+# Reports
+# ---------------------------------------------------------------------------
+
+def mi_results_to_wide(mi_results):
+    wide = None
+    for label, res in mi_results.items():
+        s = res.set_index("feature")["mutual_information"].rename(label)
+        wide = s.to_frame() if wide is None else wide.join(s, how="outer")
+    return wide
+
+
+def build_pdf(out_path, df, features, elements, targets, mi_results,
+              perm, no_rydberg):
+    perm_df, baseline_mae = perm
+    print(f"  writing PDF → {out_path}")
+    with PdfPages(out_path) as pdf:
+        # Title page
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.axis("off")
+        ax.text(0.5, 0.66, "Feature Analysis Report", ha="center", va="center",
+                fontsize=22, fontweight="bold", transform=ax.transAxes)
+        ax.text(0.5, 0.52, f"Elements: {', '.join(elements)}    ·    n={len(df)} samples",
+                ha="center", va="center", fontsize=14, transform=ax.transAxes, color="#5a5a5a")
+        ax.text(0.5, 0.40, f"Features analysed: {', '.join(features)}",
+                ha="center", va="center", fontsize=10, transform=ax.transAxes,
+                color="#7a7a7a", wrap=True)
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+        plot_feature_distributions(df, features, elements, pdf)
+        plot_correlation_matrix(df, features, targets, pdf)
+        plot_mutual_information(mi_results, pdf)
+
+        log_scatter = "log_binding_energy" if "log_binding_energy" in df.columns else LEVEL_COL
+        plot_feature_target_scatter(df, features, log_scatter, elements, pdf)
+        for col, _ in targets:
+            if col != log_scatter:
+                plot_feature_target_scatter(df, features, col, elements, pdf)
+
+        if not no_rydberg:
+            plot_rydberg_residuals(df, elements, pdf)
+            plot_quantum_defect(df, elements, pdf)
+        plot_feature_ranges(df, features, elements, pdf)
+        if not no_rydberg:
+            plot_nstar_distribution(df, elements, pdf)
+
+        if perm_df is not None:
+            plot_permutation_importance(perm_df, baseline_mae, pdf)
+
+
+def build_xlsx(out_path, df, features, targets, mi_results, perm):
+    perm_df, _ = perm
+    print(f"  writing XLSX → {out_path}")
+    mi_wide = mi_results_to_wide(mi_results)
+    target_cols = [c for c, _ in targets]
+    corr_cols = [c for c in features + target_cols if c in df.columns]
+    corr = df[corr_cols].corr()
+    summary = build_summary_table(df, features)
+    samples = df.groupby("Element").size().rename("n_samples").to_frame()
+
+    with pd.ExcelWriter(out_path, engine="openpyxl") as xl:
+        if mi_wide is not None:
+            mi_wide.to_excel(xl, sheet_name="mutual_information")
+        corr.to_excel(xl, sheet_name="correlation")
+        summary.to_excel(xl, sheet_name="summary_stats", index=False)
+        samples.to_excel(xl, sheet_name="samples_per_element")
+        if perm_df is not None:
+            perm_df.to_excel(xl, sheet_name="permutation_importance", index=False)
+
+
+_HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Feature Analysis — {title}</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+ body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background:#f7f8fa; color:#1f2937; }}
+ header {{ background:#1e293b; color:#fff; padding:24px 32px; }}
+ header h1 {{ margin:0 0 6px; font-size:22px; }}
+ header p {{ margin:0; color:#cbd5e1; font-size:14px; }}
+ main {{ max-width:1100px; margin:0 auto; padding:24px 32px; }}
+ .card {{ background:#fff; border:1px solid #e5e7eb; border-radius:10px; padding:18px 20px; margin-bottom:22px; box-shadow:0 1px 2px rgba(0,0,0,.04); }}
+ .card h2 {{ margin:0 0 14px; font-size:16px; }}
+ table {{ border-collapse:collapse; width:100%; font-size:13px; }}
+ th, td {{ border:1px solid #e5e7eb; padding:6px 9px; text-align:right; }}
+ th {{ background:#f1f5f9; }}
+ td:first-child, th:first-child {{ text-align:left; }}
+ .chips span {{ display:inline-block; background:#e0e7ff; color:#3730a3; border-radius:12px; padding:2px 10px; margin:2px; font-size:12px; }}
+</style></head><body>
+<header>
+ <h1>Feature Analysis Report</h1>
+ <p>{subtitle}</p>
+</header>
+<main>
+ <div class="card"><h2>Overview</h2>{overview}</div>
+ {chart_cards}
+ <div class="card"><h2>Per-feature summary</h2>{summary_table}</div>
+ {perm_table}
+</main>
+<script>
+const CHARTS = {charts_json};
+CHARTS.forEach(c => new Chart(document.getElementById(c.id), {{
+  type:'bar',
+  data:{{ labels:c.labels, datasets:[{{ label:c.title, data:c.values, backgroundColor:c.color }}] }},
+  options:{{ indexAxis:'y', responsive:true, maintainAspectRatio:false,
+    plugins:{{ legend:{{display:false}}, title:{{display:true, text:c.title}} }},
+    scales:{{ x:{{ beginAtZero:true }} }} }}
+}}));
+</script>
+</body></html>"""
+
+
+def build_html(out_path, df, features, elements, modes, targets, mi_results, perm):
+    perm_df, baseline_mae = perm
+    print(f"  writing HTML → {out_path}")
+
+    charts, cards = [], []
+    cidx = 0
+    for label, res in mi_results.items():
+        cid = f"chart{cidx}"
+        cidx += 1
+        charts.append({
+            "id": cid,
+            "title": f"Mutual information — target: {label}",
+            "labels": res["feature"].tolist(),
+            "values": [round(float(v), 4) for v in res["mutual_information"]],
+            "color": "#2563eb",
+        })
+        h = max(220, 22 * len(res))
+        cards.append(f'<div class="card"><h2>Mutual information — {label}</h2>'
+                     f'<div style="height:{h}px"><canvas id="{cid}"></canvas></div></div>')
+
+    if perm_df is not None:
+        cid = f"chart{cidx}"
+        cidx += 1
+        charts.append({
+            "id": cid,
+            "title": f"Permutation importance (baseline MAE {baseline_mae:.1f} cm⁻¹)",
+            "labels": perm_df["feature"].tolist(),
+            "values": [round(float(v), 3) for v in perm_df["mean_mae_increase"]],
+            "color": "#16a34a",
+        })
+        h = max(220, 22 * len(perm_df))
+        cards.append(f'<div class="card"><h2>Permutation importance (model-based)</h2>'
+                     f'<div style="height:{h}px"><canvas id="{cid}"></canvas></div></div>')
+
+    mode_chips = " ".join(f"<span>{el}: {modes.get(el, '?')}</span>" for el in elements)
+    overview = (
+        f'<p><b>{len(df)}</b> samples across <b>{len(elements)}</b> element(s); '
+        f'<b>{len(features)}</b> features analysed against '
+        f'<b>{len(targets)}</b> target(s).</p>'
+        f'<p>Input mode per element:</p><div class="chips">{mode_chips}</div>'
+        f'<p style="margin-top:10px;color:#6b7280;font-size:13px">Features: '
+        f'{", ".join(features)}</p>'
+    )
+
+    summary = build_summary_table(df, features).round(4)
+    summary_table = summary.to_html(index=False, border=0)
+
+    perm_table = ""
+    if perm_df is not None:
+        perm_table = ('<div class="card"><h2>Permutation importance table</h2>'
+                      + perm_df.round(3).to_html(index=False, border=0) + "</div>")
+
+    html = _HTML_TEMPLATE.format(
+        title=", ".join(elements),
+        subtitle=f"{', '.join(elements)} · n={len(df)} · generated {_dt.date.today().isoformat()}",
+        overview=overview,
+        chart_cards="\n".join(cards),
+        summary_table=summary_table,
+        perm_table=perm_table,
+        charts_json=json.dumps(charts),
+    )
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(html)
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -681,136 +1148,54 @@ def plot_nstar_distribution(df: pd.DataFrame, elements: list, pdf: PdfPages):
 
 def main():
     args = parse_args()
-    elements = args.elements
+    settings, element_info = load_preprocess_config(args.config)
 
-    out_path = args.out or os.path.join(
-        "reports", f"features_{'_'.join(elements)}.pdf"
-    )
-    os.makedirs(os.path.dirname(out_path) if os.path.dirname(out_path) else ".", exist_ok=True)
+    source = (args.source or settings["source"]).lower()
+    data_dir = args.data_dir or settings["data_dir"]
+    report_dir = settings["report_dir"]
+    elements = args.elements or list(element_info.keys())
+    formats = [f.strip().lower() for f in args.formats.split(",") if f.strip()]
 
-    # Load data
-    print(f"Loading elements: {elements}")
-    dfs = []
-    for el in elements:
-        d = load_element(el, args.data_dir, args.level_col)
-        d = add_valence_encoding(d, max_valence=1)
-        dfs.append(d)
-        print(f"  {el}: {len(d)} samples, level range "
-              f"{d[args.level_col].min():.0f}–{d[args.level_col].max():.0f} cm⁻¹")
+    ensure_element_colors(elements)
 
-    df = pd.concat(dfs, ignore_index=True)
-    print(f"Combined: {len(df)} samples")
+    print(f"Analysing elements: {elements}  (source preference: {source})")
+    df, modes = load_elements(elements, data_dir, source, element_info)
+    print(f"Combined: {len(df)} samples;  modes={modes}")
 
-    if not args.no_rydberg:
-        print("Computing Rydberg features...")
-        df = add_rydberg_features(df, args.level_col)
-        df["log_binding_energy"]     = np.log(df["binding_energy"].clip(lower=1e-6))
-        df["inverse_binding_energy"] = 1.0 / df["binding_energy"].replace(0, np.nan)
-        print("  Done.")
+    features = select_features(df, modes, element_info)
+    targets = get_targets(df)
+    print(f"Features ({len(features)}): {features}")
+    print(f"Targets: {[lbl for _, lbl in targets]}")
 
-    print("Computing derived features...")
-    df = add_derived_features(df)
-    print("  Done.")
+    mi_results = compute_mi_table(df, features, targets)
 
-    # Define feature sets to analyse
-    base_features = ["val_e1_n", "val_e1_l", "J"]
-    quantum_features = ["S_qn", "L_qn"]
-    atomic_features = ["Z", "A"]
-    rydberg_features = ["n_star", "rydberg_pred", "one_over_nstar_sq"]
-    derived_features = ["total_electrons", "max_principal_n", "valence_electrons",
-                        "core_electrons", "unpaired_electrons"]
+    # Optional model-based permutation importance.
+    perm = (None, None)
+    if not args.no_permutation and (args.checkpoint or any(m == "rich" for m in modes.values())):
+        print("Permutation importance:")
+        perm = run_permutation_importance(args.training_config, args.checkpoint)
 
-    all_features = (
-        base_features +
-        [f for f in quantum_features if f in df.columns] +
-        [f for f in atomic_features if f in df.columns] +
-        [f for f in rydberg_features if f in df.columns] +
-        [f for f in derived_features if f in df.columns]
-    )
-    all_features = [f for f in all_features if f in df.columns]
+    # Output base path.
+    if args.out:
+        base = args.out
+    else:
+        os.makedirs(report_dir, exist_ok=True)
+        base = os.path.join(report_dir, f"features_{'_'.join(elements)}_{source}")
+    out_dir = os.path.dirname(base)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
-    # Build target columns for correlation analysis
-    target_cols = []
-    if "log_binding_energy" in df.columns:
-        target_cols.append("log_binding_energy")
-    if "binding_energy" in df.columns:
-        target_cols.append("binding_energy")
-    if args.level_col in df.columns:
-        target_cols.append(args.level_col)
-    if "inverse_binding_energy" in df.columns:
-        target_cols.append("inverse_binding_energy")
+    no_rydberg = args.no_rydberg or ("n_star" not in df.columns) or df["n_star"].dropna().empty
 
-    # MI targets: (column_name, display_label) — keep only those present in df
-    _mi_candidates = [
-        ("log_binding_energy",     "log_binding_energy"),
-        (args.level_col,           f"raw_energy ({args.level_col})"),
-        ("binding_energy",         "binding_energy"),
-        ("inverse_binding_energy", "inverse_binding_energy"),
-    ]
-    mi_targets = [(col, lbl) for col, lbl in _mi_candidates if col in df.columns]
+    print("Writing reports:")
+    if "pdf" in formats:
+        build_pdf(base + ".pdf", df, features, elements, targets, mi_results, perm, no_rydberg)
+    if "xlsx" in formats:
+        build_xlsx(base + ".xlsx", df, features, targets, mi_results, perm)
+    if "html" in formats:
+        build_html(base + ".html", df, features, elements, modes, targets, mi_results, perm)
 
-    # Scatter targets beyond log_binding_energy
-    scatter_extra_targets = [t for t in [args.level_col, "binding_energy", "inverse_binding_energy"]
-                              if t in df.columns]
-
-    target_for_log_scatter = "log_binding_energy" if "log_binding_energy" in df.columns \
-        else args.level_col
-
-    print(f"\nFeatures to analyse: {all_features}")
-    print(f"MI targets: {[lbl for _, lbl in mi_targets]}")
-    print(f"\nWriting report to: {out_path}")
-
-    with PdfPages(out_path) as pdf:
-
-        # Title page
-        fig, ax = plt.subplots(figsize=(12, 6))
-        ax.axis("off")
-        ax.text(0.5, 0.65,
-                "Feature Analysis Report",
-                ha="center", va="center", fontsize=22, fontweight="bold",
-                transform=ax.transAxes)
-        ax.text(0.5, 0.5,
-                f"Elements: {', '.join(elements)}    ·    n={len(df)} total samples",
-                ha="center", va="center", fontsize=14,
-                transform=ax.transAxes, color="#5a5a5a")
-        ax.text(0.5, 0.38,
-                f"Features analysed: {', '.join(all_features)}",
-                ha="center", va="center", fontsize=11,
-                transform=ax.transAxes, color="#7a7a7a")
-        pdf.savefig(fig, bbox_inches="tight")
-        plt.close(fig)
-
-        print("  [1] Feature distributions...")
-        plot_feature_distributions(df, all_features, elements, args.level_col, pdf)
-
-        print("  [2] Correlation matrix...")
-        plot_correlation_matrix(df, all_features, pdf, targets=target_cols)
-
-        print("  [3] Mutual information ranking (all targets)...")
-        plot_mutual_information(df, all_features, mi_targets, pdf)
-
-        print("  [4] Feature vs log-binding-energy scatter...")
-        plot_feature_target_scatter(df, all_features, target_for_log_scatter, elements, pdf)
-
-        for extra_target in scatter_extra_targets:
-            print(f"  [4+] Feature vs {extra_target} scatter...")
-            plot_feature_target_scatter(df, all_features, extra_target, elements, pdf)
-
-        if not args.no_rydberg:
-            print("  [5] Rydberg residuals...")
-            plot_rydberg_residuals(df, args.level_col, elements, pdf)
-
-            print("  [6] Quantum defect stability...")
-            plot_quantum_defect(df, elements, pdf)
-
-        print("  [7] Feature ranges by element...")
-        plot_feature_ranges(df, all_features, elements, pdf)
-
-        if not args.no_rydberg:
-            print("  [8] n* distribution...")
-            plot_nstar_distribution(df, elements, pdf)
-
-    print(f"\nDone. Report: {out_path}")
+    print(f"\nDone. Report base: {base}  formats={formats}")
 
 
 if __name__ == "__main__":

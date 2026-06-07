@@ -1,0 +1,88 @@
+# ===========================================================================
+# Preprocessing / feature-analysis configuration
+# ===========================================================================
+# Source of truth for feature engineering (preprocess/preprocess_atomic.py) and
+# feature analysis (preprocess/analyze_features.py). These steps are run a priori,
+# separately from training, and may cover many elements at once.
+#
+# Training (config_atomic.yaml) is a pure CONSUMER of the produced
+# data/<El>_features_rich_<source>.xlsx files; it does not read this file.
+#
+# Run examples:
+#   python preprocess/preprocess_atomic.py --config config_preprocess.yaml
+#   python preprocess/preprocess_atomic.py --config config_preprocess.yaml --elements Co --source nist
+#   python preprocess/analyze_features.py  --config config_preprocess.yaml --elements Li Na K Rb Cs Fr
+# ===========================================================================
+
+source: kurucz                 # active raw source (nist | kurucz); --source overrides
+data_dir: data                 # where rich xlsx are written / read
+report_dir: preprocess/reports # where analyze_features.py writes its reports
+
+# Fallback values merged into every element entry when the key is absent.
+defaults:
+  inverse_target_scale: 100000.0   # A in Inverse_Binding_Energy = A / binding
+  zeta_3d: 0.0                     # only transition metals have a meaningful 3d ζ
+
+# Per-element table. Each entry is self-contained; preprocess_atomic.py loops over
+# the selected subset (all by default, or those passed via --elements).
+#   symbol             element symbol (also the Element column value)
+#   Z, A               atomic and mass numbers
+#   ionization_energy  first ionization energy, cm^-1 (sets the binding-energy zero)
+#   max_valence        valence electrons encoded as (n, l) slots
+#   zeta_3d            3d spin-orbit coupling constant, cm^-1 (0 for alkali)
+#   input_files        raw input path per source ({source: path})
+elements:
+  # --- Transition metal (rich xlsx already generated) --------------------
+  - symbol: Co
+    Z: 27
+    A: 59
+    ionization_energy: 63564.0   # Co I, cm^-1
+    max_valence: 9
+    zeta_3d: 515.0               # Co I 3d spin-orbit coupling constant
+    input_files:
+      kurucz: data/kurucz/Co_raw.xlsx
+      nist:   data/nist/Co_i.csv
+
+  # --- Alkali atoms -----------------------------------------------------
+  # NOTE: preprocess_atomic.py is currently transition-metal oriented (Co core,
+  # 3d features, Rydberg columns hardcoded to 0). The alkali atoms are analysed
+  # by analyze_features.py from their existing data/<El>_features.csv files
+  # (auto-detected), where Rydberg features are computed on the fly using the
+  # ionization energies below. The entries are kept here so analysis pulls every
+  # per-element constant from one place rather than hardcoding them.
+  - symbol: Li
+    Z: 3
+    A: 7
+    ionization_energy: 43487.114
+    max_valence: 1
+    input_files: { nist: data/nist/Li_i.csv }
+  - symbol: Na
+    Z: 11
+    A: 23
+    ionization_energy: 41449.451
+    max_valence: 1
+    input_files: { nist: data/nist/Na_i.csv }
+  - symbol: K
+    Z: 19
+    A: 39
+    ionization_energy: 35009.814
+    max_valence: 1
+    input_files: { nist: data/nist/K_i.csv }
+  - symbol: Rb
+    Z: 37
+    A: 85
+    ionization_energy: 33690.81
+    max_valence: 1
+    input_files: { nist: data/nist/Rb_i.csv }
+  - symbol: Cs
+    Z: 55
+    A: 133
+    ionization_energy: 31406.467
+    max_valence: 1
+    input_files: { nist: data/nist/Cs_i.csv }
+  - symbol: Fr
+    Z: 87
+    A: 223
+    ionization_energy: 32848.872
+    max_valence: 1
+    input_files: { nist: data/nist/Fr_i.csv }

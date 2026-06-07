@@ -1,22 +1,12 @@
-# Standalone feature-engineering step (preprocess_atomic.py).
-# Reads a raw level file for the active dataset.dataset_source (nist/kurucz) and
-# writes a rich feature XLSX with ALL computed features. The output filename gets
-# the source suffix automatically (e.g. Co_features_rich_kurucz.xlsx). AtomicDataset.py
-# then loads the matching source file and selects columns by name.
-preprocessing:
-  # Raw input file per source; the active one is chosen by dataset.dataset_source.
-  input_files:
-    kurucz: "data/kurucz/Co_raw.xlsx"   # intermediate raw-schema XLSX
-    nist:   "data/nist/Co_i.csv"               # NIST Excel-exported CSV
-  # Rich-feature output. The "_<source>" suffix is appended automatically, so any
-  # source suffix already present here is replaced (kurucz <-> nist).
-  output_file: "data/Co_features_rich.xlsx"
-  element: "Co"
-  Z: 27
-  A: 59
-  ionization_energy: 63564.0  # Co I ionization energy in cm^-1
-  max_valence: 9              # max valence electrons encoded as (n, l) slots
-  zeta_3d: 515.0             # Co I 3d spin-orbit coupling constant (cm^-1)
+# =============================================================================
+# TRAINING configuration. This file is a pure CONSUMER of the pre-computed rich
+# feature files. Feature engineering (preprocess_atomic.py) and feature analysis
+# (preprocess/analyze_features.py) are configured separately, per element, in
+# config_preprocess.yaml. To (re)generate the rich xlsx this config loads:
+#     python preprocess/preprocess_atomic.py --config config_preprocess.yaml --elements Co
+# The active source below (dataset.dataset_source) must match the suffix of the
+# rich file produced there (e.g. Co_features_rich_kurucz.xlsx).
+# =============================================================================
 
 general:
   epochs: 30000                   # Number of training epochs
