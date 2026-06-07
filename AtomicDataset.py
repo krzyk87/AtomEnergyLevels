@@ -30,10 +30,11 @@ import os
 import re
 
 # NOTE: Binding energy is now pre-computed in preprocess_atomic.py.
-# This dict is retained for convert_predictions_to_absolute() in test_model.py
-# and for any future multi-element merging utilities. It is no longer used to
-# compute binding-energy targets inside this class (those columns are read from
-# the rich XLSX directly).
+# This dict is retained for energy-stratified splitting (_create_splits) and for
+# any future multi-element merging utilities. It is no longer used to compute
+# binding-energy targets inside this class (those columns are read from the rich
+# XLSX directly), nor to invert predictions (E_ion is recovered from the rich
+# file at load time — see _setup_target_inversion).
 IONIZATION_ENERGIES = {
     # Element: (Z, ionization_energy_cm-1)
     'Li': (3, 43487.114),
@@ -130,6 +131,24 @@ FEATURE_GROUPS = {
     'valence_summary': [
         'valence_electrons', 'total_electrons', 'max_principal_n'
     ],
+}
+
+
+# ---------------------------------------------------------------------------
+# Target inversion: map the selected target_feature back to an absolute energy
+# level (OBS.LEVEL, cm^-1) for reporting / metrics / predictions.
+# ---------------------------------------------------------------------------
+RAW_LEVEL_COL = 'OBS.LEVEL'                  # absolute experimental level (cm^-1)
+BINDING_COL = 'Binding_Energy_cm-1'          # E_ion - OBS.LEVEL (>=0)
+INVERSE_BINDING_COL = 'Inverse_Binding_Energy_cm-1'
+
+# How each target_feature column relates to the binding energy, and thus how a
+# model prediction in that space is inverted back to an absolute level.
+TARGET_KIND_BY_COLUMN = {
+    'OBS.LEVEL':                   'raw',      # already a level → identity
+    'Binding_Energy_cm-1':         'binding',  # level = E_ion - y
+    'Log_Binding_Energy_cm-1':     'log',      # level = E_ion - exp(y)
+    'Inverse_Binding_Energy_cm-1': 'inverse',  # level = E_ion - scale/y
 }
 
 
@@ -238,6 +257,11 @@ class AtomicDataset(Dataset):
         # Extract features (X) and target (y) for this subset
         self.X = self.df.loc[self.indices, self.feature_columns].values
         self.y = self.df.loc[self.indices, self.target_column].values.reshape(-1, 1)
+
+        # Resolve how to invert the chosen target back to an absolute level, and
+        # recover E_ion from the rich file, so predictions / metrics are reported
+        # in physical cm^-1 regardless of which target_feature was selected.
+        self._setup_target_inversion()
 
         # Normalize features and target if requested
         if config.dataset.normalize_features:
@@ -802,7 +826,10 @@ class AtomicDataset(Dataset):
         from sklearn.model_selection import train_test_split
 
         n_bins = int(self.config.dataset.get('stratify_energy_bins', 5))
-        raw_level_col = self.config.dataset.target_feature  # original level column
+        # Always bin on the physical absolute level, independent of which
+        # target_feature is selected (binding/log/inverse are NOT raw levels).
+        raw_level_col = RAW_LEVEL_COL if RAW_LEVEL_COL in self.df.columns \
+            else self.config.dataset.target_feature
         use_gj = self._use_gj_stratification()
         if use_gj:
             n_obs = int(self.df['has_obs_gj'].sum())
@@ -1112,45 +1139,101 @@ class AtomicDataset(Dataset):
         """Return the number of input features (dimensionality)."""
         return len(self.feature_columns)
 
+    def _setup_target_inversion(self):
+        """
+        Resolve the target *kind* and recover E_ion / inverse-scale from the rich
+        file, so inverse_transform_target() can map any target_feature back to an
+        absolute energy level (OBS.LEVEL, cm^-1).
+
+        The rich file always carries both OBS.LEVEL and Binding_Energy_cm-1, and by
+        construction (binding = E_ion - level, clipped at 0) every row with
+        binding > 0 satisfies  OBS.LEVEL + Binding_Energy_cm-1 = E_ion exactly.
+        E_ion is therefore recovered directly from the data — no config coupling —
+        as a per-dataset constant (exact for a single element).
+
+        Sets:
+            self._target_kind   'raw' | 'binding' | 'log' | 'inverse'
+            self.E_ion          float ionization energy (cm^-1) or None for 'raw'
+            self._inverse_scale float A in Inverse_Binding = A / binding
+        """
+        self._target_kind = TARGET_KIND_BY_COLUMN.get(self.target_column, 'raw')
+        if self.target_column not in TARGET_KIND_BY_COLUMN:
+            print(f"  ⚠️  target_feature '{self.target_column}' is not a known binding "
+                  f"transform; inverse_transform_target() will treat it as a raw level "
+                  f"(identity).")
+
+        self.E_ion = None
+        # Default scale from config (preprocess uses 100000); refined from data below.
+        self._inverse_scale = float(self.config.dataset.get('inverse_target_scale', 100000.0))
+
+        df = self.df
+        if RAW_LEVEL_COL in df.columns and BINDING_COL in df.columns:
+            binding = df[BINDING_COL]
+            valid = binding > 0
+            if valid.any():
+                # OBS.LEVEL + binding == E_ion on every unclipped row (constant).
+                self.E_ion = float((df[RAW_LEVEL_COL] + binding)[valid].median())
+                if INVERSE_BINDING_COL in df.columns:
+                    prod = (df[INVERSE_BINDING_COL] * binding)[valid].dropna()
+                    if not prod.empty:
+                        self._inverse_scale = float(prod.median())
+
+        if self._target_kind != 'raw' and self.E_ion is None:
+            raise ValueError(
+                f"Cannot invert target '{self.target_column}' to absolute levels: the "
+                f"rich file lacks usable '{RAW_LEVEL_COL}'/'{BINDING_COL}' columns needed "
+                f"to recover E_ion."
+            )
+
     def inverse_transform_target(self, y_normalized: np.ndarray) -> np.ndarray:
         """
-        Convert normalized target values back to original scale (cm⁻¹).
+        Convert model output back to an absolute energy level in cm⁻¹.
 
-        This is used after making predictions to convert the model's output
-        (which is in normalized space) back to physical energy levels.
         Undoes, in order:
             1. StandardScaler normalization (if normalize_target=True)
-            2. Inverse scaling: E = A / model_output  (if use_inverse_target=True)
+            2. the binding-energy transform implied by target_feature, all the way
+               back to an absolute level:
+                   raw      → identity                 (already a level)
+                   binding  → level = E_ion - y
+                   log      → level = E_ion - exp(y)
+                   inverse  → level = E_ion - scale/y
+
+        Because targets and predictions are both routed through this function, all
+        reported metrics (train/val/test MAE, RMSE, …) and the saved predictions
+        come out in physical cm⁻¹ for every target_feature, and inverting the stored
+        targets round-trips back to OBS.LEVEL.
 
         Args:
-            y_normalized: Normalized target values
+            y_normalized: model output (or stored target) in the target space.
 
         Returns:
-            Target values in original scale (cm⁻¹)
+            Absolute energy levels in cm⁻¹, same shape as the input.
         """
-        y = y_normalized.copy()
-        # Step 1: undo StandardScaler
+        y = np.asarray(y_normalized, dtype=float).copy()
+
+        # Step 1: undo StandardScaler (only if the target was standardized).
         if self.scaler_target is not None:
-            y = self.scaler_target.inverse_transform(y_normalized)
+            y = self.scaler_target.inverse_transform(y)
 
-        # Step 2: undo A / E_target  →  E_target = A / y
-        if self.config.dataset.get('use_inverse_target', False):
-            A = self.config.dataset.get('inverse_target_scale', 100000)
-            # Clip to avoid division by zero from a near-zero model output
-            clipped = np.clip(y, a_min=1e-6, a_max=None)
-            # Warn if any values were actually clipped (signals a poorly predicted sample)
-            n_clipped = np.sum(y < 1e-6)
+        kind = getattr(self, '_target_kind', 'raw')
+        if kind == 'raw':
+            return y                                    # already an absolute level
+
+        # Step 2: undo the binding-energy transform → binding energy (cm^-1).
+        if kind == 'log':
+            # Clip the exponent so a wild prediction cannot overflow exp().
+            binding = np.exp(np.clip(y, a_min=None, a_max=25.0))
+        elif kind == 'inverse':
+            n_clipped = int(np.sum(y < 1e-6))
             if n_clipped > 0:
-                print(f"  ⚠️  WARNING: {n_clipped} predictions clipped before inversion "
-                      f"(model output near zero → unphysically large energy). "
-                      f"Min raw value: {y.min():.6f}")
-            y = A / clipped
+                print(f"  ⚠️  WARNING: {n_clipped} predictions clipped before inverse-target "
+                      f"inversion (model output near zero → unphysically large energy).")
+            binding = self._inverse_scale / np.clip(y, a_min=1e-6, a_max=None)
+        else:  # 'binding'
+            binding = y
 
-        if self.config.dataset.get('use_log_target', False):
-            # RuntimeWarning: overflow encountered in exp
-            y = np.exp(y)
-
-        return y
+        # Step 3: binding energy → absolute level: E_level = E_ion - binding.
+        return self.E_ion - binding
 
     def inverse_transform_gj(self, y: np.ndarray,
                               calc_gj: np.ndarray = None) -> np.ndarray:

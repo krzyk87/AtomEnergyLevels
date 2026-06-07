@@ -33,35 +33,6 @@ from utils import (load_checkpoint, get_model_name_from_config,
                    append_metrics_to_excel, _get_elements_str, get_experiment_tags)
 
 
-def convert_predictions_to_absolute(
-        binding_energy_predictions: np.ndarray,
-        element: str
-) -> np.ndarray:
-    """
-    Convert binding energy predictions back to absolute energy levels.
-
-    E_level = E_ionization - ΔE_binding
-
-    Args:
-        binding_energy_predictions: Predicted binding energies (cm⁻¹)
-        element: Element name (e.g., 'Na', 'K')
-
-    Returns:
-        Absolute energy levels (cm⁻¹)
-    """
-    from AtomicDataset import IONIZATION_ENERGIES
-
-    if element not in IONIZATION_ENERGIES:
-        raise ValueError(f"Unknown element: {element}")
-
-    Z, E_ion = IONIZATION_ENERGIES[element]
-
-    # E_level = E_ion - ΔE_binding
-    energy_levels = E_ion - binding_energy_predictions
-
-    return energy_levels
-
-
 def compute_metrics(
     predictions: np.ndarray, 
     targets: np.ndarray
@@ -207,28 +178,39 @@ def test_model(
     # Build gJ results dict (multitask only)
     gj_results = None
     if is_multitask and all_gj_preds:
-        gj_pred_all   = np.concatenate(all_gj_preds).flatten()    # (N,)
-        gj_target_all = np.concatenate(all_gj_targets).flatten()   # (N,)
+        gj_pred_all   = np.concatenate(all_gj_preds).flatten()    # (N,) model output
+        gj_target_all = np.concatenate(all_gj_targets).flatten()   # (N,) stored target
         gj_mask_all   = np.concatenate(all_gj_masks).flatten()     # (N,)
 
-        # gJ is not normalised — inverse_transform_gj is identity, called for API symmetry
+        # Recover the physical obs_gj scale for BOTH predictions and targets.
+        # In 'residual' mode the model predicts (obs_gj − calc_gj) AND the stored
+        # target is that same residual, so inverse_transform_gj adds the Cowan
+        # calc_gj baseline back to each; in 'raw' mode it is the identity.
+        # Applying it to the target too is the piece that was missing — otherwise
+        # gj_observed (and the gJ metrics) stayed in residual space.
         gj_pred_all = test_dataset.inverse_transform_gj(gj_pred_all)
+        gj_obs_all  = test_dataset.inverse_transform_gj(gj_target_all)
 
         observed = gj_mask_all == 1.0
         n_observed = int(observed.sum())
 
+        # Unobserved rows carry no experimental gJ; report NaN rather than the
+        # restored fill value (0 + calc_gj) so the saved column is unambiguous.
+        gj_obs_all = gj_obs_all.copy()
+        gj_obs_all[~observed] = np.nan
+
         if n_observed > 0:
-            # Compute gJ metrics on observed rows only
+            # Compute gJ metrics on observed rows only, in obs_gj scale.
             gj_metrics = compute_metrics(
                 gj_pred_all[observed].reshape(-1, 1),
-                gj_target_all[observed].reshape(-1, 1)
+                gj_obs_all[observed].reshape(-1, 1)
             )
         else:
             gj_metrics = {}
 
         gj_results = {
             'gj_predicted': gj_pred_all,
-            'gj_observed':  gj_target_all,
+            'gj_observed':  gj_obs_all,
             'gj_mask':      gj_mask_all,
             'metrics':      gj_metrics,
             'n_observed':   n_observed,
@@ -474,55 +456,19 @@ def test_one_run(
     load_checkpoint(model, optimizer, checkpoint_path, device)
 
     # Evaluate on test set.
-    # test_model() calls test_dataset.inverse_transform_target() internally,
-    # which handles ALL inverse steps in the correct order:
-    #   1. Undo StandardScaler normalisation
-    #   2. Undo A / E_target  (if use_inverse_target=True)
-    # After this, predictions_cm and targets_cm are in the actual target space:
-    #   - binding energy (cm⁻¹)  if use_binding_energy=True
-    #   - absolute E_level (cm⁻¹) otherwise
+    # test_model() calls test_dataset.inverse_transform_target() internally, which
+    # inverts whichever target_feature was used (raw / binding / log / inverse) all
+    # the way back to an absolute energy level, so predictions_cm and targets_cm are
+    # always in physical cm⁻¹.
     # gj_results is None in single-task mode; a dict in multi-task mode.
     metrics, predictions_cm, targets_cm, gj_results = test_model(
         model, test_loader, device, test_dataset, config
     )
 
-    # If trained on binding energies, convert predictions back to absolute energy levels
-    # This is a display-only step: E_level = E_ion - binding_energy.
-    # We do NOT do this when use_inverse_target=True, because in that mode
-    # the target is already A / binding_energy, and inverse_transform_target()
-    # has already recovered the binding energy; the conversion below is
-    # still correct and safe to apply.
-    if config.dataset.get('use_binding_energy', False):
-        # Get element from the dataset (supports both single and multi-element datasets)
-        unique_elements = test_dataset.df['Element'].unique()
-        if len(unique_elements) > 1:
-            print(
-                f"Warning: Multiple elements in test set: {unique_elements}. "
-                f"Per-element conversion used."
-            )
-            # Multi-element: convert per row using the element column
-            indices = test_dataset.indices
-            elements = test_dataset.df.loc[indices, 'Element'].values
-            abs_predictions = np.array([
-                convert_predictions_to_absolute(
-                    np.array([predictions_cm.flatten()[i]]), elem
-                )[0]
-                for i, elem in enumerate(elements)
-            ])
-            abs_targets = np.array([
-                convert_predictions_to_absolute(
-                    np.array([targets_cm.flatten()[i]]), elem
-                )[0]
-                for i, elem in enumerate(elements)
-            ])
-        else:
-            element = unique_elements[0]
-            abs_predictions = convert_predictions_to_absolute(predictions_cm, element)
-            abs_targets = convert_predictions_to_absolute(targets_cm, element)
-
-        predictions_cm = abs_predictions
-        targets_cm = abs_targets
-        metrics = compute_metrics(predictions_cm, targets_cm)
+    # predictions_cm / targets_cm are already absolute energy levels in cm⁻¹:
+    # AtomicDataset.inverse_transform_target() inverts whichever target_feature was
+    # used (raw / binding / log / inverse) all the way back to OBS.LEVEL. No extra
+    # binding→level conversion is needed here.
 
     # Print results — gJ section shown automatically when gj_results is not None
     print_metrics(metrics, gj_results=gj_results)

@@ -183,6 +183,16 @@ def _get_elements_str(config) -> str:
     return base
 
 
+# Short target tag per target_feature column (rich-file architecture). Mirrors the
+# labels generate_report.py expects ('raw' / 'binded' / 'log-binded' / 'inv-binded').
+_TARGET_TAG_BY_COLUMN = {
+    'OBS.LEVEL':                   'raw',
+    'Binding_Energy_cm-1':         'binded',
+    'Log_Binding_Energy_cm-1':     'log-binded',
+    'Inverse_Binding_Energy_cm-1': 'inv-binded',
+}
+
+
 def get_experiment_tags(config) -> str:
     """
     Build a short tag string encoding target type and sample-weighting strategy.
@@ -206,19 +216,9 @@ def get_experiment_tags(config) -> str:
     Returns:
         Tag string, e.g. 'log-binded_no-weights' or 'inv-binded_bins'
     """
-    use_binding = config.dataset.get('use_binding_energy', False)
-    use_inverse = config.dataset.get('use_inverse_target', False)
-    if use_binding and use_inverse:
-        target_tag = 'inv-binded'
-    elif use_binding:
-        target_tag = 'binded'
-    elif use_inverse:
-        target_tag = 'inv-raw'
-    else:
-        target_tag = 'raw'
-
-    if config.dataset.get('use_log_target', False):
-        target_tag = f'log-{target_tag}'
+    # Target type is selected by the target_feature COLUMN NAME (the rich-file
+    # architecture), not by the legacy use_*_target boolean flags.
+    target_tag = _TARGET_TAG_BY_COLUMN.get(config.dataset.target_feature, 'raw')
 
     use_weights = config.dataset.get('use_sample_weights', False)
     if use_weights:
@@ -336,9 +336,12 @@ def append_metrics_to_excel(config, test_metrics, train_metrics=None, val_metric
     row["target_feature"] = (
         features.get("target_column") if features is not None else None
     ) or config.dataset.target_feature
-    row["use_binding_energy"] = config.dataset.get("use_binding_energy", False)
-    row["use_inverse_target"] = config.dataset.get("use_inverse_target", False)
-    row["use_log_target"] = config.dataset.get("use_log_target", False)
+    # Target type is now driven by target_feature; derive the legacy boolean labels
+    # from it so the results sheet / generate_report.py keep labelling runs correctly.
+    _tf = config.dataset.target_feature
+    row["use_binding_energy"] = (_tf == "Binding_Energy_cm-1")
+    row["use_inverse_target"] = (_tf == "Inverse_Binding_Energy_cm-1")
+    row["use_log_target"] = (_tf == "Log_Binding_Energy_cm-1")
     row["normalize_features"] = config.dataset.normalize_features
     row["normalize_target"] = config.dataset.normalize_target
     row["use_sample_weights"] = config.dataset.get("use_sample_weights", False)
