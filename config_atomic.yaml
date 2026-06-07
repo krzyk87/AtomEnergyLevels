@@ -97,6 +97,10 @@ dataset:
     val: 0.2
     test: 0.2
   stratify_energy_bins: 10   # quantile bins per element; 0 = element-only stratification
+  stratify_by_gj: true       # also stratify on observed-gJ presence (has_obs_gj);
+                             # only active when training.multitask_gj is true.
+                             # Recommend stratify_energy_bins: 5 when this is on,
+                             # so the (bin x gj) product stays well-populated.
 
   # === Missing values ===
   drop_missing: false           # Drop rows with missing values

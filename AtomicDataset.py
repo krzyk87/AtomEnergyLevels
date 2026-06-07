@@ -701,6 +701,12 @@ class AtomicDataset(Dataset):
         For multi-element data, creates stratified splits to ensure
         each element is represented in all splits.
         """
+        # Current stratification scheme (stored in / compared against the file).
+        current_scheme = {
+            'energy_bins': int(self.config.dataset.get('stratify_energy_bins', 5)),
+            'by_gj': self._use_gj_stratification(),
+        }
+
         # Determine split file name
         split_file = self._get_split_file_path()
         print(f"\nData split file: {split_file}")
@@ -709,6 +715,13 @@ class AtomicDataset(Dataset):
         if os.path.exists(split_file):
             with open(split_file, 'r') as f:
                 splits = json.load(f)
+            # Warn (but still use) if the saved split predates the current
+            # stratification scheme — delete the file to regenerate it.
+            saved_scheme = splits.get('metadata', {}).get('stratification')
+            if saved_scheme is not None and dict(saved_scheme) != current_scheme:
+                print(f"  ⚠ Existing split was built with a DIFFERENT stratification "
+                      f"scheme ({dict(saved_scheme)}) than the current config "
+                      f"({current_scheme}). Delete {split_file} to regenerate.")
             self.indices = splits[self.subset]
             print(f"  ✓ Loaded existing {self.subset} split: {len(self.indices)} samples")
             return
@@ -729,6 +742,7 @@ class AtomicDataset(Dataset):
                 'created_date': str(pd.Timestamp.now()),
                 'random_seed': self.config.general.random_seed,
                 'elements': self.df['Element'].unique().tolist() if 'Element' in self.df.columns else [],
+                'stratification': current_scheme,   # energy_bins + by_gj scheme
                 'train_size': len(train_indices),
                 'val_size': len(val_indices),
                 'test_size': len(test_indices),
@@ -744,35 +758,69 @@ class AtomicDataset(Dataset):
 
         self.indices = splits[self.subset]
 
+    def _use_gj_stratification(self) -> bool:
+        """
+        Whether the train/val/test split should also stratify on observed-gJ.
+
+        Only active when ALL of:
+          - multi-task gJ learning is enabled (training.multitask_gj), AND
+          - dataset.stratify_by_gj is true (default true), AND
+          - the 'has_obs_gj' column is present in the loaded data.
+
+        Rationale: the gJ head is supervised only on rows with an observed gJ, so
+        balancing has_obs_gj across splits keeps the gJ task trainable and gives
+        val/test enough observed rows to evaluate gJ MAE. When multitask is off
+        there is no gJ task, so this returns False and the split is identical to
+        the previous element × energy-bin behaviour.
+        """
+        return bool(
+            self.config.training.get('multitask_gj', False)
+            and self.config.dataset.get('stratify_by_gj', True)
+            and 'has_obs_gj' in self.df.columns
+        )
+
     def _create_stratified_splits(self):
         """
-        Create stratified splits by element × energy quantile bin.
+        Create stratified splits by element × energy quantile bin, and — when
+        multi-task gJ is active — also by observed-gJ presence (has_obs_gj).
 
         For each element, energy levels are divided into n_bins quantile bins
-        (equal sample count per bin). The stratum label is 'ELEMENT_binN'.
-        This guarantees that both rare low-energy states AND the dense
-        high-energy cluster are proportionally represented in every split.
+        (equal sample count per bin). The base stratum label is 'ELEMENT_binN';
+        when gJ stratification is on, an observed-gJ suffix is appended:
+        'ELEMENT_binN_g0' (gJ missing) / 'ELEMENT_binN_g1' (gJ observed).
+        This guarantees rare low-energy states, the dense high-energy cluster,
+        AND the observed/missing-gJ rows are proportionally represented in every
+        split.
 
         Works for single-element datasets too: the 'element' part of the
-        stratum label is constant, so stratification is purely by energy bin.
+        stratum label is constant, so stratification is purely by energy (× gJ).
 
-        Config key: dataset.stratify_energy_bins (default: 5, set 0 to disable)
+        Config keys:
+          dataset.stratify_energy_bins  (default 5, set 0 to disable energy bins)
+          dataset.stratify_by_gj        (default true; gated on multitask_gj)
         """
         from sklearn.model_selection import train_test_split
 
         n_bins = int(self.config.dataset.get('stratify_energy_bins', 5))
         raw_level_col = self.config.dataset.target_feature  # original level column
+        use_gj = self._use_gj_stratification()
+        if use_gj:
+            n_obs = int(self.df['has_obs_gj'].sum())
+            print(f"  Stratifying also on observed-gJ (has_obs_gj): "
+                  f"{n_obs}/{len(self.df)} rows observed")
 
         # ----------------------------------------------------------------
-        # Build stratum labels: 'ELEMENT_bin0' .. 'ELEMENT_bin{n_bins-1}'
+        # Build stratum labels: 'ELEMENT_bin{n}' (+ '_g{0|1}' when use_gj)
         # ----------------------------------------------------------------
         strata = []
         for idx, row in self.df.iterrows():
             element = row.get('Element', 'X')
+            # Third key: observed-gJ presence (only when gJ stratification is on)
+            g_suffix = f"_g{int(row['has_obs_gj'])}" if use_gj else ""
 
             if n_bins <= 1:
-                # No energy stratification — stratify by element only
-                strata.append(element)
+                # No energy stratification — stratify by element (× gJ)
+                strata.append(f"{element}{g_suffix}")
                 continue
 
             level = row.get(raw_level_col, np.nan)
@@ -782,7 +830,7 @@ class AtomicDataset(Dataset):
                 level = np.nan
 
             if np.isnan(level):
-                strata.append(f"{element}_bin0")
+                strata.append(f"{element}_bin0{g_suffix}")
                 continue
 
             # Compute quantile bin within this element's levels
@@ -799,31 +847,72 @@ class AtomicDataset(Dataset):
             except Exception:
                 bin_label = 0
 
-            strata.append(f"{element}_bin{bin_label}")
+            strata.append(f"{element}_bin{bin_label}{g_suffix}")
 
         strata = np.array(strata)
 
         # ----------------------------------------------------------------
-        # Check minimum bin size — sklearn needs >= 2 per stratum per split
-        # If any stratum has < 4 samples (can't survive two splits), merge
-        # it into the nearest stratum by renaming it.
+        # Keep strata populated — sklearn needs >= 2 per stratum per split, and
+        # the two-stage 60/20/20 split needs ~4. Merge sparse strata in three
+        # scheme-aware steps (works for both 'el_binN' and 'el_binN_gD' labels):
+        #   1. Collapse the gJ sub-split of any energy bin that has a sparse
+        #      (bin, gj) cell — relabel BOTH gj cells of that bin to the energy-
+        #      only base so they actually merge (relaxes gJ balance only where
+        #      data is thin; preserves energy stratification).
+        #   2. Merge any still-sparse stratum into an adjacent energy bin.
+        #   3. Final safety: fold any residual sparse stratum into the largest
+        #      stratum so train_test_split can never fail.
         # ----------------------------------------------------------------
         from collections import Counter
-        counts = Counter(strata)
         MIN_STRATUM_SIZE = 4
-        for label, count in counts.items():
-            if count < MIN_STRATUM_SIZE:
-                # Find replacement: same element, adjacent bin number
-                element = label.rsplit('_bin', 1)[0]
-                bin_num = int(label.rsplit('_bin', 1)[1])
-                # Try bin+1, then bin-1
-                for alt in [bin_num + 1, bin_num - 1, bin_num + 2]:
-                    alt_label = f"{element}_bin{alt}"
-                    if alt_label in counts and counts[alt_label] >= MIN_STRATUM_SIZE:
-                        strata[strata == label] = alt_label
-                        print(f"    ⚠ Merged stratum '{label}' ({count} samples) "
-                              f"→ '{alt_label}'")
+        # Parses 'el_binN' and 'el_binN_gD'; element-only labels won't match.
+        label_re = re.compile(r'^(?P<el>.+)_bin(?P<bin>\d+)(?:_g(?P<g>\d))?$')
+
+        # Step 1 — collapse gJ sub-split where a (bin, gj) cell is sparse.
+        if use_gj:
+            counts = Counter(strata)
+            bin_members = {}   # 'el_binN' base → [composite labels in that bin]
+            for label in counts:
+                m = label_re.match(label)
+                if m and m.group('g') is not None:
+                    base = f"{m.group('el')}_bin{m.group('bin')}"
+                    bin_members.setdefault(base, []).append(label)
+            for base, members in bin_members.items():
+                if any(counts[lb] < MIN_STRATUM_SIZE for lb in members):
+                    for lb in members:
+                        strata[strata == lb] = base   # merge g0 & g1 → base
+                    print(f"    ⚠ Collapsed gJ split for '{base}' (sparse cell)")
+
+        # Step 2 — merge any still-sparse stratum into an adjacent energy bin.
+        counts = Counter(strata)
+        for label in [lb for lb, c in counts.items() if c < MIN_STRATUM_SIZE]:
+            m = label_re.match(label)
+            if not m:
+                continue  # element-only label (no _bin) — nothing to merge into
+            el, bin_num = m.group('el'), int(m.group('bin'))
+            g_sfx = f"_g{m.group('g')}" if m.group('g') is not None else ""
+            merged = False
+            for alt in (bin_num + 1, bin_num - 1, bin_num + 2, bin_num - 2):
+                # Prefer the same gj suffix; fall back to the energy-only base.
+                for cand in (f"{el}_bin{alt}{g_sfx}", f"{el}_bin{alt}"):
+                    if counts.get(cand, 0) >= MIN_STRATUM_SIZE:
+                        strata[strata == label] = cand
+                        counts = Counter(strata)
+                        print(f"    ⚠ Merged stratum '{label}' → '{cand}'")
+                        merged = True
                         break
+                if merged:
+                    break
+
+        # Step 3 — final safety net: fold any residual sparse stratum into the
+        # largest one (guarantees every stratum can survive both split stages).
+        counts = Counter(strata)
+        if any(c < MIN_STRATUM_SIZE for c in counts.values()):
+            largest = max(counts, key=counts.get)
+            for label, c in list(counts.items()):
+                if c < MIN_STRATUM_SIZE and label != largest:
+                    strata[strata == label] = largest
+                    print(f"    ⚠ Merged residual stratum '{label}' ({c}) → '{largest}'")
 
         all_indices = self.df.index.tolist()
         elements = self.df['Element'].values if 'Element' in self.df.columns else None
