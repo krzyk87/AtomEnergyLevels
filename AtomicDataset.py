@@ -50,6 +50,34 @@ IONIZATION_ENERGIES = {
 ALKALI_METALS = {'Li', 'Na', 'K', 'Rb', 'Cs', 'Fr'}
 R_INF = 109737.316  # Rydberg constant in cm-1
 
+# Dataset sources. The rich-feature XLSX and the split JSON are suffixed with the
+# active source (dataset.dataset_source) so the NIST and Kurucz datasets — which
+# have different rows — never share a file. See preprocess_atomic.py, which writes
+# the matching ``_<source>`` rich files.
+SOURCE_SUFFIXES = ('nist', 'kurucz')
+
+
+def with_source_suffix(path, source):
+    """
+    Return *path* with a ``_<source>`` suffix inserted before its extension.
+
+    Any pre-existing recognised source suffix is stripped first, so the result is
+    deterministic whether the configured base path already carries a suffix:
+
+        with_source_suffix('data/Co_features_rich.xlsx', 'kurucz')
+            → 'data/Co_features_rich_kurucz.xlsx'
+        with_source_suffix('data/dataset_split_indices_Co.json', 'nist')
+            → 'data/dataset_split_indices_Co_nist.json'
+    """
+    if not path:
+        return path
+    base, ext = os.path.splitext(path)
+    for k in SOURCE_SUFFIXES:
+        if base.endswith(f'_{k}'):
+            base = base[: -(len(k) + 1)]
+            break
+    return f"{base}_{source}{ext}"
+
 
 # ---------------------------------------------------------------------------
 # Feature group → column mappings.
@@ -274,6 +302,9 @@ class AtomicDataset(Dataset):
         key_dict = {
             'rich_feature_file': ds.get('rich_feature_file', None),
             'rich_feature_files': list(ds.get('rich_feature_files', []) or []),
+            # Source matters: NIST and Kurucz load different rich files / row sets,
+            # so they must never share a cache entry even with identical settings.
+            'dataset_source': ds.get('dataset_source', 'nist'),
             'target_feature': ds.get('target_feature', None),
             'feature_groups': fg_clean,
             'force_include_features': list(ds.get('force_include_features', []) or []),
@@ -304,12 +335,18 @@ class AtomicDataset(Dataset):
         list (rich_feature_files) which are concatenated; the Element column is
         already present in each xlsx (set by preprocess_atomic.py).
 
+        The configured path is treated as a BASE name: the active dataset source
+        (dataset.dataset_source) is appended as a ``_<source>`` suffix so the
+        NIST and Kurucz rich files are loaded from separate workbooks, matching
+        the ``_<source>`` files written by preprocess_atomic.py.
+
         No CSV loading, no feature computation, no Element-column injection.
 
         Returns:
             DataFrame with all pre-computed columns.
         """
         ds = self.config.dataset
+        source = ds.get('dataset_source', 'nist')
 
         # ---- Backward-compatibility guard (Task 9) ----
         # Old configs used 'data_file' / 'elements' to drive CSV loading + on-the-fly
@@ -335,7 +372,8 @@ class AtomicDataset(Dataset):
         files = ds.get('rich_feature_files', None)
         if files:
             all_dfs = []
-            for path in files:
+            for raw_path in files:
+                path = with_source_suffix(raw_path, source)  # add _<source> suffix
                 if not os.path.exists(path):
                     raise FileNotFoundError(f"Rich feature file not found: {path}")
                 d = pd.read_excel(path, sheet_name='features')
@@ -346,9 +384,12 @@ class AtomicDataset(Dataset):
             return df
 
         # ---- Single element: one rich feature file ----
-        path = ds.rich_feature_file
+        path = with_source_suffix(ds.rich_feature_file, source)  # add _<source> suffix
         if not os.path.exists(path):
-            raise FileNotFoundError(f"Rich feature file not found: {path}")
+            raise FileNotFoundError(
+                f"Rich feature file not found: {path} (source='{source}'). "
+                f"Run: python preprocess_atomic.py --source {source}"
+            )
         df = pd.read_excel(path, sheet_name='features')
         print(f"  Loaded {len(df)} rows, {df.shape[1]} columns from {path}")
         return df
@@ -612,33 +653,39 @@ class AtomicDataset(Dataset):
                 print(f"Filled missing values with {fill_value}")
 
     def _get_split_file_path(self) -> str:
-        """Return the path to the split indices JSON file.
+        """Return the path to the split indices JSON file (source-suffixed).
 
-        If config.dataset.split_file is set, it is used directly. Otherwise a name
-        is generated from the element column (backward-compatible fallback):
-            data/dataset_split_indices_Co.json          (NIST)
-            data/dataset_split_indices_Co_kurucz.json   (Kurucz)
+        The NIST and Kurucz datasets contain different rows, so each gets its own
+        split file. The active source (dataset.dataset_source) is appended as a
+        ``_<source>`` suffix to whichever base name applies:
+
+            data/dataset_split_indices_Co_nist.json     (source = nist)
+            data/dataset_split_indices_Co_kurucz.json   (source = kurucz)
+
+        If config.dataset.split_file is set it is used as the base (the suffix is
+        injected, replacing any existing source suffix). Otherwise the name is
+        generated from the element column (backward-compatible fallback).
         """
-        # Explicit config path takes precedence (new behaviour)
+        source = self.config.dataset.get('dataset_source', 'nist')
+
+        # Explicit config path takes precedence; the source suffix is injected so
+        # nist/kurucz never share a split file even from the same base name.
         split_file = self.config.dataset.get('split_file', None)
         if split_file:
-            return split_file
+            return with_source_suffix(split_file, source)
 
         # ---- Fallback: generate from the element column ----
-        source = self.config.dataset.get('dataset_source', 'nist')
-        source_suffix = f'_{source}' if source != 'nist' else ''
-
         if hasattr(self.config.dataset, 'elements') and \
                 self.config.dataset.elements and len(self.config.dataset.elements) > 1:
             # Multi-element: use combined name
             elements_str = '_'.join(sorted(self.config.dataset.elements))
-            split_file = f"dataset_split_indices_{elements_str}{source_suffix}.json"
+            split_file = f"dataset_split_indices_{elements_str}_{source}.json"
         elif 'Element' in self.df.columns:
             # Single element: element-specific split file
             element = self.df['Element'].iloc[0]
-            split_file = f"dataset_split_indices_{element}{source_suffix}.json"
+            split_file = f"dataset_split_indices_{element}_{source}.json"
         else:
-            split_file = f"dataset_split_indices_dataset{source_suffix}.json"
+            split_file = f"dataset_split_indices_dataset_{source}.json"
 
         # Add data_dir if specified
         data_dir = self.config.dataset.get('data_dir', None)
@@ -907,12 +954,25 @@ class AtomicDataset(Dataset):
         # Target values for current subset; NaN → 0.0 (mask excludes these rows from loss)
         self.y_gj = self.df.loc[self.indices, target_col].fillna(0.0).values.astype(np.float32)
 
-        # Mask: has_obs_gj has the same NaN pattern as obs_gj in both modes
+        # Mask: a row is supervised only where the CHOSEN target is actually
+        # defined (not NaN). In 'raw' mode this equals has_obs_gj. In 'residual'
+        # mode it additionally requires calc_gj — so the NIST source, which has no
+        # Cowan calc_gj (obs_minus_calc_gj is all-NaN), correctly contributes NO
+        # gJ supervision instead of silently training the head toward 0.
+        target_valid = self.df.loc[self.indices, target_col].notna().values
         if 'has_obs_gj' in self.df.columns:
-            self.gj_mask = self.df.loc[self.indices, 'has_obs_gj'].values.astype(np.float32)
+            has_obs = self.df.loc[self.indices, 'has_obs_gj'].values.astype(bool)
         else:
-            # Fallback: derive from obs_gj NaN (source of truth for the mask)
-            self.gj_mask = (~self.df.loc[self.indices, 'obs_gj'].isna()).values.astype(np.float32)
+            # Fallback: derive from obs_gj NaN (source of truth for "observed")
+            has_obs = (~self.df.loc[self.indices, 'obs_gj'].isna()).values
+        self.gj_mask = (target_valid & has_obs).astype(np.float32)
+
+        # Warn loudly if residual-mode supervision collapsed to nothing — this is
+        # the expected outcome for NIST (no calc_gj); switch to gj_target_mode:'raw'.
+        if gj_mode == 'residual' and self.gj_mask.sum() == 0:
+            print("  ⚠ gj_target_mode='residual' yields NO supervised gJ rows for "
+                  "this source (no calc_gj baseline — e.g. NIST). "
+                  "Use gj_target_mode: 'raw' to predict obs_gj directly.")
 
         # Residual mode: cache calc_gj for this subset so inverse_transform_gj()
         # can add it back and return predictions in the original obs_gj scale.
@@ -1067,6 +1127,11 @@ class AtomicDataset(Dataset):
             S_qn = row['result_S']
             L_qn = row['result_L']
             J = row['J']
+
+            # Missing term (e.g. blanked NIST non-LS entries like '16*', '*'):
+            # nothing to validate — these are intentionally recorded as missing.
+            if pd.isna(term) or str(term).strip() == '':
+                continue
 
             # Parse term symbol: ²P₃/₂ → multiplicity=2, L_letter='P', J_term=1.5
             # Examples: "2S", "2P*", "2D", "4F", "2[3/2]*"

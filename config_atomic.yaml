@@ -1,10 +1,16 @@
 # Standalone feature-engineering step (preprocess_atomic.py).
-# Reads a raw Kurucz/Cowan level file and writes a rich feature XLSX containing
-# ALL computed features. AtomicDataset.py is intended to later just load this
-# file and select columns by name instead of recomputing features on-the-fly.
+# Reads a raw level file for the active dataset.dataset_source (nist/kurucz) and
+# writes a rich feature XLSX with ALL computed features. The output filename gets
+# the source suffix automatically (e.g. Co_features_rich_kurucz.xlsx). AtomicDataset.py
+# then loads the matching source file and selects columns by name.
 preprocessing:
-  input_file: "data/kurucz/Co_kurucz_raw.xlsx"  # raw level file (xlsx or csv)
-  output_file: "data/Co_features_rich.xlsx"     # rich feature workbook to write
+  # Raw input file per source; the active one is chosen by dataset.dataset_source.
+  input_files:
+    kurucz: "data/kurucz/Co_raw.xlsx"   # intermediate raw-schema XLSX
+    nist:   "data/nist/Co_i.csv"               # NIST Excel-exported CSV
+  # Rich-feature output. The "_<source>" suffix is appended automatically, so any
+  # source suffix already present here is replaced (kurucz <-> nist).
+  output_file: "data/Co_features_rich.xlsx"
   element: "Co"
   Z: 27
   A: 59

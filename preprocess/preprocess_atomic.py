@@ -3,46 +3,61 @@ preprocess_atomic.py
 
 Standalone feature-engineering script for transition-metal atomic energy levels.
 
-It reads a *raw* Kurucz/Cowan level file (XLSX or CSV) — e.g.
-``data/kurucz/Co_kurucz_raw.xlsx`` — and writes a *rich* feature workbook
-(``data/Co_features_rich.xlsx``) that contains EVERY computed feature as an
-explicit column.  The goal is to move all on-the-fly feature engineering out of
-``AtomicDataset.py`` and into a single, inspectable, version-controllable file.
+It reads a *raw* level file for the active dataset source and writes a *rich*
+feature workbook containing EVERY computed feature as an explicit column. The
+goal is to move all on-the-fly feature engineering out of ``AtomicDataset.py``
+and into a single, inspectable, version-controllable file.
 
-Raw input columns (one row per energy level)::
+Two dataset sources are supported, selected by ``dataset.dataset_source`` in the
+config (override with ``--source``):
+
+  * ``kurucz`` — Kurucz/Cowan data. Raw input is the intermediate
+    ``data/kurucz/Co_kurucz_raw.xlsx`` (already in the raw schema below), built
+    from the two .txt files in ``data/kurucz/``. Output:
+    ``data/Co_features_rich_kurucz.xlsx``.
+  * ``nist``   — NIST data. Raw input is ``data/nist/Co_i.csv`` and is converted
+    to the raw schema via the helpers in ``preprocess/preprocess_nist.py``.
+    Output: ``data/Co_features_rich_nist.xlsx``.
+
+The output filename always carries the ``_<source>`` suffix so the two never
+collide.
+
+Raw (intermediate) schema consumed by compute_row_features() — one row/level::
 
     J, parity_flag, Configuration_raw, Term_raw, OBS.LEVEL, EIGENVALUE,
     T-W, calc.gJ, obs.gJ, Reference
 
-  * ``EIGENVALUE`` is the theoretically calculated energy (Cowan code), cm⁻¹.
-  * ``OBS.LEVEL``  is the experimentally observed energy (the ML TARGET), cm⁻¹.
-  * ``T-W``        is the residual OBS.LEVEL − EIGENVALUE, cm⁻¹.
+  * ``EIGENVALUE`` theoretically calculated energy (Cowan code), cm^-1.
+    NaN for NIST (experimental-only source).
+  * ``OBS.LEVEL``  experimentally observed energy (the ML TARGET), cm^-1.
+  * ``T-W``        residual OBS.LEVEL - EIGENVALUE, cm^-1 (NaN for NIST).
+  * ``obs.gJ``     measured Landé g-factor (NIST: the 'Lande' column).
+  * ``calc.gJ``    theoretical g-factor (Cowan); NaN for NIST.
 
 Usage::
 
-    python preprocess_atomic.py --config config_atomic.yaml
+    python preprocess_atomic.py --config config_atomic.yaml            # uses dataset_source
+    python preprocess_atomic.py --config config_atomic.yaml --source nist
+    python preprocess_atomic.py --config config_atomic.yaml --source kurucz
 
 ------------------------------------------------------------------------------
 NOTE FOR A FUTURE STEP (AtomicDataset.py refactor)
 ------------------------------------------------------------------------------
 This script intentionally does NOT modify ``AtomicDataset.py``.  Once this
-rich feature file exists, ``AtomicDataset.py`` should be simplified so that it
-merely:
+rich feature file exists, ``AtomicDataset.py`` merely:
 
     1. loads ``Co_features_rich.xlsx`` (the "features" sheet),
     2. selects the configured input-feature columns *by name*,
     3. performs the train/val/test split and StandardScaler scaling.
 
-All the parsing / physics computation currently living in
-``_add_derived_features``, ``_add_transition_metal_features``,
-``_add_theoretical_lande_g`` and ``_encode_valence_electrons`` is reproduced
+All the parsing / physics computation (derived features, orbital counts, etc) is
 here and baked into the output columns, so the Dataset class will no longer
 need to recompute anything on instantiation.
 
-IMPORTANT BEHAVIOUR CHANGE vs. the current AtomicDataset.py:
+IMPORTANT BEHAVIOUR CHANGE:
     The valence-slot ordering is REVERSED.  Here ``val_e1`` is the OUTERMOST
     electron (highest Madelung order); in the old code ``val_e1`` was the most
-    core-like valence electron.  This fixes the naming confusion flagged by the
+    core-like valence electron. This fixes the naming confusion flagged by the
     permutation-importance analysis.
 
 Author: Aga (generated with Claude Code)
@@ -71,6 +86,44 @@ except ImportError:  # pragma: no cover - environment bootstrap
 
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+
+# Allow importing the NIST parsing helpers from the preprocess/ package so the
+# NIST adapter below can reuse the battle-tested read/parse functions instead of
+# duplicating them.
+_PREPROCESS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'preprocess')
+if _PREPROCESS_DIR not in sys.path:
+    sys.path.insert(0, _PREPROCESS_DIR)
+
+
+# ===========================================================================
+# Dataset source handling
+# ===========================================================================
+
+# The two raw dataset sources this project supports. Output files (rich XLSX and
+# split JSON) are suffixed with the active source so the two never collide.
+SOURCE_SUFFIXES = ('nist', 'kurucz')
+
+
+def with_source_suffix(path, source):
+    """
+    Return *path* with a ``_<source>`` suffix inserted before its extension.
+
+    Any pre-existing recognised source suffix is stripped first, so the function
+    is idempotent and robust to a base path that already carries a suffix:
+
+        with_source_suffix('data/Co_features_rich.xlsx', 'nist')
+            → 'data/Co_features_rich_nist.xlsx'
+        with_source_suffix('data/Co_features_rich_kurucz.xlsx', 'nist')
+            → 'data/Co_features_rich_nist.xlsx'   (kurucz suffix replaced)
+    """
+    if not path:
+        return path
+    base, ext = os.path.splitext(path)
+    for k in SOURCE_SUFFIXES:
+        if base.endswith(f'_{k}'):
+            base = base[: -(len(k) + 1)]
+            break
+    return f"{base}_{source}{ext}"
 
 
 # ===========================================================================
@@ -117,6 +170,12 @@ def load_preprocessing_config(config_path):
     Returns a plain dict with sensible defaults filled in so the script runs
     even if some keys are missing.  We read YAML directly (rather than through
     utils.load_config / OmegaConf) to keep this script dependency-light.
+
+    The active dataset source (``nist`` / ``kurucz``) is taken from the
+    ``dataset.dataset_source`` config key so that this preprocessing step and the
+    training pipeline always agree on which raw data to use. Per-source raw input
+    files are read from ``preprocessing.input_files`` (a {source: path} mapping);
+    the legacy single ``preprocessing.input_file`` is kept as a fallback.
     """
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config file not found: {config_path}")
@@ -125,11 +184,11 @@ def load_preprocessing_config(config_path):
         full_cfg = yaml.safe_load(fh)
 
     pp = (full_cfg or {}).get('preprocessing', {}) or {}
+    ds = (full_cfg or {}).get('dataset', {}) or {}
 
     # Defaults match the Co I dataset described in the task.
     defaults = {
-        'input_file': 'data/kurucz/Co_kurucz_raw.xlsx',
-        'output_file': 'data/Co_features_rich.xlsx',
+        'output_file': 'data/Co_features_rich.xlsx',  # base; source suffix appended
         'element': 'Co',
         'Z': 27,
         'A': 59,
@@ -140,6 +199,16 @@ def load_preprocessing_config(config_path):
     }
     for key, val in defaults.items():
         pp.setdefault(key, val)
+
+    # Per-source raw input files (kurucz/nist). Fall back to the legacy single
+    # 'input_file' (treated as the kurucz input) when the mapping is absent.
+    input_files = dict(pp.get('input_files') or {})
+    if 'input_file' in pp and 'kurucz' not in input_files:
+        input_files['kurucz'] = pp['input_file']
+    pp['input_files'] = input_files
+
+    # Active source comes from dataset.dataset_source (default: kurucz).
+    pp['dataset_source'] = (ds.get('dataset_source') or 'kurucz').lower()
 
     return pp
 
@@ -751,8 +820,124 @@ def print_validation_report(df, cfg):
 # Main pipeline
 # ===========================================================================
 
-def read_raw_input(input_file):
-    """Read the raw input file, dispatching on the .xlsx/.csv extension."""
+def read_nist_as_raw(input_file, element, Z, A):
+    """
+    Read a raw NIST level CSV and adapt it to the Kurucz "raw" schema.
+
+    NIST stores its data very differently from the Kurucz/Cowan files:
+      * an Excel-exported CSV with =""value"" formula quoting,
+      * a label-prefixed Term symbol (e.g. 'a 4F', 'z 6F*') with parity in '*',
+      * the experimental Landé g-factor in a 'Lande' column,
+      * NO theoretical (Cowan) energy or theoretical gJ.
+
+    This function reuses the parsing helpers from preprocess/preprocess_nist.py
+    (rather than duplicating them) and emits exactly the columns that
+    compute_row_features() expects:
+
+        Configuration_raw, Term_raw, J, parity_flag,
+        OBS.LEVEL, EIGENVALUE, T-W, calc.gJ, obs.gJ, Reference
+
+    Source-specific handling:
+      * EIGENVALUE / T-W / calc.gJ → NaN  (NIST is experimental only — there is
+        no Cowan baseline; the eigenvalue feature group should stay off for NIST).
+      * obs.gJ ← the NIST 'Lande' column (the measured g-factor).
+      * Term_raw ← the canonical term with the spectroscopic label prefix and the
+        parity '*' stripped; parity is carried in parity_flag instead.
+      * Rows flagged uncertain (Prefix='[' or Suffix='?') are dropped, the
+        Configuration is forward-filled across terms that share it, and multi-J
+        fields (e.g. '7/2,9/2') are expanded into separate rows — mirroring
+        preprocess_nist.preprocess_element().
+    """
+    from preprocess_nist import read_nist_csv, parse_term, parse_j, parse_lande_g
+
+    df = read_nist_csv(input_file)
+
+    # Drop uncertain / approximated levels (Prefix='[' bracketed, Suffix='?').
+    uncertain = pd.Series(False, index=df.index)
+    if 'Prefix' in df.columns:
+        uncertain |= df['Prefix'].str.strip() == '['
+    if 'Suffix' in df.columns:
+        uncertain |= df['Suffix'].str.strip() == '?'
+    n_removed = int(uncertain.sum())
+    if n_removed:
+        df = df[~uncertain].reset_index(drop=True)
+        print(f"  Removed {n_removed} uncertain/approximated NIST rows "
+              f"(Prefix='[' or Suffix='?')")
+
+    rows = []
+    n_missing_term = 0          # NIST entries whose Term is not a valid LS symbol
+    last_config = ''            # NIST omits the config for repeated terms → forward-fill
+    for _, r in df.iterrows():
+        config = str(r.get('Configuration', '')).strip()
+        if config:
+            last_config = config
+        else:
+            config = last_config
+
+        term = str(r.get('Term', '')).strip()
+        # parse_term returns (S, L, parity, label). The NIST Term column sometimes
+        # holds values that are NOT proper LS term symbols — e.g. '16*', '*', '1',
+        # '8*', '14*' — which are genuine NIST entries we cannot interpret. When
+        # S or L comes back None the term is uninterpretable, so we treat it as a
+        # MISSING term: Term_raw is left blank and result_S/result_L become NaN
+        # (term_known=0) downstream. The parity marker ('*') is still honoured.
+        _S, _L, parity, _label = parse_term(term)
+        if _S is None or _L is None:
+            term_raw = ''               # missing / non-LS term
+            n_missing_term += 1
+        else:
+            m_label = re.match(r'^([a-z])\s+', term)   # drop 'a '/'z ' label prefix
+            term_clean = term[m_label.end():] if m_label else term
+            term_raw = term_clean.replace('*', '').strip()  # drop parity '*'
+
+        try:
+            level = float(str(r.get('Level (cm-1)', '')).strip())
+        except ValueError:
+            level = np.nan
+        if pd.isna(level):
+            continue  # a level with no energy cannot be a target — skip
+
+        obs_gj = parse_lande_g(str(r.get('Lande', '')).strip())  # NIST measured gJ
+        reference = str(r.get('Reference', '')).strip()
+
+        # Expand multi-valued J fields ('7/2,9/2') into one row per J value.
+        j_str = str(r.get('J', '')).strip()
+        for j_part in [v.strip() for v in j_str.split(',')]:
+            J = parse_j(j_part)
+            if J is None:
+                continue
+            rows.append({
+                'Configuration_raw': config,
+                'Term_raw':          term_raw,
+                'J':                 J,
+                'parity_flag':       int(parity),
+                'OBS.LEVEL':         level,
+                'EIGENVALUE':        np.nan,   # no Cowan baseline in NIST data
+                'T-W':               np.nan,
+                'calc.gJ':           np.nan,   # no theoretical gJ in NIST data
+                'obs.gJ':            obs_gj,   # NIST Lande = observed g-factor
+                'Reference':         reference,
+            })
+
+    if n_missing_term:
+        print(f"  {n_missing_term} NIST rows have a non-LS / uninterpretable Term "
+              f"(e.g. '16*', '*', '1') — treated as missing (Term_raw blank, term_known=0)")
+
+    return pd.DataFrame(rows)
+
+
+def read_raw_input(input_file, source, cfg):
+    """
+    Read the raw input for the active dataset source into the Kurucz raw schema.
+
+    * ``kurucz`` — the file is already in the raw schema (intermediate XLSX or
+      an equivalent CSV); read it directly by extension.
+    * ``nist``   — convert from the NIST CSV via read_nist_as_raw().
+    """
+    if source == 'nist':
+        return read_nist_as_raw(input_file, cfg['element'], int(cfg['Z']), int(cfg['A']))
+
+    # Kurucz (default): raw-schema file, dispatch on extension.
     ext = os.path.splitext(input_file)[1].lower()
     if ext in ('.xlsx', '.xlsm', '.xls'):
         return pd.read_excel(input_file)
@@ -768,17 +953,33 @@ def main():
     )
     parser.add_argument('--config', type=str, default='config_atomic.yaml',
                         help="Path to the YAML config (default: config_atomic.yaml)")
+    parser.add_argument('--source', type=str, default=None, choices=list(SOURCE_SUFFIXES),
+                        help="Override dataset source (nist/kurucz). "
+                             "Default: dataset.dataset_source from the config.")
     args = parser.parse_args()
 
     cfg = load_preprocessing_config(args.config)
 
-    input_file = cfg['input_file']
-    output_file = cfg['output_file']
+    # Active source: CLI override wins, else dataset.dataset_source from config.
+    source = (args.source or cfg['dataset_source']).lower()
+
+    # Select the raw input file for this source (per-source mapping preferred).
+    input_files = cfg.get('input_files') or {}
+    input_file = input_files.get(source) or cfg.get('input_file')
+    if not input_file:
+        raise ValueError(
+            f"No raw input file configured for source '{source}'. "
+            f"Set preprocessing.input_files.{source} in {args.config}."
+        )
+
+    # Output rich file carries the source suffix so nist/kurucz never collide.
+    output_file = with_source_suffix(cfg['output_file'], source)
     max_valence = cfg['max_valence']
 
     print("=" * 60)
     print("ATOMIC FEATURE PREPROCESSING")
     print("=" * 60)
+    print(f"Dataset source : {source}")
     print(f"Element        : {cfg['element']}  (Z={cfg['Z']}, A={cfg['A']})")
     print(f"Input file     : {input_file}")
     print(f"Output file    : {output_file}")
@@ -788,7 +989,7 @@ def main():
     if not os.path.exists(input_file):
         raise FileNotFoundError(f"Input file not found: {input_file}")
 
-    raw_df = read_raw_input(input_file)
+    raw_df = read_raw_input(input_file, source, cfg)
     print(f"\nLoaded {len(raw_df)} raw rows with columns: {list(raw_df.columns)}")
 
     # Row-by-row feature computation with a progress bar.
