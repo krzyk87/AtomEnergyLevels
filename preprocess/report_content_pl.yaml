@@ -30,15 +30,17 @@ report:
     rygorystycznych obliczeń struktury atomowej.
 
   dataset_note: |
-    Uwaga dotycząca interpretacji wykresów rozproszenia: brak wyraźnego trendu na
-    wykresach pojedyncza-cecha-kontra-energia jest oczekiwany, nie jest oznaką
+    Uwaga dotycząca interpretacji wyników wzajemnej informacji i ważności cech
+    poniżej: niskie wyniki dla poszczególnych cech są oczekiwane, nie są oznaką
     niepowodzenia. Dla atomów alkalicznych jedna cecha Rydberga (1/n*²) przewiduje
-    ponad 99% wariancji energii, więc struktura jest widoczna gołym okiem. Kobalt jest
-    zasadniczo inny — jego struktura energetyczna jest autentycznie wielowymiarowa,
-    wynikiem kilku porównywalnych oddziaływań (odpychanie elektron–elektron,
-    sprzężenie spin–orbita, mieszanie konfiguracji) o zbliżonej skali. Żadna pojedyncza
-    cecha nie dominuje i właśnie dlatego model uczenia maszynowego, który może łączyć
-    wiele słabych predyktorów w sposób nieliniowy, jest tu właściwym narzędziem.
+    ponad 99% wariancji energii, więc jedna cecha dominuje ze znaczną przewagą.
+    Kobalt jest zasadniczo inny — jego struktura energetyczna jest autentycznie
+    wielowymiarowa, wynikiem kilku porównywalnych oddziaływań (odpychanie
+    elektron–elektron, sprzężenie spin–orbita, mieszanie konfiguracji) o
+    zbliżonej skali. Żadna pojedyncza cecha nie dominuje i właśnie dlatego model
+    uczenia maszynowego, który może łączyć wiele słabych predyktorów w sposób
+    nieliniowy, jest tu właściwym narzędziem. Wyniki przewidywań w Sekcji 7
+    pokazują, co pełny zestaw cech osiąga w kombinacji.
 
   outlook: |
     Planowane przycinanie cech: gdy wyniki współliniowości (niniejszy raport) i

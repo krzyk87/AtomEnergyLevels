@@ -71,6 +71,46 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 
+def _load_preprocessing_sidecar(base_path: str) -> dict | None:
+    """
+    Look for a JSON sidecar file produced by preprocess_atomic.py.
+    Tries two candidate locations:
+      1. <base_path stem>_preprocess_log.json  (same dir as output base)
+      2. <features_file stem>_preprocess_log.json  (alongside features Excel)
+    Returns the parsed dict, or None if not found.
+    """
+    import json
+    from pathlib import Path
+
+    candidates = []
+
+    # candidate 1: alongside the analysis output base path
+    p = Path(base_path)
+    candidates.append(p.parent / f"{p.stem}_preprocess_log.json")
+
+    # candidate 2: in the data directory, matching the features file pattern
+    # e.g. data/Co_features_rich_kurucz_preprocess_log.json
+    data_dirs = ["data", ".", "output", "outputs"]
+    for d in data_dirs:
+        dp = Path(d)
+        if dp.exists():
+            matches = list(dp.glob("*_preprocess_log.json"))
+            candidates.extend(matches)
+
+    for path in candidates:
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                print(f"  [sidecar] loaded preprocessing log from {path}")
+                return data
+            except Exception as e:
+                print(f"  [sidecar] found {path} but could not read: {e}")
+
+    print("  [sidecar] no preprocessing log found — dataset overview will be partial")
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -1831,9 +1871,9 @@ def main():
             except Exception as exc:
                 print(f"  ⚠ could not read results '{p}': {type(exc).__name__}: {exc}")
 
-    # Populated manually or from a future preprocessing-log parser; None is fine
-    # (the HTML report derives what it can from the dataframe).
-    preprocessing_info = None
+    # Structured preprocessing metadata written by preprocess_atomic.py as a JSON
+    # sidecar; None is fine (the HTML report derives what it can from the dataframe).
+    preprocessing_info = _load_preprocessing_sidecar(base)
 
     print("Writing reports:")
     if "pdf" in formats:

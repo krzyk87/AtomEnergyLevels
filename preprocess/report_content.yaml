@@ -30,15 +30,17 @@ report:
     reference for rigorous ab-initio structure.
 
   dataset_note: |
-    A word of caution on reading the scatter plots below: the absence of a clear
-    trend in any single feature-versus-energy plot is expected, not a failure.
-    For alkali atoms a single Rydberg feature (1/n*²) predicts more than 99% of
-    the energy variance, so the structure is visible by eye. Cobalt is
-    fundamentally different — its energy structure is genuinely multivariate, the
-    product of several comparable interactions (electron-electron repulsion,
-    spin-orbit coupling, configuration mixing) of similar magnitude. No single
-    feature dominates, and that is precisely why a machine-learning model, which
-    can combine many weak predictors nonlinearly, is the right tool here.
+    A word of caution on reading the mutual information and feature importance
+    results below: low scores for individual features are expected, not a
+    failure. For alkali atoms a single Rydberg feature (1/n*²) predicts more
+    than 99% of the energy variance, so one feature dominates by a wide margin.
+    Cobalt is fundamentally different — its energy structure is genuinely
+    multivariate, the product of several comparable interactions
+    (electron-electron repulsion, spin-orbit coupling, configuration mixing)
+    of similar magnitude. No single feature dominates, and that is precisely
+    why a machine-learning model, which can combine many weak predictors
+    nonlinearly, is the right tool here. The predicted-vs-observed results in
+    Section 7 show what the full feature set achieves in combination.
 
   outlook: |
     Planned feature pruning: once collinearity (this report) and permutation-

@@ -69,6 +69,14 @@ import re
 import subprocess
 import sys
 
+# Console output contains unicode (→, ⚠, cm⁻¹); make stdout/stderr UTF-8 so it
+# does not crash on Windows' default cp1252 code page.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import numpy as np
 import pandas as pd
 import yaml
@@ -916,6 +924,134 @@ def print_validation_report(df, cfg):
         print(f"  {term}: {cnt} rows")
 
 
+def _write_preprocessing_sidecar(df: pd.DataFrame, config: dict, out_path: str) -> None:
+    """
+    Write a JSON sidecar file alongside the feature Excel output.
+    The sidecar contains structured preprocessing metadata for use
+    by analyze_features.py when building the HTML report.
+    File is written to the same directory as out_path, with the
+    same stem and suffix '_preprocess_log.json'.
+    Example: data/Co_features_rich_kurucz.xlsx
+          -> data/Co_features_rich_kurucz_preprocess_log.json
+    """
+    import json, os
+    from pathlib import Path
+
+    # --- energy range and parity split ---
+    level_col = None
+    for candidate in ["OBS.LEVEL", "obs_level", "energy", "ENERGY"]:
+        if candidate in df.columns:
+            level_col = candidate
+            break
+    energy_min = float(df[level_col].min()) if level_col else None
+    energy_max = float(df[level_col].max()) if level_col else None
+
+    parity_col = None
+    for candidate in ["parity_computed", "parity_flag", "parity"]:
+        if candidate in df.columns:
+            parity_col = candidate
+            break
+    n_even = int((df[parity_col] == 0).sum()) if parity_col else None
+    n_odd  = int((df[parity_col] == 1).sum()) if parity_col else None
+
+    # --- obs_gj coverage ---
+    gj_col = None
+    for candidate in ["obs_gj", "obs.gJ", "obs_gJ"]:
+        if candidate in df.columns:
+            gj_col = candidate
+            break
+    rows_with_obs_gj = int(df[gj_col].notna().sum()) if gj_col else None
+    pct_obs_gj = round(100.0 * rows_with_obs_gj / len(df), 1) if rows_with_obs_gj is not None else None
+
+    # --- term known ---
+    term_col = None
+    for candidate in ["Term_raw", "term", "TERM"]:
+        if candidate in df.columns:
+            term_col = candidate
+            break
+    rows_term_known = int(df[term_col].notna().sum()) if term_col else len(df)
+
+    # --- parity consistency ---
+    parity_match = None
+    if "parity_computed" in df.columns and "parity_flag" in df.columns:
+        parity_match = int((df["parity_computed"] == df["parity_flag"]).sum())
+    parity_total = len(df)
+
+    # --- component distribution ---
+    n_components = {}
+    if "n_components" in df.columns:
+        for k, v in df["n_components"].value_counts().items():
+            n_components[int(k)] = int(v)
+    elif "comp3_S" in df.columns:
+        # infer from presence of comp columns
+        def count_components(row):
+            for c in [3, 2, 1, 0]:
+                col = f"comp{c}_S"
+                if col in df.columns and pd.notna(row.get(col)):
+                    return c
+            return 0
+        counts = df.apply(count_components, axis=1).value_counts()
+        n_components = {int(k): int(v) for k, v in counts.items()}
+
+    has_subresultant = {}
+    if "subres_S" in df.columns:
+        has_sub = df["subres_S"].notna()
+        has_subresultant = {0: int((~has_sub).sum()), 1: int(has_sub.sum())}
+
+    # --- top comp1 terms ---
+    top_comp1_terms = []
+    if "comp1_L" in df.columns and "comp1_S" in df.columns:
+        L_LETTERS = {0:"S",1:"P",2:"D",3:"F",4:"G",5:"H",6:"I"}
+        def to_term(row):
+            s = row["comp1_S"]
+            l = row["comp1_L"]
+            if pd.isna(s) or pd.isna(l):
+                return None
+            mult = int(round(2*s + 1))
+            letter = L_LETTERS.get(int(l), "?")
+            return f"{mult}{letter}"
+        terms = df.apply(to_term, axis=1).dropna()
+        top5 = terms.value_counts().head(5)
+        top_comp1_terms = [[str(k), int(v)] for k, v in top5.items()]
+
+    # --- element-level constants from config ---
+    element = config.get("element", "")
+    Z       = config.get("Z", None)
+    A       = config.get("A", None)
+    source  = config.get("source", config.get("dataset_source", ""))
+    zeta_3d    = config.get("zeta_3d", None)
+    max_valence = config.get("max_valence", None)
+
+    sidecar = {
+        "element":         element,
+        "Z":               int(Z) if Z is not None else None,
+        "A":               int(A) if A is not None else None,
+        "source":          source,
+        "total_rows":      len(df),
+        "rows_with_obs_gj": rows_with_obs_gj,
+        "pct_obs_gj":      pct_obs_gj,
+        "rows_term_known": rows_term_known,
+        "electron_count_ok": True,          # already validated by caller
+        "parity_match":    parity_match,
+        "parity_total":    parity_total,
+        "n_components":    n_components,
+        "has_subresultant": has_subresultant,
+        "top_comp1_terms": top_comp1_terms,
+        "energy_min":      energy_min,
+        "energy_max":      energy_max,
+        "n_even":          n_even,
+        "n_odd":           n_odd,
+        "zeta_3d":         float(zeta_3d) if zeta_3d is not None else None,
+        "max_valence":     int(max_valence) if max_valence is not None else None,
+    }
+
+    stem = Path(out_path).stem
+    sidecar_path = Path(out_path).parent / f"{stem}_preprocess_log.json"
+    with open(sidecar_path, "w", encoding="utf-8") as f:
+        json.dump(sidecar, f, indent=2, ensure_ascii=False)
+    print(f"  [sidecar] preprocessing log written → {sidecar_path}")
+
+
 # ===========================================================================
 # Main pipeline
 # ===========================================================================
@@ -1110,6 +1246,10 @@ def process_element(cfg):
     write_rich_xlsx(features_df, summary_df, output_file)
 
     print_validation_report(features_df, cfg)
+
+    # Persist structured preprocessing metadata next to the Excel output so
+    # analyze_features.py can populate the HTML Dataset Overview automatically.
+    _write_preprocessing_sidecar(features_df, cfg, output_file)
 
     print(f"\nOutput written to: {output_file} "
           f"({len(features_df)} rows, {len(features_df.columns)} columns)")
