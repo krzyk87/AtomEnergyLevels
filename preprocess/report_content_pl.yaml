@@ -30,6 +30,12 @@ report:
     rygorystycznych obliczeń struktury atomowej.
 
   dataset_note: |
+    Powyższy schemat pokazuje udział w bazie danych konfiguracji z różną liczbą 
+    termów wewnętrznych, np.: 
+    1 komponent: 3d9 - całkowity term: (2D); 
+    2 komponenty: 3d8(3F)6s(2S) - całkowity term: (4F);
+    3 komponenty, subterm: 3d7(4F)4s(2S)4d(2D),(1D) - całkowity term: (4D)
+    
     Uwaga dotycząca interpretacji wyników wzajemnej informacji i ważności cech
     poniżej: niskie wyniki dla poszczególnych cech są oczekiwane, nie są oznaką
     niepowodzenia. Dla atomów alkalicznych jedna cecha Rydberga (1/n*²) przewiduje
@@ -54,6 +60,97 @@ report:
     zmieniać i nieść informację.
 
 feature_groups:
+  - name: "Cechy bazowe — kodowanie konfiguracji i liczby kwantowe"
+    color: "#475569"
+    features:
+      - name: "val_e1_n / val_e2_n / val_e3_n / val_e4_n / val_e5_n / val_e6_n / val_e7_n / val_e8_n / val_e9_n"
+        display: "val_eᵢ_n — główne liczby kwantowe (n) slotów walencyjnych"
+        equation: "val\\_e_i\\_n = n_i \\quad (i = 1, ..., 9)"
+        physical_meaning: |
+          Kodowanie konfiguracji elektronowej w postaci stałej liczby „slotów”
+          walencyjnych. Każdy slot przechowuje główną liczbę kwantową n jednego
+          elektronu walencyjnego. Sloty są uporządkowane regułą Madelunga, a
+          numeracja jest odwrócona: val_e1 to elektron najbardziej zewnętrzny,
+          val_e9 — najgłębszy z uwzględnionych (max_valence = 9 dla Co I).
+          Niewykorzystane sloty są dopełniane zerami z przodu; wartość 0 oznacza
+          brak elektronu w danym slocie.
+        ml_rationale: |
+          Daje modelowi pełną, jawną reprezentację konfiguracji walencyjnej o
+          stałej długości, niezależną od liczby zajętych orbitali. Dla Co I realnie
+          zmienne są jedynie sloty zewnętrzne (1, 8, 9) — pozostałe są stałe i
+          odfiltrowywane przed treningiem.
+        reference: "Reguła Madelunga; konwencja kodowania projektu (preprocess_atomic.py)"
+
+      - name: "val_e1_l / val_e2_l / val_e3_l / val_e4_l / val_e5_l / val_e6_l / val_e7_l / val_e8_l / val_e9_l"
+        display: "val_eᵢ_l — orbitalne liczby kwantowe (ℓ) slotów walencyjnych"
+        equation: "val\\_e_i\\_l = \\ell_i \\quad (s=0,\\; p=1,\\; d=2,\\; f=3)"
+        physical_meaning: |
+          Orbitalna liczba kwantowa ℓ elektronu w danym slocie walencyjnym,
+          zakodowana liczbowo (s=0, p=1, d=2, f=3). Razem z val_eᵢ_n w pełni
+          określa orbital każdego elektronu walencyjnego (np. n=3, ℓ=2 → 3d).
+        ml_rationale: |
+          Pozwala modelowi rozróżniać typy orbitali walencyjnych (np. 4s wobec 3d
+          wobec 4p), co jest kluczowe dla parzystości i energii konfiguracji.
+        reference: "Konwencja kodowania projektu (preprocess_atomic.py)"
+
+      - name: "J"
+        display: "J (całkowity moment pędu poziomu)"
+        equation: "J \\in \\{ |L - S|, ..., L + S \\}"
+        physical_meaning: |
+          Kwantowa liczba całkowitego momentu pędu danego poziomu — wektorowa suma
+          całkowitego orbitalnego (L) i spinowego (S) momentu pędu, o wartościach
+          od |L−S| do L+S. To podstawowa, „surowa” liczba kwantowa odczytana wprost
+          z symbolu poziomu; cechy J(J+1) oraz L·S są z niej wyprowadzane.
+        ml_rationale: |
+          Bezpośrednie wejście identyfikujące konkretny poziom w obrębie multipletu
+          i stanowiące podstawę dla pochodnych cech momentu pędu (J_sq, lande_so_term).
+        reference: "Condon & Shortley, Theory of Atomic Spectra (1935)"
+
+      - name: "S_qn"
+        display: "S_qn (całkowita liczba kwantowa spinu)"
+        equation: "S = n_{niespar.} / 2"
+        physical_meaning: |
+          Całkowity spin poziomu (S = liczba niesparowanych elektronów / 2),
+          wyznaczający krotność termu 2S+1. Dla Co I przyjmuje wartości takie jak
+          1/2, 3/2, 5/2. „Surowa” wartość, z której liczona jest cecha S(S+1).
+        ml_rationale: |
+          Podstawowa liczba kwantowa termu; wraz z L_qn definiuje term LS poziomu.
+        reference: "Reguły Hunda; Condon & Shortley (1935)"
+
+      - name: "L_qn"
+        display: "L_qn (całkowita orbitalna liczba kwantowa)"
+        equation: "L \\in \\{0, 1, 2, ...\\} \\;(S, P, D, F, ...)"
+        physical_meaning: |
+          Całkowity orbitalny moment pędu poziomu, kodowany liczbowo (S=0, P=1,
+          D=2, F=3, G=4, ...). Określa literę symbolu termu. „Surowa” wartość,
+          z której liczona jest cecha L(L+1).
+        ml_rationale: |
+          Podstawowa liczba kwantowa termu; wraz z S_qn definiuje term LS poziomu.
+        reference: "Condon & Shortley, Theory of Atomic Spectra (1935)"
+
+      - name: "max_principal_n"
+        display: "max_principal_n (najwyższe zajęte n)"
+        equation: "max\\_principal\\_n = \\text{max}(n_i)"
+        physical_meaning: |
+          Najwyższa główna liczba kwantowa n spośród wszystkich zajętych orbitali
+          w konfiguracji. Wskazuje, jak „wysoko” sięga wzbudzenie elektronowe
+          (np. obecność elektronów 4s, 4p, 5s).
+        ml_rationale: |
+          Zwięzły wskaźnik stopnia wzbudzenia konfiguracji; pomaga odróżnić
+          konfiguracje rdzeniowe od wysoko wzbudzonych.
+        reference: "Cecha pochodna (preprocess_atomic.py)"
+
+      - name: "unpaired_electrons"
+        display: "unpaired_electrons (liczba niesparowanych elektronów)"
+        equation: "n_{niespar.} = 2S"
+        physical_meaning: |
+          Liczba niesparowanych elektronów w konfiguracji, równa 2S. Bezpośrednio
+          powiązana ze spinem i momentem magnetycznym atomu (dla Co I 3d⁷ wynosi 3).
+        ml_rationale: |
+          Jawne, całkowitoliczbowe kodowanie spinu, komplementarne wobec S_qn i
+          S(S+1); ułatwia modelowi uchwycenie reguł Hunda.
+        reference: "Reguły Hunda"
+
   - name: "Moment pędu — sprzężenie spin–orbita (reguła interwałów Landégo)"
     color: "#2563eb"
     features:
@@ -251,6 +348,31 @@ feature_groups:
           subtermsem 3d mogą mieć energie różniące się o tysiące cm⁻¹.
         reference: "Racah (1942); Cowan (1981)"
 
+      - name: "comp2_S / comp2_L"
+        display: "Subterm drugiego składnika: S i L"
+        equation: "\\text{z } (^{2S+1}L) \\text{ w drugim nawiasie ciągu konfiguracji}"
+        physical_meaning: |
+          Spin i orbitalny moment pędu drugiego składnika sprzężenia, odczytane
+          z drugiego nawiasu termowego ciągu konfiguracji (kolejnej grupy elektronów
+          po grupie 3d). Obecne tylko w konfiguracjach o co najmniej dwóch składnikach
+          (n_components ≥ 2); w pozostałych przyjmują 0.
+        ml_rationale: |
+          Rozróżnia konfiguracje wieloskładnikowe o tym samym subtermsie 3d, lecz
+          różnym sprzężeniu kolejnych grup elektronów — źródło dalszych różnic energii.
+        reference: "Racah (1942); Cowan (1981)"
+
+      - name: "comp3_S / comp3_L"
+        display: "Subterm trzeciego składnika: S i L"
+        equation: "\\text{z } (^{2S+1}L) \\text{ w trzecim nawiasie ciągu konfiguracji}"
+        physical_meaning: |
+          Spin i orbitalny moment pędu trzeciego składnika sprzężenia, odczytane
+          z trzeciego nawiasu termowego. Występuje w najbardziej złożonych
+          konfiguracjach (n_components = 3); w pozostałych przyjmują 0.
+        ml_rationale: |
+          Dopełnia opis sprzężenia dla najbardziej złożonych konfiguracji, w których
+          trzy grupy elektronów sprzęgają się kolejno.
+        reference: "Racah (1942); Cowan (1981)"
+
       - name: "subres_S / subres_L"
         display: "Subterm wypadkowy: S i L"
         equation: "\\text{z } ,(^{2S+1}L) \\text{ na końcu ciągu konfiguracji}"
@@ -262,6 +384,32 @@ feature_groups:
           Rozróżnia konfiguracje, które mają ten sam subterm 3d i ten sam term
           wypadkowy, ale inną historię pośredniego sprzężenia — a co za tym idzie,
           różne energie.
+        reference: "Cowan (1981), Rozdział 12"
+
+      - name: "n_components"
+        display: "n_components (liczba składników termowych)"
+        equation: "n\\_components \\in \\{0, 1, 2, 3\\}"
+        physical_meaning: |
+          Liczba nawiasów termowych (składników sprzężenia) w ciągu konfiguracji —
+          ile kolejnych grup elektronów (3d, 4s, 4p, ...) ma jawnie podany term
+          pośredni. 0 oznacza brak rozłożonego subterma (np. czyste 3d⁹),
+          a 3 — najbardziej złożone sprzężenie.
+        ml_rationale: |
+          Koduje złożoność schematu sprzężenia konfiguracji i informuje model, ile
+          pól comp*_S/L niesie realną informację, a ile jest jedynie dopełnione zerami.
+        reference: "Cowan (1981), Rozdział 12"
+
+      - name: "has_subresultant"
+        display: "has_subresultant (flaga subterma wypadkowego)"
+        equation: "has\\_subresultant = \\mathbf{1}[\\text{obecny } ,(^{2S+1}L)]"
+        physical_meaning: |
+          Flaga binarna wskazująca, czy ciąg konfiguracji zawiera końcowy term
+          wypadkowy zapisany po przecinku, np. ,(³P). Oznacza obecność pośredniego
+          sprzężenia dwóch najbardziej zewnętrznych elektronów przed sprzężeniem
+          z grupą 3d (zob. subres_S / subres_L).
+        ml_rationale: |
+          Mówi modelowi, czy cechy subres_S / subres_L niosą realną informację, czy
+          są jedynie wartościami dopełniającymi — zapobiega błędnej interpretacji zer.
         reference: "Cowan (1981), Rozdział 12"
 
 chart_descriptions:

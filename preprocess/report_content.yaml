@@ -54,6 +54,101 @@ report:
     begin to vary and carry information.
 
 feature_groups:
+  - name: "Baseline Features — Configuration Encoding and Quantum Numbers"
+    color: "#475569"
+    features:
+      - name: "val_e1_n / val_e2_n / val_e3_n / val_e4_n / val_e5_n / val_e6_n / val_e7_n / val_e8_n / val_e9_n"
+        display: "val_eᵢ_n — principal quantum numbers (n) of valence slots"
+        equation: "val\\_e_i\\_n = n_i \\quad (i = 1, ..., 9)"
+        physical_meaning: |
+          Encoding of the electron configuration as a fixed number of valence
+          "slots". Each slot stores the principal quantum number n of one valence
+          electron. Slots are ordered by the Madelung rule and the numbering is
+          reversed: val_e1 is the outermost electron, val_e9 the innermost included
+          (max_valence = 9 for Co I). Unused slots are padded with zeros at the
+          front; a value of 0 means no electron occupies that slot.
+        ml_rationale: |
+          Gives the model a complete, explicit, fixed-length representation of the
+          valence configuration, independent of how many orbitals are occupied. For
+          Co I only the outer slots (1, 8, 9) actually vary — the rest are constant
+          and are filtered out before training.
+        reference: "Madelung rule; project encoding convention (preprocess_atomic.py)"
+
+      - name: "val_e1_l / val_e2_l / val_e3_l / val_e4_l / val_e5_l / val_e6_l / val_e7_l / val_e8_l / val_e9_l"
+        display: "val_eᵢ_l — orbital quantum numbers (ℓ) of valence slots"
+        equation: "val\\_e_i\\_l = \\ell_i \\quad (s=0,\\; p=1,\\; d=2,\\; f=3)"
+        physical_meaning: |
+          The orbital angular momentum quantum number ℓ of the electron in each
+          valence slot, encoded numerically (s=0, p=1, d=2, f=3). Together with
+          val_eᵢ_n it fully specifies each valence electron's orbital
+          (e.g. n=3, ℓ=2 → 3d).
+        ml_rationale: |
+          Lets the model distinguish valence orbital types (e.g. 4s vs 3d vs 4p),
+          which is decisive for configuration parity and energy.
+        reference: "Project encoding convention (preprocess_atomic.py)"
+
+      - name: "J"
+        display: "J (total angular momentum of the level)"
+        equation: "J \\in \\{ |L - S|, ..., L + S \\}"
+        physical_meaning: |
+          The total angular momentum quantum number of the level — the vector sum
+          of total orbital (L) and total spin (S) angular momenta, ranging from
+          |L−S| to L+S. This is the raw quantum number read directly from the
+          level symbol; the J(J+1) and L·S features are derived from it.
+        ml_rationale: |
+          A direct input identifying the specific level within its multiplet and
+          serving as the basis for the derived angular-momentum features
+          (J_sq, lande_so_term).
+        reference: "Condon & Shortley, Theory of Atomic Spectra (1935)"
+
+      - name: "S_qn"
+        display: "S_qn (total spin quantum number)"
+        equation: "S = n_{unpaired} / 2"
+        physical_meaning: |
+          The total spin of the level (S = number of unpaired electrons / 2),
+          which sets the term multiplicity 2S+1. For Co I it takes values such as
+          1/2, 3/2, 5/2. A raw value from which the S(S+1) feature is computed.
+        ml_rationale: |
+          A fundamental term quantum number; together with L_qn it defines the
+          level's LS term.
+        reference: "Hund's rules; Condon & Shortley (1935)"
+
+      - name: "L_qn"
+        display: "L_qn (total orbital quantum number)"
+        equation: "L \\in \\{0, 1, 2, ...\\} \\;(S, P, D, F, ...)"
+        physical_meaning: |
+          The total orbital angular momentum of the level, encoded numerically
+          (S=0, P=1, D=2, F=3, G=4, ...). It sets the term symbol letter. A raw
+          value from which the L(L+1) feature is computed.
+        ml_rationale: |
+          A fundamental term quantum number; together with S_qn it defines the
+          level's LS term.
+        reference: "Condon & Shortley, Theory of Atomic Spectra (1935)"
+
+      - name: "max_principal_n"
+        display: "max_principal_n (highest occupied n)"
+        equation: "max\\_principal\\_n = \\text{max}(n_i)"
+        physical_meaning: |
+          The highest principal quantum number n among all occupied orbitals in
+          the configuration. Indicates how "high" the electronic excitation
+          reaches (e.g. presence of 4s, 4p, 5s electrons).
+        ml_rationale: |
+          A compact indicator of the degree of configuration excitation; helps
+          separate core-like from highly excited configurations.
+        reference: "Derived feature (preprocess_atomic.py)"
+
+      - name: "unpaired_electrons"
+        display: "unpaired_electrons (number of unpaired electrons)"
+        equation: "n_{unpaired} = 2S"
+        physical_meaning: |
+          The number of unpaired electrons in the configuration, equal to 2S.
+          Directly related to the atom's spin and magnetic moment
+          (for Co I 3d⁷ it equals 3).
+        ml_rationale: |
+          An explicit integer encoding of spin, complementary to S_qn and S(S+1);
+          makes it easier for the model to capture Hund's rules.
+        reference: "Hund's rules"
+
   - name: "Angular Momentum — Spin-Orbit Coupling (Landé interval rule)"
     color: "#2563eb"
     features:
@@ -255,6 +350,32 @@ feature_groups:
           of cm⁻¹ apart.
         reference: "Racah (1942); Cowan (1981)"
 
+      - name: "comp2_S / comp2_L"
+        display: "second-component sub-term S and L"
+        equation: "\\text{from } (^{2S+1}L) \\text{ in second bracket of configuration string}"
+        physical_meaning: |
+          The spin and orbital angular momentum of the second coupling component,
+          read from the second term bracket of the configuration string (the next
+          electron group after the 3d group). Present only in configurations with
+          at least two components (n_components ≥ 2); zero otherwise.
+        ml_rationale: |
+          Distinguishes multi-component configurations that share the same 3d
+          sub-term but differ in how the subsequent electron groups couple —
+          a source of further energy differences.
+        reference: "Racah (1942); Cowan (1981)"
+
+      - name: "comp3_S / comp3_L"
+        display: "third-component sub-term S and L"
+        equation: "\\text{from } (^{2S+1}L) \\text{ in third bracket of configuration string}"
+        physical_meaning: |
+          The spin and orbital angular momentum of the third coupling component,
+          read from the third term bracket. Occurs in the most complex
+          configurations (n_components = 3); zero otherwise.
+        ml_rationale: |
+          Completes the coupling description for the most complex configurations,
+          where three electron groups couple in sequence.
+        reference: "Racah (1942); Cowan (1981)"
+
       - name: "subres_S / subres_L"
         display: "sub-resultant term S and L"
         equation: "\\text{from } ,(^{2S+1}L) \\text{ at end of configuration string}"
@@ -266,6 +387,34 @@ feature_groups:
           Distinguishes configurations that have the same 3d sub-term and
           the same resultant term but different intermediate coupling history
           — and therefore different energies.
+        reference: "Cowan (1981), Chapter 12"
+
+      - name: "n_components"
+        display: "n_components (number of term components)"
+        equation: "n\\_components \\in \\{0, 1, 2, 3\\}"
+        physical_meaning: |
+          The number of term brackets (coupling components) in the configuration
+          string — how many successive electron groups (3d, 4s, 4p, ...) carry an
+          explicit intermediate term. 0 means no resolved sub-term (e.g. pure 3d⁹),
+          while 3 marks the most complex coupling.
+        ml_rationale: |
+          Encodes the complexity of the configuration's coupling scheme and tells
+          the model how many of the comp*_S/L fields carry real information versus
+          being zero-padding.
+        reference: "Cowan (1981), Chapter 12"
+
+      - name: "has_subresultant"
+        display: "has_subresultant (sub-resultant term flag)"
+        equation: "has\\_subresultant = \\mathbf{1}[\\text{present } ,(^{2S+1}L)]"
+        physical_meaning: |
+          A binary flag indicating whether the configuration string contains a
+          trailing resultant term written after a comma, e.g. ,(³P). It marks the
+          presence of an intermediate coupling of the two outermost electrons
+          before they couple to the 3d group (see subres_S / subres_L).
+        ml_rationale: |
+          Tells the model whether the subres_S / subres_L features carry real
+          information or are merely padding — preventing zeros from being
+          misinterpreted.
         reference: "Cowan (1981), Chapter 12"
 
 chart_descriptions:
