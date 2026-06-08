@@ -1,0 +1,316 @@
+report:
+  title: "Analiza zmiennych w uczeniu maszynowym — Kobalt I (Co I)"
+  subtitle: "Inżynieria cech oparta na fizyce do przewidywania poziomów energetycznych atomów"
+  introduction: |
+    Cel: Zastosuje uczenia maszynowego do problemu w
+    spektroskopii atomowej: przewidywania elektronowych poziomów energetycznych
+    złożonych atomów wieloelektronowych. 
+    
+    Punkt wyjścia: Neutralny kobalcie (Co I) — metal przejściowym, z otwartą powłoką 3d.
+    
+    Dane wejściowe: baza linii atomowych Kurucza - eksperymentalnie zmierzone i półempiryczne poziomy dla praktycznie wszystkich
+    pierwiastków istotnych astrofizycznie.
+
+    Idea: Zamiast podawać sieci neuronowej surowe liczby kwantowe i liczyć na to, że
+    samodzielnie odkryje stulecie fizyki atomowej, konstruujemy cechy kodujące
+    znane struktury fizyczne: sprzężenie momentów pędów, regułę interwałów Landégo, 
+    zapełnienie powłoki d, ekranowanie jądra oraz parzystość konfiguracji. 
+    Model jest wielowarstwowym perceptronem (MLP) opartym na fizyce, którego zadaniem jest
+    uczenie się struktury resztkowej, której proste reguły nie uchwytują. Docelowa
+    dokładność wynosi ~1 cm⁻¹, co jest porównywalne z precyzją leżących u podstaw
+    pomiarów eksperymentalnych.
+
+    Raport dokumentuje zestaw cech i jego statystyczne właściwości dla Co I: co każda
+    cecha oznacza fizycznie, dlaczego pomaga modelowi, jak cechy są ze sobą powiązane
+    (współliniowość) oraz jak informacyjna jest każda z nich dla wartości docelowej
+    energii. Celem jest uczynienie wyborów inżynierskich przejrzystymi dla
+    spektroskopistów. Model ma uzupełniać, a nie zastępować, półempiryczne obliczenia
+    kodem Cowana: oferuje szybkie, oparte na danych szacunki mogące wskazywać wartości
+    odstające i wypełniać luki, podczas gdy kod Cowana pozostaje odniesieniem do
+    rygorystycznych obliczeń struktury atomowej.
+
+  dataset_note: |
+    Uwaga dotycząca interpretacji wykresów rozproszenia: brak wyraźnego trendu na
+    wykresach pojedyncza-cecha-kontra-energia jest oczekiwany, nie jest oznaką
+    niepowodzenia. Dla atomów alkalicznych jedna cecha Rydberga (1/n*²) przewiduje
+    ponad 99% wariancji energii, więc struktura jest widoczna gołym okiem. Kobalt jest
+    zasadniczo inny — jego struktura energetyczna jest autentycznie wielowymiarowa,
+    wynikiem kilku porównywalnych oddziaływań (odpychanie elektron–elektron,
+    sprzężenie spin–orbita, mieszanie konfiguracji) o zbliżonej skali. Żadna pojedyncza
+    cecha nie dominuje i właśnie dlatego model uczenia maszynowego, który może łączyć
+    wiele słabych predyktorów w sposób nieliniowy, jest tu właściwym narzędziem.
+
+  outlook: |
+    Planowane przycinanie cech: gdy wyniki współliniowości (niniejszy raport) i
+    permutacyjnej ważności cech na wytrenowanym modelu będą dostępne, nadmiarowe
+    lub nieinformacyjne cechy zostaną usunięte w celu zmniejszenia przeuczenia i
+    poprawy interpretowalności bez utraty dokładności.
+
+    Rozszerzenie na wiele pierwiastków: ten sam schemat cech oparty na fizyce zostanie
+    rozszerzony na sąsiednie metale przejściowe z grupy żelaza: Fe, Ni i Sc, gdzie
+    cechy na poziomie pierwiastka (Z_eff, ζ₃d), stałe w obrębie Co I, zaczną się
+    zmieniać i nieść informację.
+
+feature_groups:
+  - name: "Moment pędu — sprzężenie spin–orbita (reguła interwałów Landégo)"
+    color: "#2563eb"
+    features:
+      - name: "J_sq"
+        display: "J(J+1)"
+        equation: "J_{sq} = J(J+1)"
+        physical_meaning: |
+          Kwadrat kwantowej liczby całkowitego momentu pędu J, w postaci wymaganej
+          przez mechanikę kwantową. J jest sumą wektorową całkowitego orbitalnego (L)
+          i spinowego (S) momentu pędu.
+        ml_rationale: |
+          Wkład energetyczny sprzężenia spin–orbita jest proporcjonalny do J(J+1),
+          a nie do J — podanie J² bezpośrednio sprawia, że ta zależność jest liniowa
+          dla modelu, zamiast wymagać od niego uczenia się potęgowania.
+        reference: "Condon & Shortley, Theory of Atomic Spectra (1935)"
+
+      - name: "L_sq"
+        display: "L(L+1)"
+        equation: "L_{sq} = L(L+1)"
+        physical_meaning: |
+          Kwadrat całkowitego orbitalnego momentu pędu L. L koduje zbiorowy ruch
+          orbitalny wszystkich elektronów, zdefiniowany przez literę symbolu termowego
+          (S=0, P=1, D=2, F=3, G=4, ...).
+        ml_rationale: |
+          Wymagane razem z J(J+1) i S(S+1) do wyznaczenia L·S (iloczynu skalarnego
+          spin–orbita) jako cechy liniowej.
+        reference: "Condon & Shortley, Theory of Atomic Spectra (1935)"
+
+      - name: "S_sq"
+        display: "S(S+1)"
+        equation: "S_{sq} = S(S+1)"
+        physical_meaning: |
+          Kwadrat całkowitego spinu S. S zlicza niesparowane elektrony:
+          S = n_niesparowanych / 2. Dla Co I 3d⁷ trzy niesparowane elektrony
+          dają S = 3/2, więc S(S+1) = 15/4.
+        ml_rationale: |
+          Wymagane do wyznaczenia L·S. Koduje też krotność (2S+1) termu, która
+          określa, ile poziomów J istnieje w jego obrębie.
+        reference: "Condon & Shortley, Theory of Atomic Spectra (1935)"
+
+      - name: "lande_so_term"
+        display: "L·S (iloczyn skalarny spin–orbita)"
+        equation: "lande\\_so\\_term = J(J+1) - L(L+1) - S(S+1)"
+        physical_meaning: |
+          Iloczyn skalarny wektorów orbitalnego i spinowego momentu pędu. Mierzy
+          geometryczne wyrównanie L i S: dodatni, gdy wskazują ten sam kierunek
+          (duże J), ujemny, gdy są przeciwne (małe J). Wartość ta bezpośrednio
+          wyznacza rozszczepienie energetyczne w obrębie multipletu (reguła
+          interwałów Landégo).
+        ml_rationale: |
+          Najbardziej bezpośrednie kodowanie położenia poziomu w obrębie swojego
+          multipletu. Bez tej cechy model musiałby odkryć regułę Landégo pośrednio
+          z oddzielnych wartości J, L, S.
+        reference: "Landé (1923); Cowan, Theory of Atomic Structure and Spectra (1981)"
+
+      - name: "E_so_estimate"
+        display: "ζ · L·S / 2 (szacunek energii spin–orbita)"
+        equation: "E_{so} = (\\zeta_{3d}/2) \\times [J(J+1) - L(L+1) - S(S+1)]"
+        physical_meaning: |
+          Fizyczne oszacowanie wkładu energetycznego sprzężenia spin–orbita w cm⁻¹.
+          ζ₃d = 515 cm⁻¹ to stała sprzężenia spin–orbita dla powłoki 3d Co I,
+          skalująca geometryczne wyrównanie do fizycznych jednostek energii.
+        ml_rationale: |
+          Dostarcza modelowi skalibrowane oszacowanie skali energii rozszczepienia
+          struktury subtelnej, analogicznie do przewidywania Rydberga stosowanego
+          dla atomów alkalicznych.
+        reference: "Cowan (1981); wartość ζ z bazy danych Kurucza"
+
+      - name: "zeta_3d"
+        display: "ζ₃d (stała sprzężenia spin–orbita)"
+        equation: "\\zeta_{3d} \\approx 515 \\text{ cm}^{-1} \\text{ dla Co I}"
+        physical_meaning: |
+          Stała charakterystyczna dla pierwiastka, mierząca siłę oddziaływania spinu
+          elektronu 3d z jego własnym ruchem orbitalnym. Fizycznie wynika z pola
+          magnetycznego odczuwanego przez elektron w jego własnym układzie odniesienia,
+          gdy jądro krąży wokół niego. Skaluje się w przybliżeniu jak Z_eff⁴/n³.
+        ml_rationale: |
+          Stała w obrębie Co I; staje się cechą rozróżniającą przy trenowaniu na
+          wielu pierwiastkach (Fe: ~410 cm⁻¹, Ni: ~630 cm⁻¹).
+        reference: "Cowan (1981), Tabela 16-1"
+
+  - name: "Struktura zapełnienia powłoki d"
+    color: "#16a34a"
+    features:
+      - name: "n_3d"
+        display: "n₃d (liczba elektronów 3d)"
+        equation: "n_{3d} \\in \\{0, 1, ..., 10\\}"
+        physical_meaning: |
+          Liczba elektronów zajmujących podpowłokę 3d. Dla konfiguracji Co I wynosi
+          od 7 (stan podstawowy: 3d⁷4s²) do 9 (3d⁹). Wyznacza skalę całkowitej
+          energii odpychania elektron–elektron.
+        ml_rationale: |
+          Bezpośrednio koduje dominujący czynnik różnic energii na poziomie
+          konfiguracji; ukryty implicite w kolumnach obsadzeń orbitalnych,
+          ale tu uwypuklony.
+        reference: "Hund (1925); Griffiths, Introduction to Quantum Mechanics"
+
+      - name: "d_holes"
+        display: "d_holes = 10 − n₃d"
+        equation: "d_{holes} = 10 - n_{3d}"
+        physical_meaning: |
+          Liczba pustych miejsc w podpowłoce 3d. Na mocy symetrii cząstka–dziura
+          widmo energetyczne konfiguracji d^n odzwierciedla d^(10-n), więc d⁷
+          (3 dziury) i d³ (3 elektrony) mają tę samą strukturę matematyczną.
+        ml_rationale: |
+          Pozwala modelowi wykorzystać symetrię cząstka–dziura między pierwszą
+          a drugą połową powłoki d, której nauczenie się empiryczne wymagałoby
+          dwukrotnie więcej danych.
+        reference: "Judd (1963), Operator Techniques in Atomic Spectroscopy"
+
+      - name: "d_from_half"
+        display: "d_excess = |n₃d − 5|"
+        equation: "d_{from\\_half} = |n_{3d} - 5|"
+        physical_meaning: |
+          Odległość od konfiguracji półzapełnionej (d⁵). Każdy elektron dodany
+          powyżej powłoki półzapełnionej musi się sparować z istniejącym elektronem
+          kosztem energii parowania, która w przybliżeniu skaluje się z tą odległością.
+        ml_rationale: |
+          Koduje koszt energii parowania — gładki, w przybliżeniu liniowy wskaźnik
+          dodatkowej energii odpychania w drugiej połowie powłoki.
+        reference: "Slater (1930); reguły Hunda"
+
+      - name: "is_half_filled"
+        display: "is_half_filled (flaga binarna)"
+        equation: "is\\_half\\_filled = \\mathbf{1}[n_{3d} = 5]"
+        physical_meaning: |
+          Wskaźnik binarny dla konfiguracji półzapełnionej d⁵ (Mn dla atomów
+          neutralnych). To szczególne ułożenie maksymalizuje całkowity spin S zgodnie
+          z pierwszą regułą Hunda, tworząc nieciągłość stabilności, która nie mieści
+          się w gładkim trendzie sąsiednich konfiguracji.
+        ml_rationale: |
+          Bez tej flagi model musiałby odkryć ostrą nieliniowość dokładnie dla
+          n₃d=5 na podstawie ograniczonych danych. Flaga dostarcza jej bezpośrednio.
+        reference: "Hund (1925); Cotton, Chemical Applications of Group Theory"
+
+  - name: "Efektywna liczba atomowa (ekranowanie Slatera)"
+    color: "#9333ea"
+    features:
+      - name: "Z_eff"
+        display: "Z_eff (efektywna liczba atomowa)"
+        equation: "Z_{eff} = Z - \\sigma, \\quad \\sigma = 0.35(n_{3d}-1) + 0.85 \\times 8 + 1.00 \\times 10"
+        physical_meaning: |
+          Efektywna liczba protonów odczuwana przez elektron walencyjny 3d po
+          częściowym ekranowaniu przez elektrony wewnętrzne. Elektrony wewnętrzne nie
+          znoszą jądra idealnie, ponieważ funkcje falowe elektronów walencyjnych
+          przenikają do wewnątrz. Dla Co 3d⁷: Z_eff ≈ 8,10.
+        ml_rationale: |
+          Wyznacza ogólną skalę energii odpychania elektron–elektron, będącego
+          dominującym wkładem do różnic energii na poziomie konfiguracji. Zmienia się
+          z n₃d: 3d⁷→8,10, 3d⁸→7,75, 3d⁹→7,40.
+        reference: "Slater (1930), Phys. Rev. 36, 57"
+
+      - name: "Z_eff_sq"
+        display: "Z_eff² (kwadrat efektywnej liczby atomowej)"
+        equation: "Z_{eff\\_sq} = Z_{eff}^2"
+        physical_meaning: |
+          Kwadrat efektywnej liczby atomowej. Energie odpychania elektron–elektron
+          skalują się jak Z_eff² / ⟨r⟩, co sprawia, że człon kwadratowy jest
+          niezbędny do uchwycenia pełnej nieliniowej zależności.
+        ml_rationale: |
+          Dostarcza modelowi bezpośrednio dominującą nieliniową skalę energii,
+          analogicznie do zależności Z²/n² we wzorze na energię atomu wodoru.
+        reference: "Cowan (1981); Bethe & Salpeter (1957)"
+
+  - name: "Parzystość i struktura konfiguracji"
+    color: "#dc2626"
+    features:
+      - name: "parity_computed"
+        display: "parzystość (0=parzysta, 1=nieparzysta)"
+        equation: "parity = \\left(\\sum_i n_i \\cdot \\ell_i \\right) \\bmod 2"
+        physical_meaning: |
+          Symetria mechaniki kwantowej względem odbicia współrzędnych wszystkich
+          elektronów przez jądro. Wyznaczona przez sumę orbitalnych liczb kwantowych ℓ
+          wszystkich elektronów: s(ℓ=0) i d(ℓ=2) zachowują parzystość parzystą;
+          p(ℓ=1) i f(ℓ=3) ją odwracają. Poziomy o parzystości parzystej i nieparzystej
+          nigdy się nie mieszają — są to całkowicie odrębne układy fizyczne.
+        ml_rationale: |
+          Twarda reguła wyboru, nie miękki trend. Bez tej cechy model mógłby błędnie
+          uczyć się zależności między poziomami o przeciwnej parzystości, które nigdy
+          nie mogą fizycznie oddziaływać.
+        reference: "Wigner (1927); Condon & Shortley (1935)"
+
+      - name: "comp1_S / comp1_L"
+        display: "Subterm grupy 3d: S i L"
+        equation: "\\text{z } (^{2S+1}L) \\text{ w pierwszym nawiasie ciągu konfiguracji}"
+        physical_meaning: |
+          Całkowity spin i orbitalny moment pędu samej grupy elektronów 3d przed
+          sprzężeniem z zewnętrznymi elektronami (4s, 4p). Na przykład w
+          3d⁷(⁴F)4s4p, comp1 = ⁴F → S=3/2, L=3. Istnieje wiele subtermsów 3d⁷
+          (⁴F, ⁴P, ²G, ²D, ...) o różnych energiach, dlatego informacja o subtermsach
+          jest kluczowa.
+        ml_rationale: |
+          Dodanie cech subtermsów obniżyło MAE z ~4700 do ~1400 cm⁻¹ — największa
+          pojedyncza poprawa w projekcie. Dwie konfiguracje różniące się jedynie
+          subtermsem 3d mogą mieć energie różniące się o tysiące cm⁻¹.
+        reference: "Racah (1942); Cowan (1981)"
+
+      - name: "subres_S / subres_L"
+        display: "Subterm wypadkowy: S i L"
+        equation: "\\text{z } ,(^{2S+1}L) \\text{ na końcu ciągu konfiguracji}"
+        physical_meaning: |
+          Pośredni term sprzężenia tworzony przez dwa najbardziej zewnętrzne
+          elektrony (np. 4s i 4p) przed ich sprzężeniem z grupą 3d. Pojawia się
+          jako ,(³P) lub ,(¹P) w notacji NIST.
+        ml_rationale: |
+          Rozróżnia konfiguracje, które mają ten sam subterm 3d i ten sam term
+          wypadkowy, ale inną historię pośredniego sprzężenia — a co za tym idzie,
+          różne energie.
+        reference: "Cowan (1981), Rozdział 12"
+
+chart_descriptions:
+  feature_statistics: |
+    Tabela przedstawia podstawowe statystyki każdej cechy wejściowej w zbiorze danych
+    Co I. 'n_unique' podaje liczbę odrębnych wartości przyjmowanych przez daną cechę —
+    cechy z n_unique=1 są stałe i nie niosą żadnej informacji dla modelu. 'std'
+    (odchylenie standardowe) mierzy rozproszenie; bardzo małe std w stosunku do
+    średniej sugeruje, że cecha może być prawie stała dla tego pierwiastka.
+
+  correlation_matrix: |
+    Mapa cieplna przedstawia współczynnik korelacji Pearsona między każdą parą cech.
+    Wartości bliskie +1 (ciemnoczerwony) oznaczają, że obie cechy rosną razem; wartości
+    bliskie -1 (ciemnoniebieski) oznaczają, że jedna rośnie, gdy druga maleje; wartości
+    bliskie 0 (biały) oznaczają brak związku. Cechy z |r| > 0,95 są poniżej oznaczone
+    jako potencjalnie redundantne — zachowanie obu nie dostarcza modelowi dodatkowej
+    informacji. Należy zauważyć, że wysoka korelacja w obrębie Co I może zaniknąć po
+    dodaniu kolejnych pierwiastków, gdyż niektóre cechy zmieniają się jedynie między
+    pierwiastkami.
+
+  mutual_information: |
+    Wzajemna informacja (MI) mierzy, o ile znajomość wartości cechy zmniejsza
+    niepewność co do docelowego poziomu energii. W przeciwieństwie do korelacji, MI
+    wychwytuje zależności nieliniowe. Wartość 0 oznacza, że cecha jest całkowicie
+    nieinformacyjna; wyższe wartości oznaczają większą informacyjność. Dla metali
+    przejściowych żadna pojedyncza cecha nie dominuje — struktura energetyczna jest
+    autentycznie wielowymiarowa, więc nawet cechy o skromnych wynikach MI mogą
+    wnosić wkład, gdy są stosowane w kombinacji.
+
+  permutation_importance: |
+    Permutacyjna ważność cech mierzy rzeczywisty wkład każdej cechy w przewidywania
+    wytrenowanego modelu. Procedura testowa: losowo przetasuj wartości jednej cechy
+    we wszystkich próbkach testowych, a następnie zmierz, o ile wzrośnie średni błąd
+    bezwzględny (MAE) modelu. Duży wzrost oznacza, że model w dużym stopniu polegał
+    na tej cesze; wzrost bliski zeru oznacza, że model radziłby sobie prawie tak samo
+    bez niej. Słupki błędu pokazują zmienność w 30 losowych przetasowaniach.
+
+  predicted_vs_observed: |
+    Każdy punkt reprezentuje jeden poziom energetyczny ze zbioru testowego. Oś X
+    pokazuje eksperymentalnie zaobserwowaną energię (poprawną odpowiedź); oś Y pokazuje
+    przewidywanie modelu. Punkty leżące na przerywantej linii przekątnej to doskonałe
+    przewidywania. Punkty powyżej linii to przeszacowania; poniżej — niedoszacowania.
+    Rozproszenie wokół przekątnej kwantyfikuje błąd modelu. Wyniki pokazano dla
+    wszystkich czterech testowanych wariantów docelowych (surowa energia, energia
+    wiązania, log-energia wiązania, odwrotna energia wiązania).
+
+  model_results: |
+    Tabela podsumowuje wyniki czterech wariantów modelu, z których każdy trenowany był
+    na tych samych cechach, lecz przewidywał inną transformację docelowej energii.
+    MAE (Średni Błąd Bezwzględny) to średni błąd przewidywania w cm⁻¹ — niższy jest
+    lepszy. R² (współczynnik determinacji) mierzy frakcję wyjaśnionej wariancji —
+    1,0 to wartość idealna, 0,0 oznacza, że model nie radzi sobie lepiej niż
+    przewidywanie średniej. Błąd maksymalny to najgorsze pojedyncze przewidywanie
+    w zbiorze testowym.

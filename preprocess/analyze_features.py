@@ -1374,7 +1374,7 @@ def build_html(out_path, df, features, elements, modes, targets, mi_results, per
     print(f"  writing HTML → {out_path}")
 
     content_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "report_content.yaml")
+                                "report_content_pl.yaml")
     with open(content_file, "r", encoding="utf-8") as f:
         content = yaml.safe_load(f)
 
