@@ -94,6 +94,12 @@ _PREPROCESS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prep
 if _PREPROCESS_DIR not in sys.path:
     sys.path.insert(0, _PREPROCESS_DIR)
 
+# Allow importing element_data (the master species-constants table loader) from the
+# project root.
+_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT_DIR not in sys.path:
+    sys.path.insert(0, _ROOT_DIR)
+
 
 # ===========================================================================
 # Dataset source handling
@@ -175,23 +181,52 @@ _ELEMENT_DEFAULTS = {
 }
 
 
-def _normalize_element_cfg(entry, defaults, data_dir, source):
+def _normalize_element_cfg(entry, defaults, data_dir, source, constants_file=None):
     """
     Fill one element entry to the flat shape the rest of this module consumes.
 
-    Accepts ``symbol`` (the per-element table in config_preprocess.yaml) or the
-    legacy ``element`` key. Returns a dict with: element, Z, A, ionization_energy,
-    max_valence, zeta_3d, inverse_target_scale, input_files, output_file,
-    dataset_source.
+    Physical constants (Z, A, ionization_energy, max_valence, zeta_3d) are looked
+    up from the master species table (element_data) by the entry's ``species`` (or
+    a bare ``symbol``/``element`` → neutral atom). Any constant supplied inline in
+    the entry overrides the table. If the table or species is unavailable, falls
+    back to inline/default values so legacy configs keep working.
+
+    Returns a dict with: element, species, Z, A, ionization_energy, max_valence,
+    zeta_3d, inverse_target_scale, input_files, output_file, dataset_source.
     """
+    entry = dict(entry or {})
+    species_key = entry.get('species') or entry.get('symbol') or entry.get('element')
+    if not species_key:
+        raise ValueError(f"Element entry is missing a 'species'/'symbol' key: {entry!r}")
+
     cfg = dict(_ELEMENT_DEFAULTS)
     cfg.update(defaults or {})
-    cfg.update(entry or {})
+
+    # Master constants table is the source of truth; inline entry values still win.
+    try:
+        from element_data import get_species_constants, normalize_species
+        c = (get_species_constants(species_key, constants_file) if constants_file
+             else get_species_constants(species_key))
+        table_vals = {
+            'symbol': c.get('symbol'),
+            'species': normalize_species(species_key),
+            'Z': c.get('Z'),
+            'A': c.get('A'),
+            'ionization_energy': c.get('ionization_energy_cm-1'),
+            'max_valence': c.get('max_valence'),
+            'zeta_3d': c.get('zeta_3d'),
+        }
+        cfg.update({k: v for k, v in table_vals.items()
+                    if v is not None and not (isinstance(v, float) and pd.isna(v))})
+    except (FileNotFoundError, KeyError) as exc:
+        print(f"  ⚠ element_constants lookup failed for '{species_key}' "
+              f"({type(exc).__name__}); using inline/default constants.")
+
+    cfg.update(entry)  # inline entry values override the table
 
     element = cfg.get('symbol') or cfg.get('element')
-    if not element:
-        raise ValueError(f"Element entry is missing a 'symbol'/'element' key: {entry!r}")
     cfg['element'] = element
+    cfg.setdefault('species', element)
 
     # Per-source raw input files (kurucz/nist). Fall back to the legacy single
     # 'input_file' (treated as the kurucz input) when the mapping is absent.
@@ -200,8 +235,9 @@ def _normalize_element_cfg(entry, defaults, data_dir, source):
         input_files['kurucz'] = cfg['input_file']
     cfg['input_files'] = input_files
 
-    # Rich-feature output base path; the '_<source>' suffix is appended later by
-    # with_source_suffix() in process_element().
+    # Rich-feature output base path, keyed by element SYMBOL so the established
+    # Co naming (Co_features_rich_<source>.xlsx) is preserved. The '_<source>'
+    # suffix is appended later by with_source_suffix() in process_element().
     if not cfg.get('output_file'):
         cfg['output_file'] = os.path.join(data_dir, f"{element}_features_rich.xlsx")
 
@@ -241,6 +277,7 @@ def load_preprocessing_configs(config_path, elements=None, source=None):
         defaults = full_cfg.get('defaults') or {}
         data_dir = full_cfg.get('data_dir', 'data')
         active_source = (source or full_cfg.get('source') or 'kurucz').lower()
+        constants_file = full_cfg.get('constants_file')
         entries = entries_in
     else:
         # LEGACY flat layout (preprocessing: + dataset.dataset_source)
@@ -249,9 +286,11 @@ def load_preprocessing_configs(config_path, elements=None, source=None):
         defaults = {}
         data_dir = ds.get('data_dir', 'data')
         active_source = (source or ds.get('dataset_source') or 'kurucz').lower()
+        constants_file = ds.get('constants_file')
         entries = [pp]
 
-    cfgs = [_normalize_element_cfg(e, defaults, data_dir, active_source) for e in entries]
+    cfgs = [_normalize_element_cfg(e, defaults, data_dir, active_source, constants_file)
+            for e in entries]
 
     if elements:
         wanted = {e.lower() for e in elements}
@@ -629,7 +668,8 @@ def add_element_targets_and_rydberg(df, cfg):
     E_ion = float(cfg['ionization_energy'])          # ionization energy (cm^-1)
     scale = float(cfg['inverse_target_scale'])       # A in A / binding
 
-    df['Element'] = cfg['element']                    # constant for a single-element file
+    df['Element'] = cfg['element']                    # element symbol (e.g. 'Co')
+    df['species'] = cfg.get('species', cfg['element'])  # species incl. ion stage (e.g. 'Co I')
 
     # Binding energy = how far below the ionization limit the level sits.
     binding = (E_ion - df['OBS.LEVEL']).clip(lower=0.0)
@@ -655,7 +695,7 @@ def build_column_order(max_valence):
 
     return (
         # Identifiers (not model inputs)
-        ['Configuration_raw', 'Term_raw', 'J', 'parity_flag', 'Reference', 'Element']
+        ['Configuration_raw', 'Term_raw', 'J', 'parity_flag', 'Reference', 'Element', 'species']
         # Raw energy (target + Cowan baseline) + pre-computed target transforms
         + ['OBS.LEVEL', 'EIGENVALUE', 'delta_e_theory',
            'Binding_Energy_cm-1', 'Log_Binding_Energy_cm-1', 'Inverse_Binding_Energy_cm-1']
@@ -697,7 +737,7 @@ def build_column_order(max_valence):
 
 # Leading identifier columns are excluded from the numeric summary.
 IDENTIFIER_COLUMNS = ['Configuration_raw', 'Term_raw', 'J', 'parity_flag',
-                      'Reference', 'Element']
+                      'Reference', 'Element', 'species']
 
 
 def build_summary_df(df):

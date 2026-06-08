@@ -33,6 +33,11 @@ dataset:
   # === Data source: pre-computed rich feature file (output of preprocess_atomic.py) ===
   rich_feature_file: "data/Co_features_rich.xlsx"
 
+  # Master per-species constants table (element_data.py). Used to recover the
+  # ionization energy for target inversion (binding/log/inverse → cm⁻¹) and for
+  # energy-stratified splitting. Falls back to deriving E_ion from the data if absent.
+  constants_file: "data/element_constants.xlsx"
+
   # For multi-element training (future): list xlsx files per element.
   # The Element column is already baked into each xlsx by preprocess_atomic.py.
   # rich_feature_files:

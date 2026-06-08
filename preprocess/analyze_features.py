@@ -164,10 +164,14 @@ def get_rich_physics_features():
 
 def load_preprocess_config(config_path):
     """
-    Read config_preprocess.yaml and return (settings, element_info).
+    Read config_preprocess.yaml (the run manifest) and return (settings, element_info).
 
-    settings: {source, data_dir, report_dir}
-    element_info: {symbol: {Z, A, ionization_energy, max_valence, ...}}
+    settings: {source, data_dir, report_dir, constants_file}
+    element_info: {symbol: {symbol, species, Z, A, ionization_energy, max_valence, ...}}
+
+    Per-element physical constants come from the master table (element_data),
+    looked up by each entry's species/symbol; the yaml only says which species to
+    analyse and where their raw inputs live. Inline entry values still override.
     """
     if not os.path.exists(config_path):
         sys.exit(f"ERROR: config not found: {config_path}")
@@ -178,15 +182,35 @@ def load_preprocess_config(config_path):
         "source": (cfg.get("source") or "kurucz").lower(),
         "data_dir": cfg.get("data_dir", "data"),
         "report_dir": cfg.get("report_dir", os.path.join("preprocess", "reports")),
+        "constants_file": cfg.get("constants_file"),
     }
-    defaults = cfg.get("defaults") or {}
+    constants_file = settings["constants_file"]
+
     element_info = {}
     for entry in (cfg.get("elements") or []):
-        e = dict(defaults)
-        e.update(entry or {})
-        sym = e.get("symbol") or e.get("element")
-        if sym:
-            element_info[sym] = e
+        e = dict(entry or {})
+        species_key = e.get("species") or e.get("symbol") or e.get("element")
+        if not species_key:
+            continue
+        try:
+            from element_data import get_species_constants, normalize_species
+            c = (get_species_constants(species_key, constants_file) if constants_file
+                 else get_species_constants(species_key))
+            merged = {
+                "symbol": c.get("symbol"),
+                "species": normalize_species(species_key),
+                "Z": c.get("Z"), "A": c.get("A"),
+                "ionization_energy": c.get("ionization_energy_cm-1"),
+                "max_valence": c.get("max_valence"),
+                "zeta_3d": c.get("zeta_3d"),
+            }
+            merged.update(e)          # inline entry values override the table
+            e = merged
+        except Exception as exc:
+            print(f"  ⚠ constants lookup failed for '{species_key}' "
+                  f"({type(exc).__name__}); using inline values only.")
+        sym = e.get("symbol") or e.get("element") or str(species_key).split()[0]
+        element_info[sym] = e
     return settings, element_info
 
 

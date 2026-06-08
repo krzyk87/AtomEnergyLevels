@@ -29,27 +29,34 @@ import json
 import os
 import re
 
-# NOTE: Binding energy is now pre-computed in preprocess_atomic.py.
-# This dict is retained for energy-stratified splitting (_create_splits) and for
-# any future multi-element merging utilities. It is no longer used to compute
-# binding-energy targets inside this class (those columns are read from the rich
-# XLSX directly), nor to invert predictions (E_ion is recovered from the rich
-# file at load time — see _setup_target_inversion).
-IONIZATION_ENERGIES = {
-    # Element: (Z, ionization_energy_cm-1)
-    'Li': (3, 43487.114),
-    'Na': (11, 41449.451),  # From NIST
-    'K': (19, 35009.814),
-    'Fe': (26, 63737.70),
-    'Co': (27, 63564.6),
-    'Ni': (28, 61619.77),
-    'Rb': (37, 33690.81),
-    'Cs': (55, 31406.467),
-    'Fr': (87, 32848.872)
-}
-# Alkali metals: the Rydberg features are physically meaningful (1 valence electron)
-ALKALI_METALS = {'Li', 'Na', 'K', 'Rb', 'Cs', 'Fr'}
+# Per-element physical constants now live in the master table data/element_constants.xlsx
+# (see element_data.py). The dataset itself looks up ionization energies through
+# _ionization_energy_map / _resolve_ionization_energy. IONIZATION_ENERGIES below is
+# kept ONLY as a backward-compatible {symbol: (Z, E_ion)} view for other consumers
+# (e.g. visualize.py); it is built from that single source of truth.
 R_INF = 109737.316  # Rydberg constant in cm-1
+
+
+def _ionization_energies_from_table() -> dict:
+    """Build {symbol: (Z, E_ion_cm-1)} for neutral species from the master table.
+
+    Returns an empty dict if the table is unavailable, so importing this module
+    never fails just because the constants file is missing.
+    """
+    try:
+        from element_data import load_species_table
+        table = load_species_table()
+        out = {}
+        for _, r in table.iterrows():
+            if str(r.get('ion_stage', 'I')).strip().upper() != 'I':
+                continue  # neutral atoms only, for this legacy symbol-keyed view
+            out[str(r['symbol'])] = (int(r['Z']), float(r['ionization_energy_cm-1']))
+        return out
+    except Exception:
+        return {}
+
+
+IONIZATION_ENERGIES = _ionization_energies_from_table()
 
 # Dataset sources. The rich-feature XLSX and the split JSON are suffixed with the
 # active source (dataset.dataset_source) so the NIST and Kurucz datasets — which
@@ -836,6 +843,10 @@ class AtomicDataset(Dataset):
             print(f"  Stratifying also on observed-gJ (has_obs_gj): "
                   f"{n_obs}/{len(self.df)} rows observed")
 
+        # Per-element ionization energy for log-binding bins (master constants table,
+        # with a data-derived fallback). Built once; only needed when energy-binning.
+        eion_by_element = self._ionization_energy_map('Element') if n_bins > 1 else {}
+
         # ----------------------------------------------------------------
         # Build stratum labels: 'ELEMENT_bin{n}' (+ '_g{0|1}' when use_gj)
         # ----------------------------------------------------------------
@@ -861,7 +872,7 @@ class AtomicDataset(Dataset):
                 continue
 
             # Compute quantile bin within this element's levels
-            E_ion = IONIZATION_ENERGIES.get(element, (None, np.nan))[1]
+            E_ion = eion_by_element.get(str(element), np.nan)
             el_levels_raw = self.df.loc[self.df['Element'] == element, raw_level_col].astype(float)
             el_levels = np.log((E_ion - el_levels_raw).clip(lower=1))  # bin on log(binding)
 
@@ -1139,21 +1150,82 @@ class AtomicDataset(Dataset):
         """Return the number of input features (dimensionality)."""
         return len(self.feature_columns)
 
+    def _ionization_energy_map(self, key_col: str) -> dict:
+        """
+        Return {key_value: E_ion(cm^-1)} for every distinct value of df[key_col].
+
+        Primary source is the master constants table (element_data), looked up by
+        species/symbol. Where the table is missing or a key is absent, E_ion is
+        derived from the data — OBS.LEVEL + Binding_Energy_cm-1 is exactly E_ion on
+        every unclipped row — so old rich files (and elements not yet in the table)
+        keep working.
+        """
+        df = self.df
+        keys = [str(k) for k in df[key_col].astype(str).unique()]
+        constants_file = self.config.dataset.get('constants_file', None)
+
+        # Data-derived fallback per key (exact where binding > 0).
+        derived = {}
+        if RAW_LEVEL_COL in df.columns and BINDING_COL in df.columns:
+            valid = df[BINDING_COL] > 0
+            if valid.any():
+                eion = (df[RAW_LEVEL_COL] + df[BINDING_COL])[valid]
+                derived = eion.groupby(df.loc[eion.index, key_col].astype(str)).median().to_dict()
+
+        try:
+            from element_data import get_ionization_energy as _gie
+        except Exception:
+            _gie = None
+
+        out, missing = {}, []
+        for k in keys:
+            val = np.nan
+            if _gie is not None:
+                try:
+                    val = _gie(k, constants_file) if constants_file else _gie(k)
+                except (KeyError, FileNotFoundError):
+                    val = np.nan
+            if np.isnan(val):
+                val = derived.get(k, np.nan)
+            if np.isnan(val):
+                missing.append(k)
+            out[k] = val
+        if missing:
+            print(f"  ⚠️  ionization energy unavailable for {sorted(set(missing))} "
+                  f"(constants table + data fallback); related values may be NaN.")
+        return out
+
+    def _resolve_ionization_energy(self) -> np.ndarray:
+        """
+        Per-row ionization energy (cm^-1) for this subset, aligned to self.indices.
+
+        Keyed by each row's 'species' (preferred) or 'Element' symbol, via
+        _ionization_energy_map (master table first, data-derived fallback). For a
+        single-species file this is a constant column.
+        """
+        df = self.df
+        key_col = 'species' if 'species' in df.columns else (
+            'Element' if 'Element' in df.columns else None)
+        if key_col is None:
+            return np.full((len(self.indices), 1), np.nan)
+        emap = self._ionization_energy_map(key_col)
+        keys = df.loc[self.indices, key_col].astype(str).values
+        return np.array([emap.get(k, np.nan) for k in keys], dtype=float).reshape(-1, 1)
+
     def _setup_target_inversion(self):
         """
-        Resolve the target *kind* and recover E_ion / inverse-scale from the rich
-        file, so inverse_transform_target() can map any target_feature back to an
-        absolute energy level (OBS.LEVEL, cm^-1).
+        Resolve the target *kind* and the ionization energy / inverse-scale so
+        inverse_transform_target() can map any target_feature back to an absolute
+        energy level (OBS.LEVEL, cm^-1).
 
-        The rich file always carries both OBS.LEVEL and Binding_Energy_cm-1, and by
-        construction (binding = E_ion - level, clipped at 0) every row with
-        binding > 0 satisfies  OBS.LEVEL + Binding_Energy_cm-1 = E_ion exactly.
-        E_ion is therefore recovered directly from the data — no config coupling —
-        as a per-dataset constant (exact for a single element).
+        E_ion is read from the master constants table (element_data), keyed by the
+        row's species/Element — see _resolve_ionization_energy. If the table or a
+        species is unavailable it falls back to deriving E_ion from the data
+        (OBS.LEVEL + Binding_Energy_cm-1), so nothing breaks without the table.
 
         Sets:
             self._target_kind   'raw' | 'binding' | 'log' | 'inverse'
-            self.E_ion          float ionization energy (cm^-1) or None for 'raw'
+            self.E_ion          (N,1) per-row ionization energies (cm^-1), or None for 'raw'
             self._inverse_scale float A in Inverse_Binding = A / binding
         """
         self._target_kind = TARGET_KIND_BY_COLUMN.get(self.target_column, 'raw')
@@ -1162,27 +1234,25 @@ class AtomicDataset(Dataset):
                   f"transform; inverse_transform_target() will treat it as a raw level "
                   f"(identity).")
 
-        self.E_ion = None
-        # Default scale from config (preprocess uses 100000); refined from data below.
+        # Inverse-target scale: from config, refined from data when available.
         self._inverse_scale = float(self.config.dataset.get('inverse_target_scale', 100000.0))
-
         df = self.df
-        if RAW_LEVEL_COL in df.columns and BINDING_COL in df.columns:
-            binding = df[BINDING_COL]
-            valid = binding > 0
-            if valid.any():
-                # OBS.LEVEL + binding == E_ion on every unclipped row (constant).
-                self.E_ion = float((df[RAW_LEVEL_COL] + binding)[valid].median())
-                if INVERSE_BINDING_COL in df.columns:
-                    prod = (df[INVERSE_BINDING_COL] * binding)[valid].dropna()
-                    if not prod.empty:
-                        self._inverse_scale = float(prod.median())
+        if INVERSE_BINDING_COL in df.columns and BINDING_COL in df.columns:
+            valid = df[BINDING_COL] > 0
+            prod = (df[INVERSE_BINDING_COL] * df[BINDING_COL])[valid].dropna()
+            if not prod.empty:
+                self._inverse_scale = float(prod.median())
 
-        if self._target_kind != 'raw' and self.E_ion is None:
+        if self._target_kind == 'raw':
+            self.E_ion = None
+            return
+
+        self.E_ion = self._resolve_ionization_energy()
+        if np.all(np.isnan(self.E_ion)):
             raise ValueError(
-                f"Cannot invert target '{self.target_column}' to absolute levels: the "
-                f"rich file lacks usable '{RAW_LEVEL_COL}'/'{BINDING_COL}' columns needed "
-                f"to recover E_ion."
+                f"Cannot invert target '{self.target_column}' to absolute levels: no "
+                f"ionization energy available from the constants table or the data "
+                f"(need element_constants.xlsx or OBS.LEVEL+{BINDING_COL} columns)."
             )
 
     def inverse_transform_target(self, y_normalized: np.ndarray) -> np.ndarray:

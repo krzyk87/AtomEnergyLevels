@@ -40,8 +40,9 @@ def load_config(config_path: str = "config_atomic.yaml") -> DictConfig:
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config file not found: {config_path}")
     
-    # Load YAML and convert to OmegaConf object
-    with open(config_path, 'r') as f:
+    # Load YAML and convert to OmegaConf object. Force UTF-8 so comments with
+    # non-ASCII characters (cm⁻¹, α, Landé, →) don't crash on Windows' cp1252.
+    with open(config_path, 'r', encoding='utf-8') as f:
         config_dict = yaml.safe_load(f)
     
     config = OmegaConf.create(config_dict)
