@@ -1,0 +1,323 @@
+report:
+  title: "Machine Learning Feature Analysis — Cobalt I (Co I)"
+  subtitle: "Physics-informed feature engineering for atomic energy level prediction"
+  introduction: |
+    This project applies machine learning to a long-standing problem in atomic
+    spectroscopy: predicting the electronic energy levels of complex,
+    many-electron atoms. We focus here on neutral cobalt (Co I), a transition
+    metal whose open 3d shell produces a dense, irregular spectrum that is
+    notoriously hard to model from first principles. The input data are drawn
+    from the Kurucz atomic line database, which compiles experimentally measured
+    and semi-empirically calculated levels for essentially every element of
+    astrophysical interest.
+
+    Rather than feed the network raw quantum numbers and hope it rediscovers a
+    century of atomic physics, we engineer features that encode known physical
+    structure — angular-momentum coupling, the Landé interval rule, d-shell
+    filling, nuclear screening, and configuration parity. The model is a
+    physics-informed multilayer perceptron (MLP) whose job is to learn the
+    residual structure that simple rules do not capture. The accuracy target is
+    on the order of ~1 cm⁻¹, comparable to the precision of the underlying
+    experimental measurements.
+
+    This report documents the feature set and its statistical behaviour for Co I:
+    what each feature means physically, why it helps the model, how the features
+    relate to one another (collinearity), and how informative each one is for the
+    energy target. The aim is to make the engineering choices transparent to
+    spectroscopists. The model is intended to complement, not replace,
+    semi-empirical Cowan-code calculations: it offers fast, data-driven estimates
+    that can flag outliers and fill gaps, while the Cowan code remains the
+    reference for rigorous ab-initio structure.
+
+  dataset_note: |
+    A word of caution on reading the scatter plots below: the absence of a clear
+    trend in any single feature-versus-energy plot is expected, not a failure.
+    For alkali atoms a single Rydberg feature (1/n*²) predicts more than 99% of
+    the energy variance, so the structure is visible by eye. Cobalt is
+    fundamentally different — its energy structure is genuinely multivariate, the
+    product of several comparable interactions (electron-electron repulsion,
+    spin-orbit coupling, configuration mixing) of similar magnitude. No single
+    feature dominates, and that is precisely why a machine-learning model, which
+    can combine many weak predictors nonlinearly, is the right tool here.
+
+  outlook: |
+    Planned feature pruning: once collinearity (this report) and permutation-
+    importance results on the trained model are in hand, redundant or
+    uninformative features will be removed to reduce overfitting and improve
+    interpretability without sacrificing accuracy.
+
+    Multi-element extension: the same physics-informed feature scheme will be
+    extended to the neighbouring iron-group transition metals Fe, Ni and Sc,
+    where element-level features (Z_eff, ζ₃d) that are constant within Co I will
+    begin to vary and carry information.
+
+feature_groups:
+  - name: "Angular Momentum — Spin-Orbit Coupling (Landé interval rule)"
+    color: "#2563eb"
+    features:
+      - name: "J_sq"
+        display: "J(J+1)"
+        equation: "J_{sq} = J(J+1)"
+        physical_meaning: |
+          Square of the total angular momentum quantum number J, in the
+          form required by quantum mechanics. J is the vector sum of
+          total orbital (L) and total spin (S) angular momenta.
+        ml_rationale: |
+          The spin-orbit energy contribution is proportional to J(J+1),
+          not J — providing J² explicitly makes this relationship linear
+          for the model, instead of requiring it to learn the squaring.
+        reference: "Condon & Shortley, Theory of Atomic Spectra (1935)"
+
+      - name: "L_sq"
+        display: "L(L+1)"
+        equation: "L_{sq} = L(L+1)"
+        physical_meaning: |
+          Square of the total orbital angular momentum L. L encodes the
+          collective orbital motion of all electrons, defined by the term
+          symbol letter (S=0, P=1, D=2, F=3, G=4, ...).
+        ml_rationale: |
+          Required alongside J(J+1) and S(S+1) to compute L·S (the
+          spin-orbit dot product) as a linear feature.
+        reference: "Condon & Shortley, Theory of Atomic Spectra (1935)"
+
+      - name: "S_sq"
+        display: "S(S+1)"
+        equation: "S_{sq} = S(S+1)"
+        physical_meaning: |
+          Square of the total spin S. S counts unpaired electrons:
+          S = n_unpaired / 2. For Co I 3d⁷, three unpaired electrons
+          give S = 3/2, so S(S+1) = 15/4.
+        ml_rationale: |
+          Required to compute L·S. Also encodes the multiplicity (2S+1)
+          of the term, which determines how many J-levels exist within it.
+        reference: "Condon & Shortley, Theory of Atomic Spectra (1935)"
+
+      - name: "lande_so_term"
+        display: "L·S (spin-orbit dot product)"
+        equation: "lande\\_so\\_term = J(J+1) - L(L+1) - S(S+1)"
+        physical_meaning: |
+          The dot product of the orbital and spin angular momentum vectors.
+          Measures the geometric alignment between L and S: positive when
+          they point in the same direction (high J), negative when opposed
+          (low J). This quantity directly determines the energy splitting
+          within a multiplet (Landé interval rule).
+        ml_rationale: |
+          The single most direct encoding of where a level sits within its
+          multiplet. Without this, the model must discover the Landé rule
+          implicitly from J, L, S separately.
+        reference: "Landé (1923); Cowan, Theory of Atomic Structure and Spectra (1981)"
+
+      - name: "E_so_estimate"
+        display: "ζ · L·S / 2 (spin-orbit energy estimate)"
+        equation: "E_{so} = (\\zeta_{3d}/2) \\times [J(J+1) - L(L+1) - S(S+1)]"
+        physical_meaning: |
+          Physics-based prior estimate of the spin-orbit energy contribution
+          in cm⁻¹. ζ₃d = 515 cm⁻¹ is the spin-orbit coupling constant for
+          the 3d shell of Co I, scaling the geometric alignment into physical
+          energy units.
+        ml_rationale: |
+          Provides the model with a calibrated energy-scale estimate of the
+          fine-structure splitting, analogous to the Rydberg prediction used
+          for alkali atoms.
+        reference: "Cowan (1981); ζ value from Kurucz database"
+
+      - name: "zeta_3d"
+        display: "ζ₃d (spin-orbit coupling constant)"
+        equation: "\\zeta_{3d} \\approx 515 \\text{ cm}^{-1} \\text{ for Co I}"
+        physical_meaning: |
+          Element-specific constant measuring how strongly a 3d electron's
+          spin interacts with its own orbital motion. Physically arises from
+          the magnetic field experienced by the electron in its own rest frame
+          as the nucleus orbits around it. Scales approximately as Z_eff⁴/n³.
+        ml_rationale: |
+          Constant within Co I; becomes a discriminating feature in
+          multi-element training (Fe: ~410 cm⁻¹, Ni: ~630 cm⁻¹).
+        reference: "Cowan (1981), Table 16-1"
+
+  - name: "d-Shell Filling Structure"
+    color: "#16a34a"
+    features:
+      - name: "n_3d"
+        display: "n₃d (3d electron count)"
+        equation: "n_{3d} \\in \\{0, 1, ..., 10\\}"
+        physical_meaning: |
+          Number of electrons occupying the 3d subshell. For Co I
+          configurations, this ranges from 7 (ground: 3d⁷4s²) to 9 (3d⁹).
+          Sets the total electron-electron repulsion energy scale.
+        ml_rationale: |
+          Directly encodes the dominant driver of configuration-level energy
+          differences; buried implicitly in the orbital occupancy columns
+          but made explicit here for emphasis.
+        reference: "Hund (1925); Griffiths, Introduction to Quantum Mechanics"
+
+      - name: "d_holes"
+        display: "d_holes = 10 − n₃d"
+        equation: "d_{holes} = 10 - n_{3d}"
+        physical_meaning: |
+          Number of empty slots in the 3d subshell. By particle-hole symmetry,
+          the energy spectrum of a d^n configuration mirrors that of d^(10-n),
+          so d⁷ (3 holes) and d³ (3 electrons) share mathematical structure.
+        ml_rationale: |
+          Allows the model to exploit particle-hole symmetry between the
+          first and second halves of the d-shell, which would otherwise
+          require double the data to learn empirically.
+        reference: "Judd (1963), Operator Techniques in Atomic Spectroscopy"
+
+      - name: "d_from_half"
+        display: "d_excess = |n₃d − 5|"
+        equation: "d_{from\\_half} = |n_{3d} - 5|"
+        physical_meaning: |
+          Distance from the half-filled configuration (d⁵). Each electron
+          added past the half-filled shell must pair with an existing
+          electron at the cost of the pairing energy, which scales roughly
+          with this distance.
+        ml_rationale: |
+          Encodes the pairing energy cost — a smooth, approximately linear
+          proxy for the extra repulsion energy in the second half of the shell.
+        reference: "Slater (1930); Hund's rules"
+
+      - name: "is_half_filled"
+        display: "is_half_filled (binary flag)"
+        equation: "is\\_half\\_filled = \\mathbf{1}[n_{3d} = 5]"
+        physical_meaning: |
+          Binary indicator for the half-filled d⁵ configuration (Mn in
+          neutral atoms). This special arrangement maximises total spin S
+          under Hund's first rule, creating a stability discontinuity that
+          does not fit the smooth trend of neighbouring configurations.
+        ml_rationale: |
+          Without this flag, a model would need to discover a sharp
+          non-linearity at exactly n₃d=5 from limited data. The flag
+          provides it directly.
+        reference: "Hund (1925); Cotton, Chemical Applications of Group Theory"
+
+  - name: "Effective Nuclear Charge (Slater Screening)"
+    color: "#9333ea"
+    features:
+      - name: "Z_eff"
+        display: "Z_eff (effective nuclear charge)"
+        equation: "Z_{eff} = Z - \\sigma, \\quad \\sigma = 0.35(n_{3d}-1) + 0.85 \\times 8 + 1.00 \\times 10"
+        physical_meaning: |
+          The effective number of protons felt by a 3d valence electron,
+          after partial shielding by inner electrons. Inner electrons do
+          not perfectly cancel the nucleus because valence electron
+          wavefunctions penetrate inward. For Co 3d⁷: Z_eff ≈ 8.10.
+        ml_rationale: |
+          Sets the overall energy scale of electron-electron repulsion,
+          which is the dominant contributor to configuration-level energy
+          differences. Varies with n₃d: 3d⁷→8.10, 3d⁸→7.75, 3d⁹→7.40.
+        reference: "Slater (1930), Phys. Rev. 36, 57"
+
+      - name: "Z_eff_sq"
+        display: "Z_eff² (squared effective nuclear charge)"
+        equation: "Z_{eff\\_sq} = Z_{eff}^2"
+        physical_meaning: |
+          Square of the effective nuclear charge. Electron-electron repulsion
+          energies scale as Z_eff² / ⟨r⟩, making the squared term necessary
+          to capture the full nonlinear dependence.
+        ml_rationale: |
+          Provides the model with the dominant nonlinear energy scale directly,
+          analogous to the Z²/n² dependence in the hydrogen atom energy formula.
+        reference: "Cowan (1981); Bethe & Salpeter (1957)"
+
+  - name: "Configuration Parity and Structure"
+    color: "#dc2626"
+    features:
+      - name: "parity_computed"
+        display: "parity (0=even, 1=odd)"
+        equation: "parity = \\left(\\sum_i n_i \\cdot \\ell_i \\right) \\bmod 2"
+        physical_meaning: |
+          Quantum mechanical symmetry under reflection of all electron
+          coordinates through the nucleus. Determined by the sum of orbital
+          quantum numbers ℓ of all electrons: s(ℓ=0) and d(ℓ=2) preserve
+          even parity; p(ℓ=1) and f(ℓ=3) flip it. Even and odd parity
+          levels never mix — they are completely separate physical systems.
+        ml_rationale: |
+          A hard selection rule, not a soft trend. Without this feature the
+          model might erroneously learn relationships between levels of
+          opposite parity that can never physically interact.
+        reference: "Wigner (1927); Condon & Shortley (1935)"
+
+      - name: "comp1_S / comp1_L"
+        display: "3d-group sub-term S and L"
+        equation: "\\text{from } (^{2S+1}L) \\text{ in first bracket of configuration string}"
+        physical_meaning: |
+          The total spin and orbital angular momentum of the 3d electron
+          group alone, before coupling to the outer electrons (4s, 4p).
+          For example, in 3d⁷(⁴F)4s4p, comp1 = ⁴F → S=3/2, L=3.
+          Multiple 3d⁷ sub-terms exist (⁴F, ⁴P, ²G, ²D, ...) with
+          different energies, which is why sub-term information is critical.
+        ml_rationale: |
+          Adding sub-term features reduced MAE from ~4700 to ~1400 cm⁻¹ —
+          the single largest improvement in the project. Two configurations
+          that differ only in the 3d sub-term can have energies thousands
+          of cm⁻¹ apart.
+        reference: "Racah (1942); Cowan (1981)"
+
+      - name: "subres_S / subres_L"
+        display: "sub-resultant term S and L"
+        equation: "\\text{from } ,(^{2S+1}L) \\text{ at end of configuration string}"
+        physical_meaning: |
+          The intermediate coupling term formed by the two outermost
+          electrons (e.g. 4s and 4p) before they couple to the 3d group.
+          Appears as ,(³P) or ,(¹P) in NIST notation.
+        ml_rationale: |
+          Distinguishes configurations that have the same 3d sub-term and
+          the same resultant term but different intermediate coupling history
+          — and therefore different energies.
+        reference: "Cowan (1981), Chapter 12"
+
+chart_descriptions:
+  feature_statistics: |
+    This table shows basic statistics for each input feature across the
+    Co I dataset. 'n_unique' counts how many distinct values each feature
+    takes — features with n_unique=1 are constant and carry no information
+    for the model. 'std' (standard deviation) measures spread; a very small
+    std relative to the mean suggests the feature may be near-constant
+    for this element.
+
+  correlation_matrix: |
+    This heatmap shows the Pearson correlation coefficient between every
+    pair of features. Values close to +1 (dark red) mean the two features
+    increase together; values close to -1 (dark blue) mean one increases
+    as the other decreases; values near 0 (white) mean the features are
+    unrelated. Features with |r| > 0.95 are flagged below as potentially
+    redundant — keeping both provides no additional information to the model.
+    Note that high correlation within Co I alone may resolve when more
+    elements are added, as some features only vary across elements.
+
+  mutual_information: |
+    Mutual information (MI) measures how much knowing the value of a feature
+    reduces uncertainty about the target energy level. Unlike correlation,
+    MI captures nonlinear relationships. A value of 0 means the feature is
+    completely uninformative about the target; higher values mean more
+    informative. For transition metals, no single feature dominates — the
+    energy structure is genuinely multivariate, so even features with
+    modest MI scores may contribute when used in combination.
+
+  permutation_importance: |
+    Permutation importance measures the actual contribution of each feature
+    to the trained model's predictions. The test procedure: shuffle one
+    feature's values randomly across all test samples, then measure how
+    much the model's mean absolute error (MAE) increases. A large increase
+    means the model relied heavily on that feature; an increase near zero
+    means the model could predict almost as well without it. Error bars
+    show variability across 30 random shuffles.
+
+  predicted_vs_observed: |
+    Each point represents one energy level from the test set. The x-axis
+    shows the experimentally observed energy (the correct answer); the
+    y-axis shows the model's prediction. Points falling on the diagonal
+    dashed line are perfect predictions. Points above the line are
+    overestimates; below are underestimates. The spread around the
+    diagonal quantifies the model error. Results are shown for all four
+    target variants tested (raw energy, binding energy, log-binding,
+    inverse-binding).
+
+  model_results: |
+    This table summarises the performance of four model variants, each
+    trained on the same features but predicting a different transformation
+    of the energy target. MAE (Mean Absolute Error) is the average
+    prediction error in cm⁻¹ — lower is better. R² (coefficient of
+    determination) measures the fraction of variance explained — 1.0 is
+    perfect, 0.0 means the model does no better than predicting the mean.
+    Max error is the worst single prediction in the test set.

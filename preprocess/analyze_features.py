@@ -1060,110 +1060,699 @@ def build_xlsx(out_path, df, features, targets, mi_results, perm):
             perm_df.to_excel(xl, sheet_name="permutation_importance", index=False)
 
 
-_HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<title>Feature Analysis — {title}</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<style>
- body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background:#f7f8fa; color:#1f2937; }}
- header {{ background:#1e293b; color:#fff; padding:24px 32px; }}
- header h1 {{ margin:0 0 6px; font-size:22px; }}
- header p {{ margin:0; color:#cbd5e1; font-size:14px; }}
- main {{ max-width:1100px; margin:0 auto; padding:24px 32px; }}
- .card {{ background:#fff; border:1px solid #e5e7eb; border-radius:10px; padding:18px 20px; margin-bottom:22px; box-shadow:0 1px 2px rgba(0,0,0,.04); }}
- .card h2 {{ margin:0 0 14px; font-size:16px; }}
- table {{ border-collapse:collapse; width:100%; font-size:13px; }}
- th, td {{ border:1px solid #e5e7eb; padding:6px 9px; text-align:right; }}
- th {{ background:#f1f5f9; }}
- td:first-child, th:first-child {{ text-align:left; }}
- .chips span {{ display:inline-block; background:#e0e7ff; color:#3730a3; border-radius:12px; padding:2px 10px; margin:2px; font-size:12px; }}
-</style></head><body>
-<header>
- <h1>Feature Analysis Report</h1>
- <p>{subtitle}</p>
-</header>
-<main>
- <div class="card"><h2>Overview</h2>{overview}</div>
- {chart_cards}
- <div class="card"><h2>Per-feature summary</h2>{summary_table}</div>
- {perm_table}
-</main>
-<script>
-const CHARTS = {charts_json};
-CHARTS.forEach(c => new Chart(document.getElementById(c.id), {{
-  type:'bar',
-  data:{{ labels:c.labels, datasets:[{{ label:c.title, data:c.values, backgroundColor:c.color }}] }},
-  options:{{ indexAxis:'y', responsive:true, maintainAspectRatio:false,
-    plugins:{{ legend:{{display:false}}, title:{{display:true, text:c.title}} }},
-    scales:{{ x:{{ beginAtZero:true }} }} }}
-}}));
-</script>
-</body></html>"""
+_REPORT_CSS = """
+:root { --navy:#0f172a; --navy2:#1e293b; --ink:#1f2937; --muted:#6b7280;
+  --line:#e5e7eb; --bg:#f7f8fa; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--ink);
+  font-family:'IBM Plex Sans',-apple-system,Segoe UI,Roboto,sans-serif; line-height:1.55; }
+code, .eqn, .mono { font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace; }
+
+/* Sidebar */
+.sidebar { position:fixed; top:0; left:0; width:240px; height:100vh; background:var(--navy);
+  color:#cbd5e1; padding:22px 0; overflow-y:auto; z-index:50; }
+.sidebar .brand { font-size:20px; font-weight:700; color:#fff; padding:0 22px 16px;
+  border-bottom:1px solid #1e293b; }
+.sidebar .brand span { display:block; font-size:12px; font-weight:400; color:#64748b; margin-top:2px; }
+.sidebar ul { list-style:none; margin:14px 0; padding:0; }
+.sidebar li a { display:block; padding:9px 22px; color:#cbd5e1; text-decoration:none;
+  font-size:14px; border-left:3px solid transparent; }
+.sidebar li a:hover { background:#1e293b; color:#fff; border-left-color:#3b82f6; }
+.nav-foot { padding:14px 22px; font-size:11px; color:#475569; border-top:1px solid #1e293b;
+  position:absolute; bottom:0; width:100%; }
+.menu-btn { display:none; position:fixed; top:12px; left:12px; z-index:60;
+  background:var(--navy); color:#fff; border:0; border-radius:6px; padding:8px 12px; font-size:14px; }
+
+/* Content */
+.content { margin-left:240px; max-width:1080px; padding:0 40px 80px; }
+.page-head { padding:40px 0 28px; border-bottom:2px solid var(--line); margin-bottom:8px; }
+.page-head h1 { font-size:26px; margin:0 0 8px; color:var(--navy); }
+.page-head p { margin:0; color:var(--muted); font-size:15px; }
+section { padding:34px 0; border-bottom:1px solid var(--line); scroll-margin-top:20px; }
+section > h2 { font-size:21px; color:var(--navy); margin:0 0 18px; }
+section h3 { font-size:16px; color:var(--navy2); margin:26px 0 12px; }
+section h4 { font-size:14px; margin:0 0 12px; }
+.muted { color:var(--muted); font-weight:400; font-size:12px; }
+
+/* Intro two-column */
+.two-col { display:grid; grid-template-columns:1fr 280px; gap:30px; align-items:start; }
+.col-text p { margin:0 0 14px; }
+.glance { background:var(--navy); color:#fff; border-radius:12px; padding:22px; }
+.glance h3 { color:#94a3b8; font-size:12px; text-transform:uppercase; letter-spacing:.08em;
+  margin:0 0 14px; }
+.g-num { font-size:24px; font-weight:700; color:#fff; }
+.g-lbl { font-size:12px; color:#94a3b8; margin-bottom:16px; }
+
+/* Dataset cards */
+.card-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; margin-bottom:24px; }
+.dcard { background:#fff; border:1px solid var(--line); border-radius:10px; padding:16px 18px; }
+.dc-t { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+.dc-v { font-size:20px; font-weight:600; color:var(--navy); margin:6px 0 4px; }
+.dc-s { font-size:12px; color:var(--muted); }
+.card { background:#fff; border:1px solid var(--line); border-radius:10px; padding:20px;
+  margin-bottom:20px; }
+.doughnut-wrap { max-width:420px; margin:0 auto; height:300px; }
+.note, .desc { background:#eff6ff; border-left:4px solid #2563eb; border-radius:6px;
+  padding:14px 18px; margin:16px 0; }
+.note p, .desc p { margin:0 0 8px; font-size:14px; }
+.note p:last-child, .desc p:last-child { margin-bottom:0; }
+
+/* Feature catalogue */
+.group { margin-bottom:30px; }
+.group-head { border-left:5px solid; padding:6px 0 6px 14px; margin-bottom:14px; }
+.group-head h3 { margin:0; color:var(--navy); }
+.feat-cards { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+.fcard { border:1px solid var(--line); border-top:3px solid var(--gc,#888); border-radius:10px;
+  padding:16px 18px; background:#fff; }
+.fc-name code { font-size:15px; font-weight:600; color:var(--navy); background:#f1f5f9;
+  padding:2px 7px; border-radius:5px; }
+.fc-disp { display:block; font-size:13px; color:var(--muted); margin-top:5px; }
+.eqn { background:#0f172a; color:#e2e8f0; border-radius:6px; padding:10px 14px; margin:12px 0;
+  font-size:14px; overflow-x:auto; }
+.phys p { font-size:14px; margin:0 0 8px; }
+.why { background:#eff6ff; border-radius:6px; padding:10px 14px; margin:10px 0; }
+.why-tag { display:inline-block; font-size:11px; font-weight:600; color:#2563eb;
+  text-transform:uppercase; letter-spacing:.05em; margin-bottom:4px; }
+.why p { font-size:13px; margin:0; color:#1e3a5f; }
+.ref { font-size:12px; font-style:italic; color:var(--muted); margin-top:8px; }
+
+/* Tables */
+.table-wrap { overflow-x:auto; }
+table { border-collapse:collapse; width:100%; font-size:13px; }
+th, td { border:1px solid var(--line); padding:7px 10px; text-align:right; }
+th { background:#f1f5f9; color:var(--navy2); }
+td:first-child, th:first-child { text-align:left; }
+table.sortable th { cursor:pointer; user-select:none; }
+table.sortable th:hover { background:#e2e8f0; }
+tr.best { background:#ecfdf5; font-weight:600; }
+.empty { color:var(--muted); font-style:italic; }
+
+/* Heatmap */
+.heatmap-wrap { overflow-x:auto; padding-top:60px; }
+table.heatmap { border-collapse:collapse; width:auto; }
+table.heatmap td, table.heatmap th { border:1px solid #fff; padding:0; width:34px; height:26px;
+  text-align:center; font-size:10px; }
+table.heatmap th.hrow { background:#f1f5f9; text-align:right; padding:0 6px; white-space:nowrap;
+  font-size:11px; width:auto; }
+table.heatmap th.hrot { background:transparent; height:60px; position:relative; }
+table.heatmap th.hrot span { position:absolute; bottom:4px; left:50%; transform:translateX(-50%) rotate(-60deg);
+  transform-origin:left bottom; white-space:nowrap; font-size:11px; font-weight:500; }
+
+/* Charts */
+.chart-box { position:relative; width:100%; }
+
+/* Outlook */
+ul.outlook { list-style:none; padding:0; margin:0; }
+ul.outlook li { display:flex; gap:14px; align-items:flex-start; background:#fff;
+  border:1px solid var(--line); border-radius:10px; padding:16px 18px; margin-bottom:14px; }
+ul.outlook .bullet { color:#2563eb; font-size:22px; line-height:1; }
+
+.page-foot { padding:26px 0 0; color:var(--muted); font-size:13px; }
+
+@media (max-width:880px) {
+  .sidebar { transform:translateX(-100%); transition:transform .2s; }
+  body.nav-open .sidebar { transform:translateX(0); }
+  .menu-btn { display:block; }
+  .content { margin-left:0; padding:50px 18px 60px; }
+  .two-col, .card-grid, .feat-cards { grid-template-columns:1fr; }
+}
+"""
+
+_REPORT_JS = """
+const D = REPORT_DATA;
+const FONT = "'IBM Plex Sans', sans-serif";
+Chart.defaults.font.family = FONT;
+
+// Custom horizontal error-bar plugin (no external dependency).
+const errBarsH = {
+  id:'errBarsH',
+  afterDatasetsDraw(chart){
+    const errs = chart.$errors;
+    if(!errs) return;
+    const {ctx, scales:{x}} = chart;
+    const meta = chart.getDatasetMeta(0);
+    ctx.save(); ctx.strokeStyle='#334155'; ctx.lineWidth=1;
+    meta.data.forEach((bar,i)=>{
+      const v = chart.data.datasets[0].data[i], e = errs[i];
+      if(e==null) return;
+      const yC = bar.y, xp = x.getPixelForValue(v+e), xm = x.getPixelForValue(v-e);
+      ctx.beginPath();
+      ctx.moveTo(xm,yC); ctx.lineTo(xp,yC);
+      ctx.moveTo(xm,yC-4); ctx.lineTo(xm,yC+4);
+      ctx.moveTo(xp,yC-4); ctx.lineTo(xp,yC+4);
+      ctx.stroke();
+    });
+    ctx.restore();
+  }
+};
+
+// Mutual information charts
+(D.mi||[]).forEach((m,i)=>{
+  const el = document.getElementById('mi_chart_'+i);
+  if(!el) return;
+  new Chart(el, {
+    type:'bar',
+    data:{ labels:m.labels, datasets:[{ data:m.values, backgroundColor:m.colors }] },
+    options:{ indexAxis:'y', responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{display:false},
+        tooltip:{callbacks:{label:c=>'MI: '+c.parsed.x.toFixed(4)}} },
+      scales:{ x:{ beginAtZero:true, title:{display:true,text:'Mutual information'} },
+               y:{ ticks:{ font:{size:11} } } } }
+  });
+});
+
+// Permutation importance with error bars
+if(D.perm){
+  const el = document.getElementById('permChart');
+  if(el){
+    const ch = new Chart(el, {
+      type:'bar',
+      data:{ labels:D.perm.labels, datasets:[{ data:D.perm.values, backgroundColor:D.perm.colors }] },
+      options:{ indexAxis:'y', responsive:true, maintainAspectRatio:false,
+        plugins:{ legend:{display:false},
+          tooltip:{callbacks:{label:c=>'ΔMAE: '+c.parsed.x.toFixed(2)+' cm⁻¹'}} },
+        scales:{ x:{ title:{display:true,text:'Mean MAE increase (cm⁻¹)'} },
+                 y:{ ticks:{ font:{size:11} } } } },
+      plugins:[errBarsH]
+    });
+    ch.$errors = D.perm.errors;
+    ch.update();
+  }
+}
+
+// Configuration complexity doughnut
+(function(){
+  const el = document.getElementById('complexityChart');
+  if(!el || !D.complexity || !D.complexity.values.length) return;
+  const palette = ['#2563eb','#16a34a','#9333ea','#dc2626','#BA7517','#0EA5E9'];
+  new Chart(el, {
+    type:'doughnut',
+    data:{ labels:D.complexity.labels,
+      datasets:[{ data:D.complexity.values,
+        backgroundColor:D.complexity.labels.map((_,i)=>palette[i%palette.length]) }] },
+    options:{ responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{position:'right'},
+        tooltip:{callbacks:{label:c=>c.label+': '+c.parsed+' levels'}} } }
+  });
+})();
+
+// Predicted vs observed scatter
+(function(){
+  const el = document.getElementById('scatterChart');
+  if(!el || !D.scatter) return;
+  const ds = D.scatter.datasets.map(s=>({
+    type:'scatter', label:s.label, data:s.points,
+    backgroundColor:s.color, pointRadius:3, pointHoverRadius:5 }));
+  const d = D.scatter.diag;
+  ds.push({ type:'line', label:'perfect prediction',
+    data:[{x:d.min,y:d.min},{x:d.max,y:d.max}],
+    borderColor:'#64748b', borderDash:[6,5], borderWidth:1.5,
+    pointRadius:0, fill:false });
+  new Chart(el, {
+    data:{ datasets:ds },
+    options:{ responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{position:'top'} },
+      scales:{ x:{ title:{display:true,text:'Observed energy (cm⁻¹)'} },
+               y:{ title:{display:true,text:'Predicted energy (cm⁻¹)'} } } }
+  });
+})();
+
+// Click-to-sort tables
+function sortTable(id, th){
+  const table = document.getElementById(id);
+  const tbody = table.tBodies[0];
+  const idx = Array.from(th.parentNode.children).indexOf(th);
+  const asc = !(th.dataset.asc === 'true');
+  th.dataset.asc = asc;
+  const rows = Array.from(tbody.rows);
+  rows.sort((a,b)=>{
+    let x = a.cells[idx].dataset.v, y = b.cells[idx].dataset.v;
+    const nx = parseFloat(x), ny = parseFloat(y);
+    if(!isNaN(nx) && !isNaN(ny)){ return asc ? nx-ny : ny-nx; }
+    return asc ? String(x).localeCompare(y) : String(y).localeCompare(x);
+  });
+  rows.forEach(r=>tbody.appendChild(r));
+}
+"""
 
 
-def build_html(out_path, df, features, elements, modes, targets, mi_results, perm):
+def _latex_to_html(eq):
+    """
+    Render the small subset of LaTeX used in report_content.yaml equations as
+    inline HTML with Unicode symbols and <sub>/<sup> tags — no MathJax needed.
+    """
+    import re
+    s = eq or ""
+    s = re.sub(r"\\text\{([^}]*)\}", r"\1", s)
+    s = re.sub(r"\\mathbf\{([^}]*)\}", r"<b>\1</b>", s)
+    # Protect escaped literals so the sub/sup passes below leave them alone.
+    s = s.replace("\\_", "\x01").replace("\\{", "\x02").replace("\\}", "\x03")
+    for pat, sym in [
+        (r"\\zeta", "ζ"), (r"\\sigma", "σ"), (r"\\times", "×"),
+        (r"\\approx", "≈"), (r"\\in", "∈"), (r"\\sum", "Σ"),
+        (r"\\ell", "ℓ"), (r"\\bmod", " mod "), (r"\\quad", "&nbsp;&nbsp;&nbsp;&nbsp;"),
+        (r"\\,", " "), (r"\\;", " "), (r"\\cdot", "·"),
+        (r"\\left", ""), (r"\\right", ""), (r"\\Delta", "Δ"), (r"\\delta", "δ"),
+    ]:
+        s = re.sub(pat, sym, s)
+    s = re.sub(r"_\{([^}]*)\}", r"<sub>\1</sub>", s)
+    s = re.sub(r"\^\{([^}]*)\}", r"<sup>\1</sup>", s)
+    s = re.sub(r"_([A-Za-z0-9])", r"<sub>\1</sub>", s)
+    s = re.sub(r"\^([A-Za-z0-9])", r"<sup>\1</sup>", s)
+    return s.replace("\x01", "_").replace("\x02", "{").replace("\x03", "}")
+
+
+def _esc(text):
+    """Minimal HTML escaping for plain text content."""
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _paras(text):
+    """Split a YAML block scalar on blank lines into <p> paragraphs."""
+    import re
+    out = []
+    for chunk in re.split(r"\n\s*\n", (text or "").strip()):
+        chunk = " ".join(chunk.split())
+        if chunk:
+            out.append(f"<p>{_esc(chunk)}</p>")
+    return "".join(out)
+
+
+def _oneline(text):
+    """Collapse a YAML block scalar to a single escaped line."""
+    return _esc(" ".join((text or "").split()))
+
+
+def _corr_color(r):
+    """Interpolate a Pearson r in [-1, 1] from blue (#2563eb) through white to red (#dc2626)."""
+    if r != r:           # NaN
+        return "#f9fafb"
+    if r >= 0:
+        t = min(r, 1.0)
+        (r1, g1, b1), (r2, g2, b2) = (255, 255, 255), (220, 38, 38)
+    else:
+        t = min(-r, 1.0)
+        (r1, g1, b1), (r2, g2, b2) = (255, 255, 255), (37, 99, 235)
+    return "rgb(%d,%d,%d)" % (int(r1 + (r2 - r1) * t),
+                              int(g1 + (g2 - g1) * t),
+                              int(b1 + (b2 - b1) * t))
+
+
+def build_html(out_path, df, features, elements, modes, targets, mi_results, perm,
+               preprocessing_info=None, predictions_df=None, results_df=None):
+    """
+    Render a single self-contained physicist-facing HTML report.
+
+    All fixed text and physics definitions come from report_content.yaml (no
+    physics is hardcoded here). Optional inputs (preprocessing_info,
+    predictions_df, results_df) enrich the dataset/results sections when present
+    and degrade gracefully when absent. All data is embedded as inline JSON, so
+    the report needs no data files at view time (only the Chart.js CDN).
+    """
+    import yaml
     perm_df, baseline_mae = perm
     print(f"  writing HTML → {out_path}")
 
-    charts, cards = [], []
-    cidx = 0
+    content_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "report_content.yaml")
+    with open(content_file, "r", encoding="utf-8") as f:
+        content = yaml.safe_load(f)
+
+    rep = content.get("report", {})
+    groups = content.get("feature_groups", [])
+    descs = content.get("chart_descriptions", {})
+    pinfo = preprocessing_info or {}
+
+    # Map each catalogued feature column -> its group colour (split "a / b" names).
+    feat_color = {}
+    import re as _re
+    for g in groups:
+        for feat in g.get("features", []):
+            for nm in _re.split(r"\s*/\s*", feat.get("name", "")):
+                if nm.strip():
+                    feat_color[nm.strip()] = g.get("color", "#888780")
+
+    def pget(key, default=None):
+        return pinfo[key] if key in pinfo else default
+
+    # ---- Data prep --------------------------------------------------------
+    feat_present = [f for f in features if f in df.columns]
+
+    # Dataset overview numbers (preprocessing_info preferred, else derive from df).
+    total_levels = pget("total_rows", len(df))
+    rows_obs_gj = pget("rows_with_obs_gj")
+    pct_obs_gj = pget("pct_obs_gj")
+    rows_term = pget("rows_term_known")
+    if rows_term is None and "term_known" in df.columns:
+        rows_term = int(pd.to_numeric(df["term_known"], errors="coerce").fillna(0).sum())
+    n_even = pget("n_even")
+    n_odd = pget("n_odd")
+    if (n_even is None or n_odd is None) and "parity_computed" in df.columns:
+        vc = pd.to_numeric(df["parity_computed"], errors="coerce").value_counts()
+        n_even = int(vc.get(0, 0))
+        n_odd = int(vc.get(1, 0))
+    e_min = pget("energy_min")
+    e_max = pget("energy_max")
+    if (e_min is None or e_max is None) and LEVEL_COL in df.columns:
+        e_min = float(df[LEVEL_COL].min())
+        e_max = float(df[LEVEL_COL].max())
+    top_terms = pget("top_comp1_terms")
+
+    # Configuration-complexity doughnut (n_components distribution).
+    comp_counts = pget("n_components")
+    if comp_counts is None and "n_components" in df.columns:
+        vc = pd.to_numeric(df["n_components"], errors="coerce").dropna().astype(int).value_counts()
+        comp_counts = {int(k): int(v) for k, v in vc.items()}
+    comp_counts = comp_counts or {}
+    comp_labels = [f"{k}-component" for k in sorted(comp_counts)]
+    comp_values = [comp_counts[k] for k in sorted(comp_counts)]
+
+    # Mutual information charts (one per target).
+    mi_payload = []
     for label, res in mi_results.items():
-        cid = f"chart{cidx}"
-        cidx += 1
-        charts.append({
-            "id": cid,
-            "title": f"Mutual information — target: {label}",
+        vals = [round(float(v), 4) for v in res["mutual_information"]]
+        med = float(np.median(res["mutual_information"])) if len(vals) else 0.0
+        colors = ["#1D9E75" if v > med else "#888780" for v in vals]
+        mi_payload.append({
+            "target": label,
             "labels": res["feature"].tolist(),
-            "values": [round(float(v), 4) for v in res["mutual_information"]],
-            "color": "#2563eb",
+            "values": vals,
+            "colors": colors,
+            "median": round(med, 4),
         })
-        h = max(220, 22 * len(res))
-        cards.append(f'<div class="card"><h2>Mutual information — {label}</h2>'
-                     f'<div style="height:{h}px"><canvas id="{cid}"></canvas></div></div>')
 
+    # Permutation importance chart, coloured by feature group.
+    perm_payload = None
     if perm_df is not None:
-        cid = f"chart{cidx}"
-        cidx += 1
-        charts.append({
-            "id": cid,
-            "title": f"Permutation importance (baseline MAE {baseline_mae:.1f} cm⁻¹)",
-            "labels": perm_df["feature"].tolist(),
-            "values": [round(float(v), 3) for v in perm_df["mean_mae_increase"]],
-            "color": "#16a34a",
-        })
-        h = max(220, 22 * len(perm_df))
-        cards.append(f'<div class="card"><h2>Permutation importance (model-based)</h2>'
-                     f'<div style="height:{h}px"><canvas id="{cid}"></canvas></div></div>')
+        d = perm_df.sort_values("mean_mae_increase", ascending=True)
+        perm_payload = {
+            "labels": d["feature"].tolist(),
+            "values": [round(float(v), 3) for v in d["mean_mae_increase"]],
+            "errors": [round(float(v), 3) for v in d["std_mae_increase"]],
+            "colors": [feat_color.get(f, "#888780") for f in d["feature"]],
+            "baseline": round(float(baseline_mae), 1) if baseline_mae is not None else None,
+        }
 
-    mode_chips = " ".join(f"<span>{el}: {modes.get(el, '?')}</span>" for el in elements)
-    overview = (
-        f'<p><b>{len(df)}</b> samples across <b>{len(elements)}</b> element(s); '
-        f'<b>{len(features)}</b> features analysed against '
-        f'<b>{len(targets)}</b> target(s).</p>'
-        f'<p>Input mode per element:</p><div class="chips">{mode_chips}</div>'
-        f'<p style="margin-top:10px;color:#6b7280;font-size:13px">Features: '
-        f'{", ".join(features)}</p>'
-    )
+    # Predicted-vs-observed scatter.
+    scatter_payload = None
+    if predictions_df is not None and "True_Energy_cm-1" in predictions_df.columns:
+        pred_cols = [c for c in predictions_df.columns if c.startswith("Predicted_")]
+        nice = {
+            "Predicted_raw_no-weights": "Raw energy",
+            "Predicted_binded_no-weights": "Binding energy",
+            "Predicted_log-binded_no-weights": "Log-binding",
+            "Predicted_inv-binded_no-weights": "Inverse-binding",
+        }
+        palette = ["#2563eb", "#16a34a", "#dc2626", "#9333ea", "#BA7517", "#0EA5E9"]
+        x = pd.to_numeric(predictions_df["True_Energy_cm-1"], errors="coerce")
+        datasets = []
+        for i, col in enumerate(pred_cols):
+            y = pd.to_numeric(predictions_df[col], errors="coerce")
+            pts = [{"x": round(float(xv), 2), "y": round(float(yv), 2)}
+                   for xv, yv in zip(x, y) if pd.notna(xv) and pd.notna(yv)]
+            datasets.append({
+                "label": nice.get(col, col.replace("Predicted_", "")),
+                "color": palette[i % len(palette)],
+                "points": pts,
+            })
+        lo = float(x.min())
+        hi = float(x.max())
+        scatter_payload = {"datasets": datasets, "diag": {"min": round(lo, 2), "max": round(hi, 2)}}
 
-    summary = build_summary_table(df, features).round(4)
-    summary_table = summary.to_html(index=False, border=0)
+    report_data = {
+        "mi": mi_payload,
+        "perm": perm_payload,
+        "complexity": {"labels": comp_labels, "values": comp_values},
+        "scatter": scatter_payload,
+    }
 
-    perm_table = ""
-    if perm_df is not None:
-        perm_table = ('<div class="card"><h2>Permutation importance table</h2>'
-                      + perm_df.round(3).to_html(index=False, border=0) + "</div>")
+    # ---- HTML assembly ----------------------------------------------------
+    P = []
+    a = P.append
+    nfeat = len(feat_present)
 
-    html = _HTML_TEMPLATE.format(
-        title=", ".join(elements),
-        subtitle=f"{', '.join(elements)} · n={len(df)} · generated {_dt.date.today().isoformat()}",
-        overview=overview,
-        chart_cards="\n".join(cards),
-        summary_table=summary_table,
-        perm_table=perm_table,
-        charts_json=json.dumps(charts),
-    )
+    def fmt_int(v):
+        return "—" if v is None else f"{int(v):,}"
+
+    # § Sidebar ------------------------------------------------------------
+    nav_items = [
+        ("intro", "1 · Introduction"),
+        ("dataset", "2 · Dataset Overview"),
+        ("catalogue", "3 · Feature Catalogue"),
+        ("stats", "4 · Feature Statistics"),
+        ("collinearity", "5 · Collinearity"),
+        ("importance", "6 · Feature Importance"),
+        ("results", "7 · Model Results"),
+        ("outlook", "8 · Outlook"),
+    ]
+
+    a("<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>")
+    a("<meta name='viewport' content='width=device-width, initial-scale=1'>")
+    a(f"<title>{_esc(rep.get('title', 'Feature Analysis'))}</title>")
+    a("<link rel='preconnect' href='https://fonts.googleapis.com'>")
+    a("<link href='https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&"
+      "family=IBM+Plex+Mono:wght@400;500&display=swap' rel='stylesheet'>")
+    a("<script src='https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js'></script>")
+    a("<style>" + _REPORT_CSS + "</style></head><body>")
+
+    # Sidebar
+    a("<nav class='sidebar'>")
+    a(f"<div class='brand'>Co I<span>feature report</span></div>")
+    a("<ul>")
+    for sid, lbl in nav_items:
+        a(f"<li><a href='#{sid}'>{_esc(lbl)}</a></li>")
+    a("</ul>")
+    a("<div class='nav-foot'>Generated " + _dt.date.today().isoformat() + "</div>")
+    a("</nav>")
+    a("<button class='menu-btn' onclick=\"document.body.classList.toggle('nav-open')\">☰ Sections</button>")
+
+    a("<main class='content'>")
+
+    # § Header
+    a("<header class='page-head'>")
+    a(f"<h1>{_esc(rep.get('title', ''))}</h1>")
+    a(f"<p>{_esc(rep.get('subtitle', ''))}</p>")
+    a("</header>")
+
+    # §1 Introduction
+    a("<section id='intro'><h2>1 · Introduction</h2>")
+    a("<div class='two-col'>")
+    a("<div class='col-text'>" + _paras(rep.get("introduction", "")) + "</div>")
+    a("<aside class='glance'><h3>At a glance</h3>")
+    a(f"<div class='g-num'>{fmt_int(total_levels)}</div><div class='g-lbl'>energy levels</div>")
+    a(f"<div class='g-num'>{nfeat}</div><div class='g-lbl'>engineered features</div>")
+    a("<div class='g-num'>~1 cm⁻¹</div><div class='g-lbl'>target accuracy</div>")
+    a(f"<div class='g-num'>{_esc(', '.join(elements))}</div><div class='g-lbl'>element(s) · Kurucz</div>")
+    a("</aside></div></section>")
+
+    # §2 Dataset Overview
+    a("<section id='dataset'><h2>2 · Dataset Overview</h2>")
+    gj_txt = "—"
+    if rows_obs_gj is not None:
+        gj_txt = fmt_int(rows_obs_gj) + (f" ({pct_obs_gj:.1f}%)" if pct_obs_gj is not None else "")
+    erange = "—"
+    if e_min is not None and e_max is not None:
+        erange = f"{e_min:,.0f} – {e_max:,.0f}"
+    if top_terms:
+        top_txt = ", ".join(f"{t}&nbsp;({n})" for t, n in top_terms[:5])
+    else:
+        top_txt = "see Feature Catalogue (§3)"
+    cells = [
+        ("Total levels", fmt_int(total_levels), "rows in the Co I dataset"),
+        ("With observed g<sub>J</sub>", gj_txt, "Landé g-factor measured"),
+        ("Term known", fmt_int(rows_term), "confirmed LS term assignment"),
+        ("Parity split", f"{fmt_int(n_even)} even / {fmt_int(n_odd)} odd", "even vs odd configurations"),
+        ("Energy range", erange + " cm⁻¹", "lowest to highest level"),
+        ("Top 3d sub-terms", top_txt, "most frequent comp1 terms"),
+    ]
+    a("<div class='card-grid'>")
+    for title, val, sub in cells:
+        a(f"<div class='dcard'><div class='dc-t'>{title}</div>"
+          f"<div class='dc-v'>{val}</div><div class='dc-s'>{_esc(sub)}</div></div>")
+    a("</div>")
+    a("<div class='card'><h3>Configuration complexity</h3>"
+      "<div class='doughnut-wrap'><canvas id='complexityChart'></canvas></div></div>")
+    a("<div class='note'>" + _paras(rep.get("dataset_note", "")) + "</div>")
+    a("</section>")
+
+    # §3 Feature Catalogue
+    a("<section id='catalogue'><h2>3 · Feature Catalogue</h2>")
+    for g in groups:
+        color = g.get("color", "#888780")
+        a(f"<div class='group' style='--gc:{color}'>")
+        a(f"<div class='group-head' style='border-left-color:{color}'>"
+          f"<h3>{_esc(g.get('name', ''))}</h3></div>")
+        a("<div class='feat-cards'>")
+        for feat in g.get("features", []):
+            a("<div class='fcard'>")
+            a(f"<div class='fc-name'><code>{_esc(feat.get('name', ''))}</code>"
+              f"<span class='fc-disp'>{_esc(feat.get('display', ''))}</span></div>")
+            a(f"<div class='eqn'>{_latex_to_html(feat.get('equation', ''))}</div>")
+            a(f"<div class='phys'>{_paras(feat.get('physical_meaning', ''))}</div>")
+            a("<div class='why'><span class='why-tag'>Why this feature?</span>"
+              + _paras(feat.get("ml_rationale", "")) + "</div>")
+            a(f"<div class='ref'>{_esc(feat.get('reference', ''))}</div>")
+            a("</div>")
+        a("</div></div>")
+    a("</section>")
+
+    # §4 Feature Statistics
+    a("<section id='stats'><h2>4 · Feature Statistics</h2>")
+    a("<div class='desc'>" + _paras(descs.get("feature_statistics", "")) + "</div>")
+    summ = build_summary_table(df, feat_present)
+    a("<div class='table-wrap'><table class='sortable' id='statsTable'><thead><tr>")
+    for col in summ.columns:
+        a(f"<th onclick='sortTable(\"statsTable\", this)'>{_esc(col)}</th>")
+    a("</tr></thead><tbody>")
+    for _, row in summ.iterrows():
+        a("<tr>")
+        for col in summ.columns:
+            v = row[col]
+            cell = _esc(v) if col == "feature" else (f"{v:.4g}" if isinstance(v, (int, float, np.floating)) else _esc(v))
+            a(f"<td data-v='{_esc(v)}'>{cell}</td>")
+        a("</tr>")
+    a("</tbody></table></div></section>")
+
+    # §5 Collinearity
+    a("<section id='collinearity'><h2>5 · Collinearity Analysis</h2>")
+    a("<div class='desc'>" + _paras(descs.get("correlation_matrix", "")) + "</div>")
+    corr = df[feat_present].corr()
+    n = len(feat_present)
+    short = [c[:12] for c in feat_present]
+    a("<div class='heatmap-wrap'><table class='heatmap'><thead><tr><th></th>")
+    for s in short:
+        a(f"<th class='hrot'><span>{_esc(s)}</span></th>")
+    a("</tr></thead><tbody>")
+    for i in range(n):
+        a(f"<tr><th class='hrow'>{_esc(short[i])}</th>")
+        for j in range(n):
+            if j > i:
+                a("<td style='background:#f9fafb'></td>")
+            else:
+                r = corr.values[i, j]
+                txt = "" if r != r else f"{r:.2f}"
+                fg = "#fff" if (r == r and abs(r) > 0.6) else "#111"
+                a(f"<td style='background:{_corr_color(r)};color:{fg}'>{txt}</td>")
+        a("</tr>")
+    a("</tbody></table></div>")
+
+    # Flagged pairs |r| > 0.95
+    flagged = []
+    for i in range(n):
+        for j in range(i):
+            r = corr.values[i, j]
+            if r == r and abs(r) > 0.95:
+                fa, fb = feat_present[i], feat_present[j]
+                const = (df[fa].nunique() <= 2) or (df[fb].nunique() <= 2)
+                note = ("May resolve with multi-element training" if const
+                        else "Redundant within Co I — consider pruning")
+                flagged.append((fa, fb, r, note))
+    a("<h3>Flagged pairs (|r| &gt; 0.95)</h3>")
+    if flagged:
+        a("<div class='table-wrap'><table><thead><tr><th>Feature A</th><th>Feature B</th>"
+          "<th>r</th><th>Note</th></tr></thead><tbody>")
+        for fa, fb, r, note in flagged:
+            a(f"<tr><td>{_esc(fa)}</td><td>{_esc(fb)}</td><td>{r:.3f}</td>"
+              f"<td style='text-align:left'>{_esc(note)}</td></tr>")
+        a("</tbody></table></div>")
+    else:
+        a("<p class='empty'>No feature pairs exceed |r| = 0.95.</p>")
+    a("</section>")
+
+    # §6 Feature Importance
+    a("<section id='importance'><h2>6 · Feature Importance</h2>")
+    a("<h3>6a · Mutual Information</h3>")
+    a("<div class='desc'>" + _paras(descs.get("mutual_information", "")) + "</div>")
+    for i, m in enumerate(mi_payload):
+        h = max(400, 20 * len(m["labels"]))
+        a(f"<div class='card'><h4>Target: <code>{_esc(m['target'])}</code></h4>"
+          f"<div class='chart-box' style='height:{h}px'><canvas id='mi_chart_{i}'></canvas></div></div>")
+    if not mi_payload:
+        a("<p class='empty'>No mutual-information results available.</p>")
+
+    a("<h3>6b · Permutation Importance</h3>")
+    a("<div class='desc'>" + _paras(descs.get("permutation_importance", "")) + "</div>")
+    if perm_payload is not None:
+        h = max(400, 20 * len(perm_payload["labels"]))
+        sub = (f"baseline MAE = {perm_payload['baseline']} cm⁻¹"
+               if perm_payload["baseline"] is not None else "")
+        a(f"<div class='card'><h4>Permutation importance <span class='muted'>{sub}</span></h4>"
+          f"<div class='chart-box' style='height:{h}px'><canvas id='permChart'></canvas></div></div>")
+    else:
+        a("<p class='empty'>Permutation importance not available "
+          "(no trained checkpoint supplied).</p>")
+    a("</section>")
+
+    # §7 Model Results
+    a("<section id='results'><h2>7 · Model Results</h2>")
+    a("<h3>7a · Results table</h3>")
+    a("<div class='desc'>" + _paras(descs.get("model_results", "")) + "</div>")
+    if results_df is not None and len(results_df):
+        cols = [("experiment_tag", "Experiment"), ("target_feature", "Target"),
+                ("test_mae", "MAE"), ("test_r2", "R²"),
+                ("test_max_error", "Max error"), ("val_mae_gj", "g_J MAE")]
+        cols = [(c, lbl) for c, lbl in cols if c in results_df.columns]
+        best_idx = results_df["test_mae"].astype(float).idxmin() if "test_mae" in results_df.columns else None
+        a("<div class='table-wrap'><table><thead><tr>")
+        for _, lbl in cols:
+            a(f"<th>{_esc(lbl)}</th>")
+        a("</tr></thead><tbody>")
+        for idx, row in results_df.iterrows():
+            cls = " class='best'" if idx == best_idx else ""
+            a(f"<tr{cls}>")
+            for c, _ in cols:
+                v = row[c]
+                if c == "test_mae":
+                    cell = f"{float(v):.1f} cm⁻¹"
+                elif c == "test_r2":
+                    cell = f"{float(v):.4f}"
+                elif c == "test_max_error":
+                    cell = f"{float(v):.0f} cm⁻¹"
+                elif c == "val_mae_gj":
+                    cell = "—" if pd.isna(v) else f"{float(v):.3f}"
+                else:
+                    cell = _esc(v)
+                a(f"<td>{cell}</td>")
+            a("</tr>")
+        a("</tbody></table></div>")
+    else:
+        a("<p class='empty'>No model results file found.</p>")
+
+    a("<h3>7b · Predicted vs Observed</h3>")
+    a("<div class='desc'>" + _paras(descs.get("predicted_vs_observed", "")) + "</div>")
+    if scatter_payload is not None:
+        a("<div class='card'><div class='chart-box' style='height:560px'>"
+          "<canvas id='scatterChart'></canvas></div></div>")
+    else:
+        a("<p class='empty'>No predictions file found.</p>")
+    a("</section>")
+
+    # §8 Outlook
+    a("<section id='outlook'><h2>8 · Outlook</h2>")
+    a("<ul class='outlook'>")
+    for chunk in _re.split(r"\n\s*\n", (rep.get("outlook", "") or "").strip()):
+        chunk = " ".join(chunk.split())
+        if chunk:
+            a(f"<li><span class='bullet'>▸</span><span>{_esc(chunk)}</span></li>")
+    a("</ul></section>")
+
+    # Footer
+    base_mae = (f"{baseline_mae:.1f} cm⁻¹" if baseline_mae is not None else "n/a")
+    a("<footer class='page-foot'>")
+    a(f"Generated {_dt.date.today().isoformat()} · "
+      f"element(s): {_esc(', '.join(elements))} · "
+      f"n = {len(df)} samples · baseline MAE: {base_mae}")
+    a("</footer>")
+
+    a("</main>")
+
+    # Inline data + chart rendering JS
+    a("<script>const REPORT_DATA = " + json.dumps(report_data) + ";</script>")
+    a("<script>" + _REPORT_JS + "</script>")
+    a("</body></html>")
+
     with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write(html)
+        fh.write("\n".join(P))
 
 
 # ---------------------------------------------------------------------------
@@ -1211,13 +1800,50 @@ def main():
 
     no_rydberg = args.no_rydberg or ("n_star" not in df.columns) or df["n_star"].dropna().empty
 
+    # Optional inputs for the HTML report: model predictions and results metrics.
+    # Looked up next to the base path first, then in the results/ dir by convention.
+    predictions_df = results_df = None
+    base_dir = os.path.dirname(base) or "."
+    el_src = f"{'_'.join(elements)}_{source}"
+    pred_candidates = [
+        base + ".xlsx",
+        os.path.join(base_dir, f"predictions_{el_src}.xlsx"),
+        os.path.join(_ROOT, "results", f"predictions_{el_src}.xlsx"),
+    ]
+    res_candidates = [
+        os.path.join(base_dir, f"results_{el_src}.xlsx"),
+        os.path.join(_ROOT, "results", f"results_{el_src}.xlsx"),
+    ]
+    for p in pred_candidates:
+        if os.path.exists(p):
+            try:
+                predictions_df = pd.read_excel(p, sheet_name="predictions")
+                print(f"  loaded predictions: {p}")
+                break
+            except Exception as exc:
+                print(f"  ⚠ could not read predictions '{p}': {type(exc).__name__}: {exc}")
+    for p in res_candidates:
+        if os.path.exists(p):
+            try:
+                results_df = pd.read_excel(p, sheet_name="metrics")
+                print(f"  loaded results: {p}")
+                break
+            except Exception as exc:
+                print(f"  ⚠ could not read results '{p}': {type(exc).__name__}: {exc}")
+
+    # Populated manually or from a future preprocessing-log parser; None is fine
+    # (the HTML report derives what it can from the dataframe).
+    preprocessing_info = None
+
     print("Writing reports:")
     if "pdf" in formats:
         build_pdf(base + ".pdf", df, features, elements, targets, mi_results, perm, no_rydberg)
     if "xlsx" in formats:
         build_xlsx(base + ".xlsx", df, features, targets, mi_results, perm)
     if "html" in formats:
-        build_html(base + ".html", df, features, elements, modes, targets, mi_results, perm)
+        build_html(base + ".html", df, features, elements, modes, targets, mi_results, perm,
+                   preprocessing_info=preprocessing_info,
+                   predictions_df=predictions_df, results_df=results_df)
 
     print(f"\nDone. Report base: {base}  formats={formats}")
 
