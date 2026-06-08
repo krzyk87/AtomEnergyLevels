@@ -319,11 +319,17 @@ def save_predictions_excel(
     run_df["True_Energy_cm-1"] = targets.flatten()
     run_df[pred_col] = predictions.flatten()
 
-    # Append gJ columns when running in multi-task mode
+    # Append gJ columns when running in multi-task mode. gj_observed / gj_mask are
+    # run-independent ground truth (written once, like True_Energy_cm-1); the gJ
+    # prediction is per-run — named with the model tags exactly like the energy
+    # prediction column — so each test session adds its own gj column rather than
+    # overwriting a shared one.
+    gj_pred_col = None
     if gj_results is not None:
-        run_df["gj_predicted"] = gj_results["gj_predicted"]
-        run_df["gj_observed"]  = gj_results["gj_observed"]
-        run_df["gj_mask"]      = gj_results["gj_mask"].astype(int)  # 1=observed, 0=missing
+        gj_pred_col = f"gj_Predicted_{tags}_ev{max_val_e}"
+        run_df[gj_pred_col]   = gj_results["gj_predicted"]
+        run_df["gj_observed"] = gj_results["gj_observed"]
+        run_df["gj_mask"]     = gj_results["gj_mask"].astype(int)  # 1=observed, 0=missing
 
     run_df = run_df.sort_values("True_Energy_cm-1", ascending=True).reset_index(drop=True)
 
@@ -331,8 +337,15 @@ def save_predictions_excel(
     if os.path.exists(results_path):
         try:
             existing_df = pd.read_excel(results_path, sheet_name=sheet_name)
+            # Bring in every column this run produced that the file does not already
+            # have: the per-run energy prediction, the per-run gJ prediction, and —
+            # the first time a multi-task run is recorded — the gj_observed / gj_mask
+            # ground-truth columns. Columns already present (features, identifiers,
+            # earlier runs' predictions) are left untouched.
+            new_cols = [c for c in run_df.columns
+                        if c != "_df_index" and c not in existing_df.columns]
             combined_df = existing_df.merge(
-                run_df[["_df_index", pred_col]],
+                run_df[["_df_index"] + new_cols],
                 on="_df_index",
                 how="left",
             )
@@ -350,7 +363,8 @@ def save_predictions_excel(
         else:
             with pd.ExcelWriter(results_path, engine="openpyxl") as writer:
                 combined_df.to_excel(writer, sheet_name=sheet_name, index=False)
-        print(f"Appended predictions column '{pred_col}' to {results_path}")
+        appended = [pred_col] + ([gj_pred_col] if gj_pred_col else [])
+        print(f"Appended prediction column(s) {appended} to {results_path}")
     except Exception as exc:
         fallback = results_path.replace(".xlsx", "_predictions.csv")
         combined_df.to_csv(fallback, index=False)
